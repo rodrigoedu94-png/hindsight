@@ -46,10 +46,6 @@ from ..base import EntityPrunePassResult, RelinkPassResult
 
 logger = logging.getLogger(__name__)
 
-# Mirrors the ``top_k`` default in ``compute_semantic_links_ann`` at retain
-# time. If you change one, change the other — otherwise victims would either
-# never reach the cap (probe returns less than the cap) or stay perpetually
-# under it (cap is higher than retain creates).
 
 def _as_uuid(value: Any) -> uuid_module.UUID:
     """Coerce an id to UUID. ``id::text`` comes back as str on PostgreSQL, but the Oracle
@@ -57,6 +53,10 @@ def _as_uuid(value: Any) -> uuid_module.UUID:
     return value if isinstance(value, uuid_module.UUID) else uuid_module.UUID(str(value))
 
 
+# Mirrors the ``top_k`` default in ``compute_semantic_links_ann`` at retain
+# time. If you change one, change the other — otherwise victims would either
+# never reach the cap (probe returns less than the cap) or stay perpetually
+# under it (cap is higher than retain creates).
 MAX_SEMANTIC_LINKS_PER_UNIT = 50
 
 # Worker fetches this many rows per relink-loop iteration. Bounds
