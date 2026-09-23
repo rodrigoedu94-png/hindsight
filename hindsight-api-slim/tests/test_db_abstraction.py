@@ -582,6 +582,19 @@ class TestOracleQueryRewriter:
         assert "::uuid" not in query
         assert "::varchar[]" not in query
 
+    def test_jsonb_merge_returns_clob(self):
+        # Without RETURNING CLOB, JSON_MERGEPATCH returns VARCHAR2(4000) with
+        # NULL ON ERROR, so large merged documents silently become NULL.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("UPDATE banks SET config = config || $1::jsonb WHERE bank_id = $2")
+        assert "JSON_MERGEPATCH(config, :1 RETURNING CLOB)" in query
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "UPDATE banks SET config = COALESCE(config, '{}'::jsonb) || $1::jsonb WHERE bank_id = $2"
+        )
+        assert "JSON_MERGEPATCH(COALESCE(config, TO_CLOB('{}')), :1 RETURNING CLOB)" in query
+
     def test_now_to_systimestamp(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
