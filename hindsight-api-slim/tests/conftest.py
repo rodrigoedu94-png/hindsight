@@ -383,13 +383,15 @@ def _oracle_admin_dsn():
 
     parsed = urlparse(dsn)
     if parsed.scheme in ("oracle", "oracle+oracledb"):
-        host = parsed.hostname or "localhost"
-        port = parsed.port or 1521
-        service = parsed.path.lstrip("/") if parsed.path else "FREEPDB1"
+        # Same parsing as the backend, so an Autonomous Database connect descriptor
+        # (oracle://user:pass@/?dsn=(description=...)) works here too.
+        from hindsight_api.engine.db.oracle import _oracle_connect_params
+
+        params = _oracle_connect_params(dsn)
         return {
-            "user": parsed.username or "SYSTEM",
-            "password": parsed.password or "oracle",
-            "dsn": f"{host}:{port}/{service}",
+            "user": params["user"] or "SYSTEM",
+            "password": params["password"] or "oracle",
+            "dsn": params["dsn"],
         }
     else:
         return {
@@ -444,9 +446,9 @@ def oracle_db_url(_oracle_admin_dsn):
                 # ORA-01031: we are not an admin. CI provisions the user with a
                 # privileged account before pytest runs and then points
                 # ORACLE_TEST_DSN at that same unprivileged user, so this bootstrap
-                # cannot (and need not) create it. Assume it exists — if it does
-                # not, run_migrations below fails with a plain login error.
-                pass
+                # cannot (and need not) create it: test as the DSN's own user (on an
+                # Autonomous Database it is pre-provisioned, with a strong password).
+                test_user, test_pass = admin_user, admin_pass
             else:
                 raise
 
@@ -472,8 +474,14 @@ def oracle_db_url(_oracle_admin_dsn):
         cursor.close()
         conn.close()
 
-    # Return URL-format DSN for the test user
-    url = f"oracle://{test_user}:{test_pass}@{bare_dsn}"
+    # Return URL-format DSN for the test user (a full connect descriptor travels as ?dsn=)
+    from urllib.parse import quote
+
+    credentials = f"{quote(test_user, safe='')}:{quote(test_pass, safe='')}"
+    if bare_dsn.lstrip().startswith("("):
+        url = f"oracle://{credentials}@/?dsn={quote(bare_dsn, safe='')}"
+    else:
+        url = f"oracle://{credentials}@{bare_dsn}"
 
     # Run idempotent migrations once at session scope (mirrors PG's pg0_db_url).
     # This avoids re-running DDL checks on every function-scoped test.
