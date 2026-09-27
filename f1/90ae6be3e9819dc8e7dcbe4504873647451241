@@ -1,0 +1,22 @@
+hindsight-api-slim/hindsight_api/engine/sql/oracle.py
+  s_1d4e0e22102b43::t_bec65f16cae3f8 269-282,284-290
+hindsight-api-slim/tests/test_db_abstraction.py
+  s_1d4e0e22102b43::t_2846a83af8df82 572-574
+  s_1d4e0e22102b43::t_d0ae0220dcc90e 546,548-571,575-576
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f190ae6be3e9819dc8e7dcbe4504873647451241",
+  "prompts": {},
+  "sessions": {
+    "s_1d4e0e22102b43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24897b5e-98d1-4837-8d14-3cbcb0b5c051",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
