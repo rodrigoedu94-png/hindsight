@@ -550,25 +550,29 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
                 flags=re.IGNORECASE,
             )
     else:
-        # No FOR UPDATE: use standard FETCH FIRST / OFFSET ROWS syntax
+        # No FOR UPDATE: use standard FETCH FIRST / OFFSET ROWS syntax.
+        # A query ranking by vector distance asks for EXACT: on Autonomous Database a bare
+        # FETCH FIRST is answered from a vector index whenever one exists, which made these
+        # nearest-neighbour lookups (temporal arm, link expansion) silently approximate.
+        fetch_first = "FETCH EXACT FIRST" if "VECTOR_DISTANCE(" in query else "FETCH FIRST"
         # First handle "LIMIT N OFFSET M" → "OFFSET M ROWS FETCH FIRST N ROWS ONLY"
         query = re.sub(
             r"\bLIMIT\s+(\d+|:\w+)\s+OFFSET\s+(\d+|:\w+)\b",
-            r"OFFSET \2 ROWS FETCH FIRST \1 ROWS ONLY",
+            rf"OFFSET \2 ROWS {fetch_first} \1 ROWS ONLY",
             query,
             flags=re.IGNORECASE,
         )
         # Handle "OFFSET M LIMIT N" → "OFFSET M ROWS FETCH FIRST N ROWS ONLY"
         query = re.sub(
             r"\bOFFSET\s+(\d+|:\w+)\s+LIMIT\s+(\d+|:\w+)\b",
-            r"OFFSET \1 ROWS FETCH FIRST \2 ROWS ONLY",
+            rf"OFFSET \1 ROWS {fetch_first} \2 ROWS ONLY",
             query,
             flags=re.IGNORECASE,
         )
         # Handle standalone "LIMIT N" (no OFFSET)
         query = re.sub(
             r"\bLIMIT\s+(\d+|:\w+)\b",
-            r"FETCH FIRST \1 ROWS ONLY",
+            rf"{fetch_first} \1 ROWS ONLY",
             query,
             flags=re.IGNORECASE,
         )
