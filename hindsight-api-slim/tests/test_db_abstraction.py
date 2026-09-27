@@ -543,12 +543,37 @@ class TestOracleDialect:
 
     def test_prepare_bm25_text(self, d):
         result = d.prepare_bm25_text(["hello", "world"], "hello world")
-        assert result == "hello OR world"
+        assert result == "{hello} OR {world}"
 
-    def test_prepare_bm25_text_special_chars_filtered(self, d):
-        result = d.prepare_bm25_text(["hello", "$special", "world"], "hello $special world")
-        assert "$special" not in result
-        assert "hello" in result
+    def test_prepare_bm25_text_escapes_underscore_wildcard(self, d):
+        """`_` is Oracle Text's one-character wildcard, so a bare snake_case term matches nothing.
+
+        On a live 26ai index, CONTAINS(text, 'hindsight_api') found 0 rows while
+        '{hindsight_api}' found 584, and a lone '_' matched every one-letter token.
+        """
+        assert d.prepare_bm25_text(["hindsight_api", "__init__"], "") == "{hindsight_api} OR {__init__}"
+
+    def test_prepare_bm25_text_escapes_reserved_words_and_operators(self, d):
+        result = d.prepare_bm25_text(["near", "about", "$special", "a&b"], "")
+        assert result == "{near} OR {about} OR {$special} OR {a&b}"
+
+    def test_prepare_bm25_text_cannot_close_the_escape(self, d):
+        """A brace inside a term would end the escape and let the rest act as operators."""
+        result = d.prepare_bm25_text(["a}", "OR", "x%{"], "")
+        assert result == "{a} OR {OR} OR {x%}"
+
+    def test_prepare_bm25_text_never_binds_the_raw_query(self, d):
+        result = d.prepare_bm25_text(["{}"], "} OR mem% {")
+        assert "mem%" not in result
+
+    def test_prepare_bm25_text_dedupes_case_insensitively(self, d):
+        assert d.prepare_bm25_text(["Oracle", "oracle", "text"], "") == "{Oracle} OR {text}"
+
+    @pytest.mark.parametrize(
+        ("cap", "expected"), [(2, "{a} OR {b}"), (0, "{a} OR {b} OR {c}"), (None, "{a} OR {b} OR {c}")]
+    )
+    def test_prepare_bm25_text_respects_max_query_terms(self, d, cap, expected):
+        assert d.prepare_bm25_text(["a", "b", "a", "c"], "", max_query_terms=cap) == expected
 
 
 # ---------------------------------------------------------------------------
