@@ -672,6 +672,29 @@ class TestOracleQueryRewriter:
         query, _, _ = _rewrite_pg_to_oracle("SELECT id FROM t ORDER BY created_at LIMIT 5 OFFSET 10")
         assert query.endswith("OFFSET 10 ROWS FETCH FIRST 5 ROWS ONLY")
 
+    def test_vector_distance_params_bind_as_native_vectors(self):
+        """A query embedding bound as text fails with ORA-01460 once it passes 32,767 bytes.
+
+        str() of a 1536-dimension embedding with full-precision floats is ~33 KB, so recall
+        failed on every query with such a provider; a native VECTOR bind has no such limit.
+        Other JSON-looking params (tag lists) keep their text/CLOB binding.
+        """
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        params = {"1": "[0.123456789, -0.5]", "2": "bank", "3": '["tag"]'}
+        OracleConnection._bind_vectors_natively(
+            "SELECT id FROM memory_units WHERE bank_id = :2 AND tags = :3 "
+            "ORDER BY VECTOR_DISTANCE(mu.embedding, :1, COSINE)",
+            params,
+        )
+        assert isinstance(params["1"], array.array)
+        assert params["1"].typecode == "f"
+        assert list(params["1"]) == pytest.approx([0.123456789, -0.5])
+        assert params["2"] == "bank"
+        assert params["3"] == '["tag"]'
+
     def test_multiple_casts(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
