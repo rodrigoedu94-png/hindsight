@@ -500,8 +500,33 @@ class TestOracleDialect:
         assert "VECTOR_DISTANCE" in arm
         assert ">= 0.58" in arm
         assert "fact_type = 'world'" in arm
-        assert "FETCH FIRST 100 ROWS ONLY" in arm
+        # EXACT is spelled out: on Autonomous Database a bare FETCH FIRST is answered from a
+        # vector index when one exists, i.e. approximately.
+        assert "FETCH EXACT FIRST 100 ROWS ONLY" in arm
+        assert "APPROX" not in arm
         assert "'semantic' AS source" in arm
+
+    def test_build_semantic_arm_approx_uses_fetch_approx(self, d, monkeypatch):
+        """FETCH APPROX is what lets Oracle answer from the embedding's vector index."""
+        from hindsight_api.config import clear_config_cache
+
+        monkeypatch.setenv("HINDSIGHT_API_ORACLE_VECTOR_SEARCH", "approx")
+        monkeypatch.setenv("HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY", "90")
+        clear_config_cache()
+        try:
+            arm = d.build_semantic_arm(
+                table="memory_units",
+                cols="id, text",
+                fact_type="world",
+                embedding_param=":1",
+                bank_id_param=":2",
+                fetch_limit=100,
+                min_similarity=0.58,
+            )
+        finally:
+            clear_config_cache()
+        assert "FETCH APPROX FIRST 100 ROWS ONLY WITH TARGET ACCURACY 90" in arm
+        assert "bank_id = :2" in arm
 
     def test_build_bm25_arm(self, d):
         arm = d.build_bm25_arm(
@@ -629,6 +654,23 @@ class TestOracleQueryRewriter:
         query, _, _ = _rewrite_pg_to_oracle("$1::jsonb")
         assert "::jsonb" not in query
         assert ":1" in query
+
+    def test_vector_ordered_limit_is_an_exact_fetch(self):
+        """On Autonomous Database a bare FETCH FIRST over a vector index is approximate.
+
+        The temporal arm and link expansion order by `embedding <=> $1 LIMIT n`; measured on
+        Oracle AI Database 26ai (ADB) with the baseline IVF index present, that plain FETCH FIRST
+        returned 42% of the true top-20, so vector-ordered limits must ask for EXACT.
+        """
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT id FROM memory_units WHERE bank_id = $2 ORDER BY embedding <=> $1::vector LIMIT 5"
+        )
+        assert "ORDER BY VECTOR_DISTANCE(embedding, :1, COSINE) FETCH EXACT FIRST 5 ROWS ONLY" in query
+
+        query, _, _ = _rewrite_pg_to_oracle("SELECT id FROM t ORDER BY created_at LIMIT 5 OFFSET 10")
+        assert query.endswith("OFFSET 10 ROWS FETCH FIRST 5 ROWS ONLY")
 
     def test_multiple_casts(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
@@ -1023,6 +1065,28 @@ class TestConfig:
         from hindsight_api.config import DEFAULT_DATABASE_BACKEND
 
         assert DEFAULT_DATABASE_BACKEND == "postgresql"
+
+    def test_oracle_vector_search_defaults_to_exact(self):
+        from hindsight_api.config import HindsightConfig
+
+        config = HindsightConfig.from_env()
+        assert config.oracle_vector_search == "exact"
+        assert config.oracle_vector_target_accuracy == 95
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("HINDSIGHT_API_ORACLE_VECTOR_SEARCH", "fuzzy"),
+            ("HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY", "0"),
+            ("HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY", "101"),
+        ],
+    )
+    def test_oracle_vector_search_settings_are_validated(self, monkeypatch, name, value):
+        from hindsight_api.config import HindsightConfig
+
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ValueError, match="oracle_vector"):
+            HindsightConfig.from_env().validate()
 
 
 # ---------------------------------------------------------------------------
