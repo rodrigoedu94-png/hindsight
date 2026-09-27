@@ -13,6 +13,7 @@ Requires: python-oracledb (thin mode — pure Python, no Oracle client needed).
 Supports multi-tenant schema isolation via ALTER SESSION SET CURRENT_SCHEMA.
 """
 
+import array
 import datetime
 import inspect
 import json
@@ -89,6 +90,8 @@ _JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both
 _JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?)\s*\?\s*'(\w+)'")
 _JSONB_CONTAINS_RE = re.compile(r"(\w+)\s*@>\s*:(\d+)")
 _RESULT_METADATA_CONTAINS_RE = re.compile(r"((?:\w+\.)?result_metadata)\s*@>\s*:(\d+)", re.IGNORECASE)
+# The query-side operand of VECTOR_DISTANCE(<column>, :N, ...), after the rewrite.
+_VECTOR_DISTANCE_PARAM_RE = re.compile(r"VECTOR_DISTANCE\(\s*[\w.\"]+\s*,\s*:(\w+)", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Argument conversion helpers
@@ -873,6 +876,24 @@ class OracleConnection(DatabaseConnection):
                 params[key] = lob
 
     @staticmethod
+    def _bind_vectors_natively(query: str, params: dict[str, Any] | None) -> None:
+        """Bind VECTOR_DISTANCE operands as native vectors instead of text.
+
+        Callers pass the query embedding as its str() — "[0.0123, ...]" — which would bind
+        as text (CLOB, see _apply_clob_input_sizes). Oracle converts text to VECTOR through a
+        32,767-byte buffer, and str() of a 1536-dimension embedding with full-precision floats
+        is ~33 KB, so recall failed with ORA-01460 for such providers (always at 3072
+        dimensions). An array('f') binds as DB_TYPE_VECTOR with no size limit; the columns
+        are FLOAT32, so nothing is lost.
+        """
+        if not params:
+            return
+        for key in set(_VECTOR_DISTANCE_PARAM_RE.findall(query)):
+            value = params.get(key)
+            if isinstance(value, str) and value.startswith("["):
+                params[key] = array.array("f", json.loads(value))
+
+    @staticmethod
     def _apply_clob_input_sizes(cursor: Any, query: str, params: dict[str, Any] | None) -> None:
         """Tell oracledb to bind typed input sizes for ambiguous parameters.
 
@@ -1160,6 +1181,7 @@ class OracleConnection(DatabaseConnection):
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
             await self._bind_large_values_as_lobs(params)
+            self._bind_vectors_natively(query, params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1267,6 +1289,7 @@ class OracleConnection(DatabaseConnection):
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
             await self._bind_large_values_as_lobs(params)
+            self._bind_vectors_natively(query, params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1309,6 +1332,7 @@ class OracleConnection(DatabaseConnection):
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
             await self._bind_large_values_as_lobs(params)
+            self._bind_vectors_natively(query, params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1351,6 +1375,7 @@ class OracleConnection(DatabaseConnection):
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
             await self._bind_large_values_as_lobs(params)
+            self._bind_vectors_natively(query, params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
