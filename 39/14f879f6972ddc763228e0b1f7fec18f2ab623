@@ -1,0 +1,32 @@
+hindsight-docs/docs/developer/configuration.mdx
+  s_1d4e0e22102b43::t_b23fc107635cff 28
+  s_1d4e0e22102b43::t_668f17b5ba55c9 42
+  s_1d4e0e22102b43::t_ef031b2890af6d 34-36
+  s_1d4e0e22102b43::t_4b68c22fea509a 254
+hindsight-docs/docs/developer/oracle.md
+  s_1d4e0e22102b43::t_12dbae20ea4410 283,285-287
+  s_1d4e0e22102b43::t_5326f19a420575 399-402
+  s_1d4e0e22102b43::t_d6c52e2ee6e10c 246-262
+  s_1d4e0e22102b43::t_820b342ce557d0 389-391
+  s_1d4e0e22102b43::t_2830e4522b9b48 4-5,288
+  s_1d4e0e22102b43::t_47ffa095940e20 126-154
+  s_1d4e0e22102b43::t_920af80ea67edb 289-300,303-368
+  s_1d4e0e22102b43::t_d640fbb80ecce5 301-302
+  s_1d4e0e22102b43::t_dd72489d799e02 26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3914f879f6972ddc763228e0b1f7fec18f2ab623",
+  "prompts": {},
+  "sessions": {
+    "s_1d4e0e22102b43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24897b5e-98d1-4837-8d14-3cbcb0b5c051",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
