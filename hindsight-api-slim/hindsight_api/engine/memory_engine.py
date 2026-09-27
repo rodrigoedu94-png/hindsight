@@ -5886,10 +5886,21 @@ class MemoryEngine(MemoryEngineInterface):
                     # unnecessary; run sequentially via the backend's own runner.
                     # normalize_schema() maps PG's "public" default to None (the
                     # connecting user's schema) on Oracle.
+                    from ..migrations import ensure_embedding_dimension
+                    from .memories import get_memories
+
                     for tenant in tenants:
                         if tenant.schema:
-                            self._backend.run_migrations(
-                                self.db_url, schema=self._backend.normalize_schema(tenant.schema)
+                            schema = self._backend.normalize_schema(tenant.schema)
+                            self._backend.run_migrations(self.db_url, schema=schema)
+                            # The Oracle baseline declares VECTOR(384); reconcile it with the model
+                            # like the PG path does. It alters tables, so it runs as the migration
+                            # user when one is configured.
+                            ensure_embedding_dimension(
+                                config.migration_database_url or self.db_url,
+                                self.embeddings.dimension,
+                                schema=schema,
+                                store_owned_memories=get_memories().store_owned,
                             )
                 logger.info("Schema migrations completed")
 
