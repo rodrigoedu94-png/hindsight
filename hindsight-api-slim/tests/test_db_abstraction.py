@@ -1379,6 +1379,34 @@ class TestNormalizeSchema:
         assert backend.normalize_schema(None) is None
 
 
+@pytest.mark.parametrize("backend_type", ["postgresql", "oracle"])
+def test_backend_migrations_run_with_the_migration_database_url(backend_type, monkeypatch):
+    """Startup migrations use HINDSIGHT_API_MIGRATION_DATABASE_URL on every backend.
+
+    The migration URL is what lets DDL run as a schema-owner account while the API
+    connects as a runtime account without DDL privileges. The Oracle backend used to
+    drop it and migrate with the runtime DSN, so a least-privilege runtime user could
+    not boot with migrations on.
+    """
+    from hindsight_api import migrations
+    from hindsight_api.config import clear_config_cache
+
+    monkeypatch.setenv("HINDSIGHT_API_MIGRATION_DATABASE_URL", "migration-url")
+    clear_config_cache()
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    def _fake_run_migrations(dsn, *, schema=None, migration_database_url=None, **_kwargs):
+        calls.append((dsn, schema, migration_database_url))
+
+    monkeypatch.setattr(migrations, "run_migrations", _fake_run_migrations)
+    try:
+        create_database_backend(backend_type).run_migrations("runtime-url", schema="S1")
+    finally:
+        clear_config_cache()
+
+    assert calls == [("runtime-url", "S1", "migration-url")]
+
+
 # ---------------------------------------------------------------------------
 # OracleBackend._set_session_schema regression
 # ---------------------------------------------------------------------------
