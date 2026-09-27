@@ -1,0 +1,40 @@
+hindsight-api-slim/tests/test_oracle_vector_search.py
+  s_1d4e0e22102b43::t_6c112137c51ee9 1,4-7,14,23-43,45,48,50,55,57-58,60-67,69,71,75-82,85,89-97,100-107,109-110,112-133
+  s_1d4e0e22102b43::t_a74e5943cdd4bc 111
+  s_1d4e0e22102b43::t_8144dfc669971a 2-3,8-13,15-22,44,46-47,49,51-54,56,59,68,70,72-74,83-84,86-88,98-99,108,134
+hindsight-api-slim/hindsight_api/engine/db/oracle.py
+  s_1d4e0e22102b43::t_3b62ab66ca6346 500-504,508,515,522
+hindsight-api-slim/hindsight_api/config.py
+  s_1d4e0e22102b43::t_05c9b79d46ab8c 4009-4018
+  s_1d4e0e22102b43::t_bae31240fa1274 3605-3606
+  s_1d4e0e22102b43::t_746dfec865d425 1447-1456
+  s_1d4e0e22102b43::t_da2d6572b551cf 4665-4670
+  s_1d4e0e22102b43::t_7c0f5e4b662d2b 656-657
+  s_1d4e0e22102b43::t_f4875a46ea9356 4019
+hindsight-api-slim/tests/test_db_abstraction.py
+  s_1d4e0e22102b43::t_603eeb037f64d1 506,509-530
+  s_1d4e0e22102b43::t_98853f980fd003 1017-1038
+  s_1d4e0e22102b43::t_e89d201bdb0141 627-643
+  s_1d4e0e22102b43::t_a741f7af8309c9 503-505
+hindsight-api-slim/hindsight_api/engine/sql/oracle.py
+  s_1d4e0e22102b43::t_71de843b7c5a2e 8
+  s_1d4e0e22102b43::t_fef132ad8934ef 208-214
+  s_1d4e0e22102b43::t_5cfc88d177e4c9 202-207,215
+  s_1d4e0e22102b43::t_617cbc47b86b84 230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "81e4e3da94c14a11fe1af072b5a5fe4b51855c66",
+  "prompts": {},
+  "sessions": {
+    "s_1d4e0e22102b43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24897b5e-98d1-4837-8d14-3cbcb0b5c051",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
