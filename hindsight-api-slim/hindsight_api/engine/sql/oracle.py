@@ -5,6 +5,7 @@ vector distance (VECTOR_DISTANCE), full-text search (Oracle Text), and
 other non-portable patterns.
 """
 
+from ...config import get_config
 from .base import SQLDialect, bm25_score_gate
 
 
@@ -198,6 +199,20 @@ class OracleDialect(SQLDialect):
     ) -> str:
         # Oracle 23ai: VECTOR_DISTANCE for cosine, FETCH FIRST for limiting.
         # Wrapped in a derived table to work within UNION ALL.
+        # The row-limiting clause picks exact vs approximate search. EXACT must be spelled out:
+        # on Autonomous Database a bare FETCH FIRST is answered from a vector index whenever one
+        # exists (documented in "Perform Exact Similarity Search"), and with the baseline's global
+        # IVF index plus the bank filter it returned 42% of the true top-20 on 26ai. APPROX is
+        # the opt-in for large banks. Both values are inlined: the mode is validated against a
+        # fixed set and the accuracy is an integer in [1, 100] (see HindsightConfig validation).
+        config = get_config()
+        if config.oracle_vector_search == "approx":
+            fetch = (
+                f"FETCH APPROX FIRST {fetch_limit} ROWS ONLY "
+                f"WITH TARGET ACCURACY {int(config.oracle_vector_target_accuracy)}"
+            )
+        else:
+            fetch = f"FETCH EXACT FIRST {fetch_limit} ROWS ONLY"
         return (
             f"SELECT * FROM (SELECT {cols},"
             f"        1 - VECTOR_DISTANCE(embedding, {embedding_param}, COSINE) AS similarity,"
@@ -212,7 +227,7 @@ class OracleDialect(SQLDialect):
             f"   {groups_clause}"
             f"   {extra_where}"
             f" ORDER BY VECTOR_DISTANCE(embedding, {embedding_param}, COSINE)"
-            f" FETCH FIRST {fetch_limit} ROWS ONLY) t"
+            f" {fetch}) t"
         )
 
     def build_bm25_arm(
