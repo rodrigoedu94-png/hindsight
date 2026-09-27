@@ -1293,9 +1293,12 @@ class OracleBackend(DatabaseBackend):
 
     def run_migrations(self, dsn: str, *, schema: str | None = None) -> None:
         """Run Oracle DDL migrations through the shared Alembic pipeline."""
+        from ...config import get_config
         from ...migrations import run_migrations
 
-        run_migrations(dsn, schema=schema)
+        # Forward the migration URL like the PostgreSQL backend does: it lets the DDL run as
+        # the schema owner while the API itself connects as a runtime user without DDL rights.
+        run_migrations(dsn, schema=schema, migration_database_url=get_config().migration_database_url)
 
     def create_task_backend(self, *, pool_getter: Any = None, schema_getter: Any = None) -> Any:
         """Oracle now uses BrokerTaskBackend — worker/poller is backend-agnostic."""
