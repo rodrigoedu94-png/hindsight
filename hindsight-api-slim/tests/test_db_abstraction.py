@@ -664,6 +664,25 @@ class TestOracleQueryRewriter:
         assert params["2"] == "bank"
         assert params["3"] == '["tag"]'
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "INSERT INTO memory_units (\n id, bank_id, text, fact_type, embedding, tags\n)\n"
+            "VALUES (:1, :2, :3, 'observation', :4, :5) RETURNING id INTO :ret_0",
+            "UPDATE memory_units SET text = :3, embedding = :4, tags = :5 WHERE id = :1 AND bank_id = :2",
+        ],
+    )
+    def test_embedding_column_writes_bind_as_native_vectors(self, query):
+        """Writing a ~33 KB embedding string into the column failed with ORA-01461 (consolidation)."""
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        params = {"1": "id", "2": "bank", "3": "text", "4": "[0.5, -0.25]", "5": '["t"]'}
+        OracleConnection._bind_vectors_natively(query, params)
+        assert isinstance(params["4"], array.array)
+        assert params["5"] == '["t"]'
+
     def test_multiple_casts(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
