@@ -16,6 +16,15 @@ import pytest
 from hindsight_api.migrations import _ensure_oracle_table_embedding_dimension
 
 
+class _Crash(Exception):
+    """The process dying between two DDL statements."""
+
+
+def _crashes_on(sql: str, step: str | None) -> bool:
+    # The pending-index marker (a COMMENT) quotes the CREATE statements, so it is never the step.
+    return bool(step) and step in sql and not sql.startswith("COMMENT ON")
+
+
 class _ScriptedCursor:
     """Answers the dictionary/data queries the dimension check issues; records every statement."""
 
@@ -26,24 +35,44 @@ class _ScriptedCursor:
         stored_dimensions: list[int] | None = None,
         vector_indexes: list[tuple[str, str, str]] | None = None,  # (name, INDEX_SUBTYPE, PARTITIONED)
         has_legacy: bool = False,
+        comments: dict[str, str] | None = None,
+        fail_on: str | None = None,
     ) -> None:
         self.vector_info = vector_info
         self.stored_dimensions = stored_dimensions or []
         self.vector_indexes = vector_indexes or []
         self.has_legacy = has_legacy
+        self.comments: dict[str, str] = dict(comments or {})  # column -> comment
+        self.fail_on = fail_on  # raise when a statement contains this text (simulated crash)
         self.statements: list[str] = []
         self._result: list[tuple] = []
 
     def execute(self, sql: str, binds: dict | None = None) -> None:
+        if _crashes_on(sql, self.fail_on):
+            raise _Crash(sql)
         self.statements.append(sql)
         # Column DDL changes what the dictionary reports next, like the real catalog.
         if "RENAME COLUMN embedding TO embedding_legacy" in sql:
             self.vector_info, self.has_legacy = None, True
+            if "EMBEDDING" in self.comments:  # Oracle keeps a column's comment across a rename
+                self.comments["EMBEDDING_LEGACY"] = self.comments.pop("EMBEDDING")
         elif added := re.search(r"ADD \(embedding VECTOR\((\d+), FLOAT32\)\)", sql):
             self.vector_info = f"VECTOR({added.group(1)},FLOAT32,DENSE)"
         elif "DROP COLUMN embedding_legacy" in sql:
             self.has_legacy = False
-        if "vector_info" in sql.lower():
+            self.comments.pop("EMBEDDING_LEGACY", None)
+        elif comment := re.match(r"COMMENT ON COLUMN \w+\.(\w+) IS '(.*)'$", sql, re.DOTALL):
+            self.comments[comment.group(1).upper()] = comment.group(2).replace("''", "'")
+        elif dropped := re.match(r'DROP INDEX "(\w+)"', sql):
+            self.vector_indexes = [i for i in self.vector_indexes if i[0] != dropped.group(1)]
+        elif created := re.match(r'CREATE VECTOR INDEX "(\w+)" .*ORGANIZATION (INMEMORY )?', sql):
+            if any(i[0] == created.group(1) for i in self.vector_indexes):
+                raise Exception("ORA-00955: name is already used by an existing object")
+            subtype = "INMEMORY_NEIGHBOR_GRAPH_HNSW" if created.group(2) else "NEIGHBOR_PARTITIONS_IVF"
+            self.vector_indexes.append((created.group(1), subtype, "YES" if sql.endswith(" LOCAL") else "NO"))
+        if "all_col_comments" in sql:
+            self._result = [(c,) for c in self.comments.values()]
+        elif "vector_info" in sql.lower():
             self._result = ([("EMBEDDING", self.vector_info)] if self.vector_info is not None else []) + (
                 [("EMBEDDING_LEGACY", None)] if self.has_legacy else []
             )
@@ -126,6 +155,50 @@ def test_resize_interrupted_after_the_new_column_is_finished():
     assert _ddl(cursor) == ["ALTER TABLE MEMORY_UNITS DROP COLUMN embedding_legacy"]
 
 
+@pytest.mark.parametrize(
+    "crash_at",
+    [
+        "DROP INDEX",
+        "RENAME COLUMN",
+        "ADD (embedding",
+        "DROP COLUMN embedding_legacy",
+        "CREATE VECTOR INDEX",
+    ],
+)
+def test_resize_interrupted_at_any_step_still_ends_with_the_vector_index(crash_at):
+    """Oracle DDL is not transactional; a crash between steps must not lose the baseline index."""
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(384,FLOAT32,DENSE)",
+        vector_indexes=[("IDX_MU_EMBEDDING_HNSW", "NEIGHBOR_PARTITIONS_IVF", "NO")],
+        fail_on=crash_at,
+    )
+    with pytest.raises(_Crash):
+        _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+
+    cursor.fail_on = None  # the next boot
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+
+    assert cursor.vector_info == "VECTOR(1536,FLOAT32,DENSE)"
+    assert not cursor.has_legacy
+    assert [i[:2] for i in cursor.vector_indexes] == [("IDX_MU_EMBEDDING_HNSW", "NEIGHBOR_PARTITIONS_IVF")]
+    assert not any(cursor.comments.values()), "the pending-index marker is cleared once rebuilt"
+
+
+def test_a_worker_that_lost_the_race_to_create_the_index_finishes_cleanly():
+    """Another worker rebuilt the index between our DROP and CREATE: ORA-00955 is not an error."""
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(1536,FLOAT32,DENSE)",
+        vector_indexes=[("IDX_MU_EMBEDDING_HNSW", "NEIGHBOR_PARTITIONS_IVF", "NO")],
+        comments={
+            "EMBEDDING": 'hindsight:pending-vector-indexes:["CREATE VECTOR INDEX \\"IDX_MU_EMBEDDING_HNSW\\" '
+            'ON MEMORY_UNITS (embedding) ORGANIZATION NEIGHBOR PARTITIONS DISTANCE COSINE WITH TARGET ACCURACY 95"]'
+        },
+    )
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert len(cursor.vector_indexes) == 1
+    assert not any(cursor.comments.values())
+
+
 def test_table_with_embeddings_of_another_dimension_fails_explicitly():
     cursor = _ScriptedCursor(vector_info="VECTOR(384,FLOAT32,DENSE)", stored_dimensions=[384])
     with pytest.raises(RuntimeError, match=r"from 384 to 1536.*MEMORY_UNITS"):
@@ -199,6 +272,10 @@ def test_live_resize_replaces_the_column_and_keeps_the_vector_index(oracle_curso
 
     assert _vector_info(cursor, table) == "VECTOR(1536,FLOAT32,DENSE)"
     assert _vector_indexes(cursor, table) == [f"{table}_IVF"]
+    cursor.execute(
+        "SELECT comments FROM user_col_comments WHERE table_name = :t AND comments IS NOT NULL", {"t": table}
+    )
+    assert cursor.fetchall() == [], "the pending-index marker is cleared once the index is rebuilt"
 
     # Idempotent: a second run with the same model changes nothing.
     _ensure_oracle_table_embedding_dimension(cursor, table, 1536)
@@ -209,6 +286,53 @@ def test_live_resize_replaces_the_column_and_keeps_the_vector_index(oracle_curso
     with pytest.raises(RuntimeError, match="from 1536 to 768"):
         _ensure_oracle_table_embedding_dimension(cursor, table, 768)
     assert _vector_info(cursor, table) == "VECTOR(1536,FLOAT32,DENSE)"
+
+
+class _CrashingCursor:
+    """Wraps a live cursor and dies once, just before the first statement containing ``crash_at``."""
+
+    def __init__(self, cursor, crash_at: str | None) -> None:
+        self._cursor, self._crash_at = cursor, crash_at
+
+    def execute(self, sql: str, binds: dict | None = None) -> None:
+        if _crashes_on(sql, self._crash_at):
+            self._crash_at = None
+            raise _Crash(sql)
+        if binds is None:
+            self._cursor.execute(sql)
+        else:
+            self._cursor.execute(sql, binds)
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+
+@pytest.mark.oracle
+@pytest.mark.parametrize("crash_at", ["ADD (embedding", "CREATE VECTOR INDEX"])
+def test_live_resize_interrupted_mid_way_rebuilds_the_vector_index(oracle_cursor, crash_at):
+    """Crashing after the rename only works out if Oracle keeps the column comment across RENAME COLUMN."""
+    cursor, table = oracle_cursor
+    cursor.execute(f"CREATE TABLE {table} (id NUMBER PRIMARY KEY, embedding VECTOR(384, FLOAT32))")
+    cursor.execute(
+        f"CREATE VECTOR INDEX {table}_IVF ON {table} (embedding) ORGANIZATION NEIGHBOR PARTITIONS "
+        "DISTANCE COSINE WITH TARGET ACCURACY 95"
+    )
+    crashing = _CrashingCursor(cursor, crash_at)
+    with pytest.raises(_Crash):
+        _ensure_oracle_table_embedding_dimension(crashing, table, 1536)
+    assert _vector_indexes(cursor, table) == []
+
+    _ensure_oracle_table_embedding_dimension(cursor, table, 1536)
+
+    assert _vector_info(cursor, table) == "VECTOR(1536,FLOAT32,DENSE)"
+    assert _vector_indexes(cursor, table) == [f"{table}_IVF"]
+    cursor.execute(
+        "SELECT comments FROM user_col_comments WHERE table_name = :t AND comments IS NOT NULL", {"t": table}
+    )
+    assert cursor.fetchall() == []
 
 
 @pytest.mark.oracle
@@ -222,6 +346,69 @@ def test_live_flexible_column_is_validated_not_altered(oracle_cursor):
 
     with pytest.raises(RuntimeError, match="flexible VECTOR column holding 1536"):
         _ensure_oracle_table_embedding_dimension(cursor, table, 384)
+
+
+class _FakeOracleDriver:
+    """Stands in for python-oracledb: a connection whose cursor accepts the session setup."""
+
+    class DatabaseError(Exception):
+        pass
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def cursor(self):
+            return _ScriptedCursor(vector_info=None)
+
+    def connect(self, **_):
+        return self._Connection()
+
+
+def _patch_reconcile(monkeypatch, outcomes: list[Exception | None]) -> list[str]:
+    """Replace the per-table reconcile with one that raises (or not) per call, in order."""
+    from hindsight_api import migrations
+    from hindsight_api.engine.db import oracle
+
+    driver = _FakeOracleDriver()
+    monkeypatch.setattr(oracle, "_import_oracledb", lambda: driver)
+    monkeypatch.setattr(oracle, "_oracle_connect_params", lambda url: {})
+    calls: list[str] = []
+
+    def reconcile(cursor, table_name, required_dimension):
+        calls.append(table_name)
+        outcome = outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+    monkeypatch.setattr(migrations, "_ensure_oracle_table_embedding_dimension", reconcile)
+    return calls
+
+
+def test_a_worker_that_raced_another_ddl_re_checks_and_converges(monkeypatch):
+    from hindsight_api import migrations
+
+    race = _FakeOracleDriver.DatabaseError("ORA-01430: column being added already exists in table")
+    calls = _patch_reconcile(monkeypatch, [race, None, None])
+    migrations._ensure_embedding_dimension_oracle("oracle://x", 1536, None, store_owned_memories=False)
+    assert calls == ["MEMORY_UNITS", "MEMORY_UNITS", "MENTAL_MODELS"]
+
+
+def test_reconcile_gives_up_after_repeated_ddl_failures_and_never_retries_a_data_mismatch(monkeypatch):
+    from hindsight_api import migrations
+
+    error = _FakeOracleDriver.DatabaseError("ORA-00054: resource busy")
+    _patch_reconcile(monkeypatch, [error, error, error])
+    with pytest.raises(_FakeOracleDriver.DatabaseError):
+        migrations._ensure_embedding_dimension_oracle("oracle://x", 1536, None, store_owned_memories=False)
+
+    calls = _patch_reconcile(monkeypatch, [RuntimeError("Cannot change embedding dimension")])
+    with pytest.raises(RuntimeError):
+        migrations._ensure_embedding_dimension_oracle("oracle://x", 1536, None, store_owned_memories=False)
+    assert calls == ["MEMORY_UNITS"]
 
 
 def test_admin_migration_of_an_oracle_url_skips_the_postgresql_steps(monkeypatch):
