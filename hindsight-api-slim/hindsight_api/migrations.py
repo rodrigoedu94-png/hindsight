@@ -782,7 +782,7 @@ class _OracleEmbeddingColumns:
     has_legacy: bool  # EMBEDDING_LEGACY left behind by an interrupted resize
 
 
-def _oracle_embedding_columns(cursor, table_name: str) -> _OracleEmbeddingColumns:
+def _oracle_embedding_columns(cursor: Any, table_name: str) -> _OracleEmbeddingColumns:
     cursor.execute(
         "SELECT column_name, vector_info FROM all_tab_columns "
         "WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') "
@@ -796,7 +796,7 @@ def _oracle_embedding_columns(cursor, table_name: str) -> _OracleEmbeddingColumn
     )
 
 
-def _ensure_oracle_table_embedding_dimension(cursor, table_name: str, required_dimension: int) -> None:
+def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, required_dimension: int) -> None:
     """Reconcile one Oracle table's ``embedding`` column with the model's dimension.
 
     Mirrors the PostgreSQL rules: a matching column is left alone, an empty table is resized,
