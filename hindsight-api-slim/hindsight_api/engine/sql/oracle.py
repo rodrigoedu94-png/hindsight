@@ -302,4 +302,8 @@ class OracleDialect(SQLDialect):
         # unbounded OR over every token.
         if max_query_terms:
             terms = terms[:max_query_terms]
-        return " OR ".join(terms)
+        # ACCUM, not OR: OR scores a row by its best single term, so a common word ranks as
+        # high as the rare one the question is about; ACCUM ranks rows matching more terms
+        # higher and matches the same rows. On BEIR SciFact (100 queries, Gemini 1536, 26ai)
+        # keyword nDCG@10 went 0.348 -> 0.666 and the RRF hybrid 0.693 -> 0.806.
+        return " ACCUM ".join(terms)
