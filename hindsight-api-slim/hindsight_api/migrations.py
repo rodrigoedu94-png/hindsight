@@ -775,11 +775,21 @@ _ORACLE_VECTOR_INDEX_ORGANIZATIONS = {
     "INMEMORY_NEIGHBOR_GRAPH_HNSW": "INMEMORY NEIGHBOR GRAPH",
 }
 
+#: Prefix of the column comment that carries the vector-index DDL a resize still has to replay.
+#: Oracle DDL is not transactional, so the definitions of the indexes a resize drops are written
+#: to the catalog first; a run interrupted anywhere before the rebuild finds them there.
+_ORACLE_PENDING_INDEXES_MARKER = "hindsight:pending-vector-indexes:"
+
+#: Attempts at reconciling one table. Workers booting together race on the same DDL; a loser
+#: re-reads the catalog, which by then describes the winner's progress, and carries on from there.
+_ORACLE_RECONCILE_ATTEMPTS = 3
+
 
 @dataclass(frozen=True)
 class _OracleEmbeddingColumns:
     vector_info: str | None  # VECTOR_INFO of EMBEDDING; None when the column (or table) is missing
     has_legacy: bool  # EMBEDDING_LEGACY left behind by an interrupted resize
+    pending_index_ddl: list[str]  # vector indexes an interrupted resize dropped and has not rebuilt
 
 
 def _oracle_embedding_columns(cursor: Any, table_name: str) -> _OracleEmbeddingColumns:
@@ -790,10 +800,40 @@ def _oracle_embedding_columns(cursor: Any, table_name: str) -> _OracleEmbeddingC
         {"table_name": table_name},
     )
     rows = cursor.fetchall()
+    cursor.execute(
+        "SELECT comments FROM all_col_comments "
+        "WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') "
+        "AND table_name = :table_name AND column_name IN ('EMBEDDING', 'EMBEDDING_LEGACY')",
+        {"table_name": table_name},
+    )
+    markers = [c for (c,) in cursor.fetchall() if c and c.startswith(_ORACLE_PENDING_INDEXES_MARKER)]
     return _OracleEmbeddingColumns(
         vector_info=next((info for name, info in rows if name == "EMBEDDING"), None),
         has_legacy=any(name == "EMBEDDING_LEGACY" for name, _ in rows),
+        pending_index_ddl=json.loads(markers[0][len(_ORACLE_PENDING_INDEXES_MARKER) :]) if markers else [],
     )
+
+
+def _set_oracle_pending_indexes(cursor: Any, table_name: str, column: str, index_ddl: list[str]) -> None:
+    """Record (or, with an empty list, clear) the vector-index DDL still owed on ``table_name``."""
+    comment = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(index_ddl) if index_ddl else ""
+    cursor.execute(f"COMMENT ON COLUMN {table_name}.{column} IS '{comment.replace(chr(39), chr(39) * 2)}'")
+
+
+def _create_oracle_vector_index(cursor: Any, ddl: str) -> None:
+    try:
+        cursor.execute(ddl)
+    except Exception as e:
+        # ORA-00955: a concurrent worker (or the interrupted run) already created it.
+        if "ORA-00955" not in str(e):
+            raise
+
+
+def _rebuild_pending_oracle_indexes(cursor: Any, table_name: str, index_ddl: list[str]) -> None:
+    for ddl in index_ddl:
+        _create_oracle_vector_index(cursor, ddl)
+    _set_oracle_pending_indexes(cursor, table_name, "embedding", [])
+    logger.warning(f"Rebuilt {len(index_ddl)} vector index(es) an interrupted resize left on {table_name}")
 
 
 def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, required_dimension: int) -> None:
@@ -814,6 +854,9 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
         # It only ever runs on an empty table, so finishing it cannot lose data.
         if columns.vector_info is None:
             cursor.execute(f"ALTER TABLE {table_name} ADD (embedding VECTOR({required_dimension}, FLOAT32))")
+        if columns.pending_index_ddl:
+            # The marker may still sit on the legacy column; move it before that column goes.
+            _set_oracle_pending_indexes(cursor, table_name, "embedding", columns.pending_index_ddl)
         cursor.execute(f"ALTER TABLE {table_name} DROP COLUMN embedding_legacy")
         logger.warning(f"Finished an interrupted resize of {table_name}.embedding")
         columns = _oracle_embedding_columns(cursor, table_name)
@@ -821,6 +864,9 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
     if columns.vector_info is None:
         logger.debug(f"No embedding column found on {table_name}, skipping")
         return
+
+    if columns.pending_index_ddl:
+        _rebuild_pending_oracle_indexes(cursor, table_name, columns.pending_index_ddl)
 
     match = _ORACLE_VECTOR_INFO_RE.match(columns.vector_info)
     if match is None:
@@ -865,7 +911,10 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
     # with ORA-51859 even on an empty table (verified on 23.26.3), so the column is replaced.
     # The steps are ordered so that an interruption leaves EMBEDDING_LEGACY behind, which the
     # next run finishes (see above). Vector indexes are dropped first and rebuilt with the same
-    # organization and locality. They cannot be replayed from DBMS_METADATA.GET_DDL, which on
+    # organization and locality; their DDL is recorded in a column comment before the drop and
+    # cleared after the rebuild, so a run interrupted in between rebuilds them (see above). Oracle
+    # keeps a column's comment across RENAME COLUMN, and the recovery moves it off the legacy
+    # column before dropping it. They cannot be replayed from DBMS_METADATA.GET_DDL, which on
     # 23.26.3 returns a plain CREATE INDEX without the VECTOR clauses (ORA-02327 on replay);
     # custom index parameters are not kept, which is harmless on the empty table this runs on.
     cursor.execute(
@@ -886,13 +935,19 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
             f"DISTANCE COSINE WITH TARGET ACCURACY {_ORACLE_VECTOR_INDEX_TARGET_ACCURACY}"
             + (" LOCAL" if partitioned == "YES" else "")
         )
+    if index_ddl:
+        _set_oracle_pending_indexes(cursor, table_name, "embedding", index_ddl)
     for name in index_names:
         cursor.execute(f'DROP INDEX "{name}"')
     cursor.execute(f"ALTER TABLE {table_name} RENAME COLUMN embedding TO embedding_legacy")
     cursor.execute(f"ALTER TABLE {table_name} ADD (embedding VECTOR({required_dimension}, FLOAT32))")
+    if index_ddl:
+        _set_oracle_pending_indexes(cursor, table_name, "embedding", index_ddl)
     cursor.execute(f"ALTER TABLE {table_name} DROP COLUMN embedding_legacy")
     for ddl in index_ddl:
-        cursor.execute(ddl)
+        _create_oracle_vector_index(cursor, ddl)
+    if index_ddl:
+        _set_oracle_pending_indexes(cursor, table_name, "embedding", [])
     logger.info(
         f"Changed {table_name}.embedding dimension to {required_dimension} ({len(index_ddl)} vector index(es) rebuilt)"
     )
@@ -913,7 +968,16 @@ def _ensure_embedding_dimension_oracle(
         if schema:
             cursor.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{schema.replace(chr(34), chr(34) * 2)}"')
         for table_name in tables:
-            _ensure_oracle_table_embedding_dimension(cursor, table_name, required_dimension)
+            for attempt in range(1, _ORACLE_RECONCILE_ATTEMPTS + 1):
+                try:
+                    _ensure_oracle_table_embedding_dimension(cursor, table_name, required_dimension)
+                    break
+                except oracledb.DatabaseError as e:
+                    # Every step is re-derived from the catalog, so a retry resumes where the
+                    # concurrent worker left the table. RuntimeError (data mismatch) is not retried.
+                    if attempt == _ORACLE_RECONCILE_ATTEMPTS:
+                        raise
+                    logger.warning(f"Reconciling {table_name}.embedding raced another DDL ({e}); re-checking")
 
 
 def ensure_embedding_dimension(
