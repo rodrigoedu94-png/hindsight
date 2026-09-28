@@ -1,0 +1,23 @@
+hindsight-api-slim/hindsight_api/migrations.py
+  s_1d4e0e22102b43::t_86a9ea22464e83 29,785,799
+hindsight-embed/hindsight_embed/env.example
+  s_1d4e0e22102b43::t_6b8cc761d0b1fc 327-330
+.env.example
+  s_1d4e0e22102b43::t_176e24aae0d515 327-330
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ec57f45362191aadb63c4a2a996771197e88e2e4",
+  "prompts": {},
+  "sessions": {
+    "s_1d4e0e22102b43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24897b5e-98d1-4837-8d14-3cbcb0b5c051",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
