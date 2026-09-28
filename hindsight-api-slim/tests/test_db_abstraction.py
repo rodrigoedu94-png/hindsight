@@ -698,6 +698,22 @@ class TestOracleQueryRewriter:
         assert params["2"] == "bank"
         assert params["3"] == '["tag"]'
 
+    def test_vector_distance_operand_wrapped_in_to_vector_binds_natively(self):
+        """The retain link probe (link_utils) wraps the operand: VECTOR_DISTANCE(embedding, TO_VECTOR($3), ...)."""
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection, _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT id, 1 - VECTOR_DISTANCE(embedding, TO_VECTOR($3), COSINE) AS similarity "
+            "FROM memory_units WHERE bank_id = $1 AND id <> $2 "
+            "ORDER BY VECTOR_DISTANCE(embedding, TO_VECTOR($3), COSINE)"
+        )
+        params = {"1": "bank", "2": "id", "3": "[0.5, -0.25]"}
+        OracleConnection._bind_vectors_natively(query, params)
+        assert isinstance(params["3"], array.array)
+        assert params["1"] == "bank"
+
     @pytest.mark.parametrize(
         "query",
         [

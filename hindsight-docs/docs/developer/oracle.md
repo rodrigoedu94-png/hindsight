@@ -253,7 +253,7 @@ the configured embeddings model, as it does on PostgreSQL:
 | Column state | What happens |
 |--------------|--------------|
 | Same dimension as the model | Nothing. |
-| Other dimension, table empty (a fresh install) | The column is replaced with `VECTOR(<N>, FLOAT32)` and its vector indexes are rebuilt with the same organization. Oracle cannot change a `VECTOR` dimension in place (`ALTER TABLE … MODIFY` fails with `ORA-51859` even on an empty table), so the column is renamed, re-added and the old one dropped; an interrupted run is finished by the next one. |
+| Other dimension, table empty (a fresh install) | The column is replaced with `VECTOR(<N>, FLOAT32)` and its vector indexes are rebuilt with the same organization. Oracle cannot change a `VECTOR` dimension in place (`ALTER TABLE … MODIFY` fails with `ORA-51859` even on an empty table), so the column is renamed, re-added and the old one dropped; an interrupted run is finished by the next one, including the index rebuild (the dropped indexes' DDL is kept in a comment on the `embedding` column until they exist again). Workers booting together converge: one that loses a DDL race re-reads the catalog and carries on. |
 | Other dimension, embeddings stored | Startup fails with an explicit error. Re-embed the data or configure a model with the stored dimension. |
 | Flexible `VECTOR(*, *)` column (created by hand) | Accepted as long as every stored embedding has the model's dimension; never altered. |
 
