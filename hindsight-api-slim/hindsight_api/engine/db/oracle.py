@@ -90,8 +90,13 @@ _JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both
 _JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?)\s*\?\s*'(\w+)'")
 _JSONB_CONTAINS_RE = re.compile(r"(\w+)\s*@>\s*:(\d+)")
 _RESULT_METADATA_CONTAINS_RE = re.compile(r"((?:\w+\.)?result_metadata)\s*@>\s*:(\d+)", re.IGNORECASE)
-# The query-side operand of VECTOR_DISTANCE(<column>, :N, ...), after the rewrite.
+# Parameters that carry an embedding: the query-side operand of VECTOR_DISTANCE(<column>, :N, ...)
+# and values written to an embedding column (SET embedding = :N, or INSERT column/value lists).
 _VECTOR_DISTANCE_PARAM_RE = re.compile(r"VECTOR_DISTANCE\(\s*[\w.\"]+\s*,\s*:(\w+)", re.IGNORECASE)
+_EMBEDDING_ASSIGN_PARAM_RE = re.compile(r"\bembedding\s*=\s*:(\w+)", re.IGNORECASE)
+_INSERT_COLUMNS_VALUES_RE = re.compile(
+    r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*\((.*)\)", re.IGNORECASE | re.DOTALL
+)
 
 # ---------------------------------------------------------------------------
 # Argument conversion helpers
@@ -877,18 +882,29 @@ class OracleConnection(DatabaseConnection):
 
     @staticmethod
     def _bind_vectors_natively(query: str, params: dict[str, Any] | None) -> None:
-        """Bind VECTOR_DISTANCE operands as native vectors instead of text.
+        """Bind embedding parameters as native vectors instead of text.
 
-        Callers pass the query embedding as its str() — "[0.0123, ...]" — which would bind
-        as text (CLOB, see _apply_clob_input_sizes). Oracle converts text to VECTOR through a
-        32,767-byte buffer, and str() of a 1536-dimension embedding with full-precision floats
-        is ~33 KB, so recall failed with ORA-01460 for such providers (always at 3072
-        dimensions). An array('f') binds as DB_TYPE_VECTOR with no size limit; the columns
-        are FLOAT32, so nothing is lost.
+        Callers pass embeddings as their str() — "[0.0123, ...]" — which bind as text. Oracle
+        converts text to VECTOR through a 32,767-byte buffer, and str() of a 1536-dimension
+        embedding with full-precision floats is ~33 KB: recall failed with ORA-01460 and
+        writes (e.g. consolidation inserting an observation) with ORA-01461 for such
+        providers, and always at 3072 dimensions. An array('f') binds as DB_TYPE_VECTOR with
+        no size limit; the columns are FLOAT32, so nothing is lost. Only parameters used as
+        an embedding are converted (VECTOR_DISTANCE operand or a value of the embedding
+        column); other JSON-looking parameters keep their text binding.
         """
         if not params:
             return
-        for key in set(_VECTOR_DISTANCE_PARAM_RE.findall(query)):
+        keys = set(_VECTOR_DISTANCE_PARAM_RE.findall(query)) | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(query))
+        # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...): pair the lists by position.
+        insert = _INSERT_COLUMNS_VALUES_RE.search(query)
+        if insert:
+            columns = [c.strip().strip('"').lower() for c in insert.group(1).split(",")]
+            values = [v.strip() for v in _split_respecting_parens(insert.group(2))]
+            for column, value in zip(columns, values, strict=False):
+                if column == "embedding" and value.startswith(":"):
+                    keys.add(value[1:])
+        for key in keys:
             value = params.get(key)
             if isinstance(value, str) and value.startswith("["):
                 params[key] = array.array("f", json.loads(value))
