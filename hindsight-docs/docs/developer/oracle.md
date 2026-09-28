@@ -353,8 +353,10 @@ with `SYNC (ON COMMIT)`. Every query term is wrapped in braces, so Oracle Text
 reads it literally: reserved words (`NEAR`, `ABOUT`, …), operator characters and
 `_` (Oracle Text's one-character wildcard) cannot change the expression, and
 `snake_case` identifiers match the words the lexer indexed. Terms are
-deduplicated and capped by `HINDSIGHT_API_BM25_MAX_QUERY_TERMS`, like on
-PostgreSQL.
+deduplicated, capped by `HINDSIGHT_API_BM25_MAX_QUERY_TERMS` like on
+PostgreSQL, and combined with `ACCUM`, which ranks a memory higher the more query
+terms it contains (`OR` scores it by its best single term, so a common word ranks
+as high as the rare one the question is about).
 
 ## Hybrid search
 
