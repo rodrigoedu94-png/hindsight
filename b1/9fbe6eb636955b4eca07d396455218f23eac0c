@@ -1,0 +1,276 @@
+skills/hindsight-docs/references/developer/observations.md
+  s_1d4e0e22102b43::t_4f3332c00782df 197,262,350,356-359
+hindsight-api-slim/tests/test_mental_models.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1208-1283,1685-1722
+skills/hindsight-docs/references/developer/api/bank-templates.md
+  s_1d4e0e22102b43::t_4f3332c00782df 87,102
+skills/hindsight-docs/references/developer/performance.md
+  s_1d4e0e22102b43::t_4f3332c00782df 158
+hindsight-api-slim/hindsight_api/engine/search/reranking.py
+  s_1d4e0e22102b43::t_4f3332c00782df 11,410-413,416-421,452-453,463-467,474-477,481-482
+hindsight-integrations/meta-muse/README.md
+  s_1d4e0e22102b43::t_4f3332c00782df 52-57
+skills/hindsight-docs/references/developer/api/documents.md
+  s_1d4e0e22102b43::t_4f3332c00782df 10,30,538-539
+hindsight-api-slim/tests/test_local_cross_encoder.py
+  s_1d4e0e22102b43::t_4f3332c00782df 10-11,20,22,29,34,105-146,359-410
+hindsight-api-slim/tests/test_operation_retry_error_cleared.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1-129
+docker/docker-compose/cuda-onnx/docker-compose.yaml
+  s_1d4e0e22102b43::t_4f3332c00782df 1-36
+skills/hindsight-docs/references/developer/api/retain.md
+  s_1d4e0e22102b43::t_4f3332c00782df 15,270,278,282,563
+skills/hindsight-docs/references/sdks/hindsight-all-npm.md
+  s_1d4e0e22102b43::t_4f3332c00782df 7,11,89
+hindsight-api-slim/hindsight_api/worker/poller.py
+  s_1d4e0e22102b43::t_4f3332c00782df 870,999,1025-1026,1032-1033,1611
+hindsight-integrations/eve/src/index.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 2,4-6,9,11-12,14-18,22,24-25,27-41,45,50-51,57,62,66-67
+skills/hindsight-docs/references/developer/monitoring.md
+  s_1d4e0e22102b43::t_4f3332c00782df 334
+hindsight-integrations/eve/src/config.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 17-18,77-95,97,110-111,113-118
+hindsight-api-slim/tests/test_strip_code_fences.py
+  s_1d4e0e22102b43::t_4f3332c00782df 4-5,7,125-144
+hindsight-clients/python/hindsight_client_api/models/operation_status_response.py
+  s_1d4e0e22102b43::t_4f3332c00782df 35-37,49,115-129,200-202
+hindsight-api-slim/hindsight_api/engine/cross_encoder.py
+  s_1d4e0e22102b43::t_4f3332c00782df 12,34,73-92,205,227-229,237,353-357,364,369-387,2244
+hindsight-docs/blog/2026-09-28-hindsight-40k-stars.md
+  s_1d4e0e22102b43::t_4f3332c00782df 1-88
+hindsight-api-slim/hindsight_api/engine/providers/claude_code_llm.py
+  s_1d4e0e22102b43::t_4f3332c00782df 27,314-316,318
+hindsight-api-slim/tests/test_mcp_tools.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1685-1693,1729-1778
+hindsight-api-slim/tests/test_observation_invalidation.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1449-1498
+hindsight-api-slim/tests/test_reranker_failover_chain.py
+  s_1d4e0e22102b43::t_4f3332c00782df 21,291-322
+hindsight-api-slim/tests/test_consolidation.py
+  s_1d4e0e22102b43::t_4f3332c00782df 3312-3414
+skills/hindsight-docs/references/developer/api/main-methods.md
+  s_1d4e0e22102b43::t_4f3332c00782df 10,102,209,287,306-309
+hindsight-api-slim/tests/test_claude_code_llm_error_result.py
+  s_1d4e0e22102b43::t_4f3332c00782df 274-302
+hindsight-api-slim/hindsight_api/mcp_tools.py
+  s_1d4e0e22102b43::t_4f3332c00782df 13,34-40,1626,1750-1751,1766,1784-1785,1799,3235-3236,3248,3267-3268,3279,3469-3470,3506-3507,3804,3809,3819-3820,3832,3840,3848-3849,3860,3867,4001-4003,4007,4009-4010,4020-4023,4033-4037,4045,4053-4056,4065-4069,4076,4200,4205,4215-4216,4227,4235,4243-4244,4254,4261
+hindsight-api-slim/tests/test_onnx_runtime.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1-98
+hindsight-api-slim/tests/test_oracle_integration.py
+  s_1d4e0e22102b43::t_4f3332c00782df 23,633-733
+hindsight-api-slim/tests/test_tags_visibility.py
+  s_1d4e0e22102b43::t_4f3332c00782df 31-32,777-814
+hindsight-clients/go/api/openapi.yaml
+  s_1d4e0e22102b43::t_4f3332c00782df 11035-11040,11109-11117
+hindsight-clients/go/model_operation_status_response.go
+  s_1d4e0e22102b43::t_4f3332c00782df 27-29,154-279,730-738
+hindsight-docs/docs-integrations/meta-muse.md
+  s_1d4e0e22102b43::t_4f3332c00782df 38-41
+hindsight-integrations/eve/src/memory-provider.test.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 1-217
+skills/hindsight-docs/references/developer/memory-defense/index.md
+  s_1d4e0e22102b43::t_4f3332c00782df 51,53
+skills/hindsight-docs/references/developer/storage.md
+  s_1d4e0e22102b43::t_4f3332c00782df 45
+skills/hindsight-docs/references/developer/reflect.md
+  s_1d4e0e22102b43::t_4f3332c00782df 314-317
+hindsight-api-slim/hindsight_api/engine/embeddings.py
+  s_1d4e0e22102b43::t_4f3332c00782df 37-38,465-466,492-497,520-525,531-545,578,587-609,611-623,625-631,636-637,2216-2217
+hindsight-api-slim/hindsight_api/engine/providers/codex_llm.py
+  s_1d4e0e22102b43::t_4f3332c00782df 44,642-645
+skills/hindsight-docs/references/changelog/integrations/eve.md
+  s_1d4e0e22102b43::t_4f3332c00782df 13-20
+docker/docker-compose/cuda-onnx/verify_runtime.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1-29
+hindsight-integrations/eve/package.json
+  s_1d4e0e22102b43::t_4f3332c00782df 3-4,44,48
+docker/docker-compose/cuda-onnx/Dockerfile
+  s_1d4e0e22102b43::t_4f3332c00782df 1-42
+hindsight-system-tests/tests/test_31_mental_model_staleness.py
+  s_1d4e0e22102b43::t_4f3332c00782df 125-172
+skills/hindsight-docs/references/developer/api/memories.md
+  s_1d4e0e22102b43::t_4f3332c00782df 4,177,253
+hindsight-integrations/eve/src/memory-provider.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 1-147
+hindsight-api-slim/tests/test_litellm_json_repair.py
+  s_1d4e0e22102b43::t_4f3332c00782df 120-148
+hindsight-docs/static/bank-template-schema.json
+  s_1d4e0e22102b43::t_4f3332c00782df 1129
+hindsight-api-slim/hindsight_api/engine/memory_engine.py
+  s_1d4e0e22102b43::t_4f3332c00782df 583,685-692,1868-1872,1878-1879,3833,4874,5046,5097,12212-12215,12225-12236,12443-12446,12555-12556,12577,12583,12615-12616,12640,12646,12666-12682,21435-21437,21577-21580,21599-21602,21620-21621
+hindsight-api-slim/hindsight_api/engine/reflect/delta_ops.py
+  s_1d4e0e22102b43::t_4f3332c00782df 394-418,424-431,471-477,491-496,499,501-502,504
+skills/hindsight-docs/references/developer/api/mental-models.md
+  s_1d4e0e22102b43::t_4f3332c00782df 6,202,284,290-292,827,848,1120,1126,1229,1231
+.github/workflows/triage-labels.yml
+  s_1d4e0e22102b43::t_4f3332c00782df 1-26
+hindsight-api-slim/tests/test_mental_model_consolidation_refresh_scope.py
+  s_1d4e0e22102b43::t_4f3332c00782df 7-9,103,106-108,112,119,124,127-129,138,145,185,189-190,202
+hindsight-system-tests/tests/test_76_onnx_embeddings.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1-92
+hindsight-integrations/eve/src/auto-memory.test.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 104,107,110,122
+hindsight-docs/docs/developer/configuration.mdx
+  s_1d4e0e22102b43::t_4f3332c00782df 867-868,939-946,1197
+skills/hindsight-docs/references/developer/knowledge-pages.md
+  s_1d4e0e22102b43::t_4f3332c00782df 12,16,21,53,74
+hindsight-api-slim/tests/test_db_abstraction.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1579-1623
+hindsight-api-slim/tests/test_curation_validator_hooks.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1-265
+docker/docker-compose/cuda-onnx/runtime_dependencies.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1-18
+hindsight-api-slim/tests/test_onnx_embeddings.py
+  s_1d4e0e22102b43::t_4f3332c00782df 56-58,222,239-243,283-284,346-347,354-355,362-363,371-372
+hindsight-docs/blog/2026-09-28-meta-muse-agent-memory.md
+  s_1d4e0e22102b43::t_4f3332c00782df 1-198
+hindsight-api-slim/hindsight_api/engine/providers/cursor_llm.py
+  s_1d4e0e22102b43::t_4f3332c00782df 39,236-239
+skills/hindsight-docs/references/developer/mcp-server.md
+  s_1d4e0e22102b43::t_4f3332c00782df 539,565,570-573,605
+hindsight-api-slim/hindsight_api/engine/providers/litellm_llm.py
+  s_1d4e0e22102b43::t_4f3332c00782df 34,369-371,373,375-382
+hindsight-docs/docs/developer/mcp-server.md
+  s_1d4e0e22102b43::t_4f3332c00782df 539,565,570-573,605
+skills/hindsight-docs/references/sdks/cli.md
+  s_1d4e0e22102b43::t_4f3332c00782df 310
+skills/hindsight-docs/references/sdks/integrations/eve.md
+  s_1d4e0e22102b43::t_4f3332c00782df 4,8-19,26,30,33,35-36,38-42,45,47-51,61,64-66,68-72,76-82,84-87,91,93-106,110-116,121
+hindsight-docs/docs/developer/extensions.md
+  s_1d4e0e22102b43::t_4f3332c00782df 291-307
+hindsight-clients/go/model_operation_response.go
+  s_1d4e0e22102b43::t_4f3332c00782df 26-27,115-198,645-650
+hindsight-api-slim/hindsight_api/api/http.py
+  s_1d4e0e22102b43::t_4f3332c00782df 3152-3154,4355-4358,4370,4548-4555
+skills/hindsight-docs/references/developer/installation.md
+  s_1d4e0e22102b43::t_4f3332c00782df 35,49,58,64,67,112,120,122,214,216,233,360,425,431-432
+skills/hindsight-docs/references/developer/retain.md
+  s_1d4e0e22102b43::t_4f3332c00782df 192,355,389-392
+skills/hindsight-docs/references/developer/models.md
+  s_1d4e0e22102b43::t_4f3332c00782df 62,71,81,83,90,95,100,356,489,891,1090,1251
+hindsight-docs/docs-integrations/eve.md
+  s_1d4e0e22102b43::t_4f3332c00782df 4,9,13-24,31,35,38,40-41,43-47,50,52-56,66,69-71,73-77,81-87,89-92,96,98-111,115-121,126
+skills/hindsight-docs/references/developer/retrieval.md
+  s_1d4e0e22102b43::t_4f3332c00782df 149,245,267,428-430
+hindsight-docs/static/openapi.json
+  s_1d4e0e22102b43::t_4f3332c00782df 15465,15681,15980-16003,16041,16170-16205
+hindsight-integrations/eve/src/auto-memory.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 2-11,15-16,28-33,52-53,64,70,74,85-86
+skills/hindsight-docs/references/developer/configuration.md
+  s_1d4e0e22102b43::t_4f3332c00782df 37,249,268,314,542,857-858,928-935,1181,2040-2041,2434
+  s_1d4e0e22102b43::t_2b1d8c4805af2d 25,31
+hindsight-system-tests/tests/test_60_async_operations.py
+  s_1d4e0e22102b43::t_4f3332c00782df 116-131
+hindsight-docs/docs/developer/api/mental-models.mdx
+  s_1d4e0e22102b43::t_4f3332c00782df 209-210
+skills/hindsight-docs/references/developer/api/knowledge-pages.md
+  s_1d4e0e22102b43::t_4f3332c00782df 6,115,117,125,218,232,253-254,269,448,618
+scripts/triage-labels.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1-136
+skills/hindsight-docs/references/developer/extensions.md
+  s_1d4e0e22102b43::t_4f3332c00782df 291-307
+hindsight-clients/python/hindsight_client_api/models/operation_response.py
+  s_1d4e0e22102b43::t_4f3332c00782df 33-34,47,94-103,163-164
+hindsight-api-slim/hindsight_api/engine/db/oracle.py
+  s_1d4e0e22102b43::t_4f3332c00782df 141-151,707-720,860,1142,1151-1155,1415
+hindsight-api-slim/hindsight_api/engine/retain/chunk_storage.py
+  s_1d4e0e22102b43::t_4f3332c00782df 176-202
+hindsight-api-slim/hindsight_api/extensions/operation_validator.py
+  s_1d4e0e22102b43::t_4f3332c00782df 7,534-587,970-1012
+hindsight-integrations/eve/src/provider-core.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 1-218
+.env.example
+  s_1d4e0e22102b43::t_4f3332c00782df 387,399-400,566-569
+hindsight-api-slim/tests/test_delta_operation_parse.py
+  s_1d4e0e22102b43::t_4f3332c00782df 333-392
+hindsight-api-slim/tests/test_reranker_score_normalization.py
+  s_1d4e0e22102b43::t_4f3332c00782df 18,228-258
+docker/docker-compose/cuda-onnx/README.md
+  s_1d4e0e22102b43::t_4f3332c00782df 1-49
+hindsight-integrations/eve/src/client.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 7-9,34-38,41-46,52-64,97-107,128-134,140,144,147-152,156-164,172-182,189,191-210
+hindsight-integrations/eve/README.md
+  s_1d4e0e22102b43::t_4f3332c00782df 3-8,12,14-21,29,33,36,38-39,41-45,48,50-54,70,73,75-86,90,92,94-96,98-101,107-126,130-145,150-151
+hindsight-api-slim/hindsight_api/engine/providers/xai_oauth_llm.py
+  s_1d4e0e22102b43::t_4f3332c00782df 65,768
+hindsight-api-slim/hindsight_api/engine/search/tags.py
+  s_1d4e0e22102b43::t_4f3332c00782df 343-364
+hindsight-integrations/eve/src/provider-core.test.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 1-158
+hindsight-api-slim/tests/test_codex_strict_schema.py
+  s_1d4e0e22102b43::t_4f3332c00782df 195-216
+skills/hindsight-docs/references/developer/api/memory-banks.md
+  s_1d4e0e22102b43::t_4f3332c00782df 30,387,706
+skills/hindsight-docs/references/developer/mental-models.md
+  s_1d4e0e22102b43::t_4f3332c00782df 7,36,78
+scripts/generate-docs-skill.sh
+  s_1d4e0e22102b43::t_4f3332c00782df 495,542-553,555,588-590,593-594
+skills/hindsight-docs/references/sdks/go.md
+  s_1d4e0e22102b43::t_4f3332c00782df 49-50
+skills/hindsight-docs/references/developer/admin-cli.md
+  s_1d4e0e22102b43::t_4f3332c00782df 149,516
+skills/hindsight-docs/references/developer/api/quickstart.md
+  s_1d4e0e22102b43::t_4f3332c00782df 170-173
+skills/hindsight-docs/references/sdks/hindsight-all.md
+  s_1d4e0e22102b43::t_4f3332c00782df 11,30,92,148
+skills/hindsight-docs/references/developer/api/reflect.md
+  s_1d4e0e22102b43::t_4f3332c00782df 15,214,229,421
+hindsight-integrations/meta-muse/connect-prompt.md
+  s_1d4e0e22102b43::t_4f3332c00782df 42-50,53-56
+hindsight-embed/hindsight_embed/env.example
+  s_1d4e0e22102b43::t_4f3332c00782df 387,399-400,566-569
+hindsight-clients/typescript/generated/types.gen.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 4779,4889,5103-5114,5132,5193-5210
+skills/hindsight-docs/references/developer/api/operations.md
+  s_1d4e0e22102b43::t_4f3332c00782df 12,15,53,57,461,469-470
+skills/hindsight-docs/references/developer/oracle.md
+  s_1d4e0e22102b43::t_4f3332c00782df 17,228,276,412-415
+hindsight-api-slim/hindsight_api/engine/retain/link_utils.py
+  s_1d4e0e22102b43::t_4f3332c00782df 659-701,781
+hindsight-api-slim/hindsight_api/config.py
+  s_1d4e0e22102b43::t_4f3332c00782df 487-488,601,1232-1233,1286-1291,2661,2817,3171-3172,3217,3829,4459-4469,4658
+skills/hindsight-docs/references/developer/services.md
+  s_1d4e0e22102b43::t_4f3332c00782df 76,80,93
+hindsight-api-slim/hindsight_api/extensions/__init__.py
+  s_1d4e0e22102b43::t_4f3332c00782df 53-56,124-127
+hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
+  s_1d4e0e22102b43::t_4f3332c00782df 765-793,821-828,844,861,1495-1496,2283,2286-2287,2289-2296,2718-2727,2952-2954,3251-3252,3256,3265
+hindsight-api-slim/tests/test_onnx_cuda.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1-199
+hindsight-docs/src/data/integrations.json
+  s_1d4e0e22102b43::t_4f3332c00782df 426
+skills/hindsight-docs/references/developer/api/recall.md
+  s_1d4e0e22102b43::t_4f3332c00782df 15
+skills/hindsight-docs/references/sdks/integrations/meta-muse.md
+  s_1d4e0e22102b43::t_4f3332c00782df 32-34
+hindsight-api-slim/tests/test_cursor_llm.py
+  s_1d4e0e22102b43::t_4f3332c00782df 205-213
+skills/hindsight-docs/references/openapi.json
+  s_1d4e0e22102b43::t_4f3332c00782df 15465,15681,15980-16003,16041,16170-16205
+hindsight-docs/src/pages/changelog/integrations/eve.md
+  s_1d4e0e22102b43::t_4f3332c00782df 13-20
+hindsight-api-slim/tests/test_xai_oauth_llm.py
+  s_1d4e0e22102b43::t_4f3332c00782df 1590-1601
+hindsight-api-slim/hindsight_api/engine/memories/pg/reads.py
+  s_1d4e0e22102b43::t_4f3332c00782df 50,125
+hindsight-integrations/eve/src/client.test.ts
+  s_1d4e0e22102b43::t_4f3332c00782df 67-95,106-131
+hindsight-integrations/eve/package-lock.json
+  s_1d4e0e22102b43::t_8d18f30e3d68bc 3,9,13,22,26-28,33-34,45-47,59-61,66,69-70,86,99,111,617-619,623-640,644-646,661-663,678-680,695-697,712-714,729-731,746-748,763-765,780-782,797-799,814-816,831-833,848-850,865-867,1437-1439,1444-1446,1559-1561,1574-1576,1578,1609-1611,1615-1618,1684-1686,1690-1691,1701,1703-1706,1715,1718,1721,1724,1729-1738,1740-1742,1761-1763,1813-1815,1819-1820,1829-1830,1835-1837,1842-1844,1849-1851,2226-2228,2233-2235,2240-2243,2245-2251,2285-2287,2437-2439,2443,2453-2467,2516-2518,2550-2552,2762-2772,2791-2793,2795,3328-3330
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b19fbe6eb636955b4eca07d396455218f23eac0c",
+  "prompts": {},
+  "sessions": {
+    "s_1d4e0e22102b43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24897b5e-98d1-4837-8d14-3cbcb0b5c051",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
