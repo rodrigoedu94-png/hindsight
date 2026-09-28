@@ -1,0 +1,21 @@
+skills/hindsight-docs/references/developer/configuration.md
+  s_1d4e0e22102b43::t_f8ba0e5c1c1569 25,31-33,39,251
+skills/hindsight-docs/references/developer/oracle.md
+  s_1d4e0e22102b43::t_0fa070c6a00b8d 4-5,26,126-154,246-262,283,285-370,391-393,401-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9f0ab6d372b07552f897aa24d370c3e3a80fde84",
+  "prompts": {},
+  "sessions": {
+    "s_1d4e0e22102b43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24897b5e-98d1-4837-8d14-3cbcb0b5c051",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
