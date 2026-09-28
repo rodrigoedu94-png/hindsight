@@ -90,9 +90,10 @@ _JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both
 _JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?)\s*\?\s*'(\w+)'")
 _JSONB_CONTAINS_RE = re.compile(r"(\w+)\s*@>\s*:(\d+)")
 _RESULT_METADATA_CONTAINS_RE = re.compile(r"((?:\w+\.)?result_metadata)\s*@>\s*:(\d+)", re.IGNORECASE)
-# Parameters that carry an embedding: the query-side operand of VECTOR_DISTANCE(<column>, :N, ...)
-# and values written to an embedding column (SET embedding = :N, or INSERT column/value lists).
-_VECTOR_DISTANCE_PARAM_RE = re.compile(r"VECTOR_DISTANCE\(\s*[\w.\"]+\s*,\s*:(\w+)", re.IGNORECASE)
+# Parameters that carry an embedding: the query-side operand of VECTOR_DISTANCE(<column>, :N, ...),
+# bare or wrapped in TO_VECTOR (which accepts a native VECTOR bind too), and values written to an
+# embedding column (SET embedding = :N, or INSERT column/value lists).
+_VECTOR_DISTANCE_PARAM_RE = re.compile(r"VECTOR_DISTANCE\(\s*[\w.\"]+\s*,\s*(?:TO_VECTOR\(\s*)?:(\w+)", re.IGNORECASE)
 _EMBEDDING_ASSIGN_PARAM_RE = re.compile(r"\bembedding\s*=\s*:(\w+)", re.IGNORECASE)
 _INSERT_COLUMNS_VALUES_RE = re.compile(
     r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*\((.*)\)", re.IGNORECASE | re.DOTALL
