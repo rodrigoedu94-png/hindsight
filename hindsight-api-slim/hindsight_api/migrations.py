@@ -1859,7 +1859,10 @@ def run_migrations_for_schemas(
                 )
         return
 
-    worker_kwargs = dict(
+    # A kwargs BAG, assembled conditionally below. Inferred, its value type is the union of
+    # everything in it, so the `**` unpack is checked as if every key could be every type --
+    # one diagnostic per parameter of the callee, none of them real.
+    worker_kwargs: dict[str, Any] = dict(
         migration_database_url=migration_database_url,
         embedding_dimension=embedding_dimension,
         vector_extension=vector_extension,

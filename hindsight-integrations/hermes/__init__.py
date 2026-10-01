@@ -36,14 +36,17 @@ from .embedded import (
     _RETRIABLE_CONNECTION_MARKERS,
     _build_embedded_profile_env,
     _check_local_runtime,
+    _daemon_is_running,
     _embedded_llm_api_key,
     _embedded_profile_env_path,
-    _ensure_local_runtime,
     _export_port_health_grace_timeout,
+    _installed_api_binary_exists,
     _load_simple_env,
     _local_runtime_hint,
     _materialize_embedded_profile_env,
     _may_rewrite_profile_env,
+    _start_daemon,
+    _stop_daemon,
 )
 from .settings import (
     _DEFAULT_API_URL,
@@ -97,9 +100,16 @@ def _cloud_api_key(config: dict) -> str:
     return config.get("apiKey") or config.get("api_key") or get_secret("HINDSIGHT_API_KEY", "")
 
 
-def _maybe_upgrade_client() -> None:
-    """Auto-upgrade an outdated hindsight-client via the environment-aware lazy_deps
-    installer (sealed hosted venvs redirect to the durable target)."""
+def _warn_if_client_outdated() -> None:
+    """Warn when the installed ``hindsight-client`` is below what this plugin needs.
+
+    This used to try to fix it by calling ``tools.lazy_deps.install_specs``, which on
+    package-manager Hermes hands the process to the updater instead of installing (the loop in
+    NousResearch/hermes-agent#126494; upstream af26acab73 now raises ImportError). There is
+    nothing to repair at runtime anyway: the floor is declared in this plugin's
+    ``pyproject.toml``, so a version below it means the environment was built or stripped without
+    it, which a plugin update fixes and a lazy install would only paper over.
+    """
     try:
         from importlib.metadata import version as pkg_version
 
@@ -108,27 +118,13 @@ def _maybe_upgrade_client() -> None:
         installed = pkg_version("hindsight-client")
         if Version(installed) < Version(_MIN_CLIENT_VERSION):
             logger.warning(
-                "hindsight-client %s is outdated (need >=%s), attempting upgrade...", installed, _MIN_CLIENT_VERSION
+                "hindsight-client %s is older than this plugin needs (>=%s). "
+                "Run 'hermes plugins update hindsight' to prepare its declared dependencies.",
+                installed,
+                _MIN_CLIENT_VERSION,
             )
-            from tools.lazy_deps import install_specs
-
-            outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
-            if outcome.ok:
-                logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-            elif outcome.blocked:
-                logger.warning(
-                    "Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
-                    outcome.reason,
-                    _MIN_CLIENT_VERSION,
-                )
-            else:
-                logger.warning(
-                    "Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                    (outcome.stderr or "").strip() or "install error",
-                    _MIN_CLIENT_VERSION,
-                )
     except Exception:
-        pass  # packaging not available or other issue — proceed anyway
+        pass  # packaging or metadata unavailable — proceed anyway
 
 
 # update_mode='append' capability (Hindsight >= 0.5.0), cached per (API URL, key fingerprint)
@@ -395,7 +391,9 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._config = self._api_key = self._client = None
-        self._api_url, self._llm_base_url, self._mode = _DEFAULT_API_URL, "", "cloud"
+        self._embedded_url = None
+        self._client_lock = threading.Lock()
+        self._api_url, self._mode = _DEFAULT_API_URL, "cloud"
         self._timeout, self._idle_timeout = _DEFAULT_TIMEOUT, _DEFAULT_IDLE_TIMEOUT
         self._bank_id, self._budget, self._bank_id_template = "hermes", "mid", ""
         self._bank_mission, self._bank_retain_mission = "", None
@@ -452,7 +450,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 # The availability gate is the only place worth self-healing from: agent_init drops
                 # the provider outright when this returns False, and every other runtime probe below
                 # runs after it has already passed.
-                return _ensure_local_runtime()[0]
+                return _check_local_runtime().available
             return mode == "local_external" or bool(
                 _cloud_api_key(cfg) or cfg.get("api_url") or get_secret("HINDSIGHT_API_URL", "")
             )
@@ -472,8 +470,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 return ""
         except Exception:
             return ""
-        available, reason = _check_local_runtime()
-        return "" if available else _local_runtime_hint(reason).strip()
+        status = _check_local_runtime()
+        return "" if status.available else _local_runtime_hint(status.reason).strip()
 
     def save_config(self, values, hermes_home):
         """Merge *values* into $HERMES_HOME/hindsight/config.json."""
@@ -702,33 +700,44 @@ class HindsightMemoryProvider(MemoryProvider):
         return _parse_int_setting(os.environ.get(env_var, env_default) if value is None else value, default)
 
     def _new_embedded_client(self):
-        available, reason = _check_local_runtime()
-        if not available:
-            raise RuntimeError("Hindsight local runtime is unavailable" + (f": {reason}" if reason else ""))
-        from hindsight import HindsightEmbedded
+        """Client for local_embedded: start the daemon out-of-process, then talk HTTP to it.
 
-        HindsightEmbedded.__del__ = lambda self: None
+        This used to be ``from hindsight import HindsightEmbedded``, which required the
+        ``hindsight-all`` package — the entire hindsight-api-slim server tree — inside Hermes'
+        venv, where it cannot resolve against Hermes' pinned extras. ``HindsightEmbedded`` is
+        only ``hindsight_client.Hindsight`` + ``hindsight_embed.get_embed_manager()``, so we
+        compose the same two packages ourselves. Same daemon, same profile, same profile ``.env``,
+        same pg0 database: nothing of an existing user's data or config moves.
+        """
+        status = _check_local_runtime()
+        if not status.available:
+            raise RuntimeError(
+                "Hindsight local runtime is unavailable" + (f": {status.reason}" if status.reason else "")
+            )
+        from hindsight_client import Hindsight
+
         cfg = self._config
-        llm_provider = _daemon_llm_provider(cfg.get("llm_provider", ""))
-        logger.debug(
-            "Creating HindsightEmbedded client (profile=%s, provider=%s)", cfg.get("profile", "hermes"), llm_provider
-        )
+        profile = str(cfg.get("profile", "hermes") or "hermes")
         self._idle_timeout = self._int_setting(
             "idle_timeout",
             "HINDSIGHT_IDLE_TIMEOUT",
             _DEFAULT_IDLE_TIMEOUT,
             env_default=self._idle_timeout,
         )
-        kwargs = dict(
-            profile=cfg.get("profile", "hermes"),
-            llm_provider=llm_provider,
-            llm_api_key=_embedded_llm_api_key(cfg),
-            llm_model=cfg.get("llm_model", ""),
-            idle_timeout=self._idle_timeout,
+        # Only explicitly-configured keys: an omitted one is resolved by the daemon from the
+        # profile .env, then the parent environment (#3253). This mirrors HindsightEmbedded's
+        # own config assembly so the daemon sees exactly what it saw before.
+        daemon_config = _build_embedded_profile_env(cfg)
+        daemon_config["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(self._idle_timeout)
+        logger.debug(
+            "Starting embedded Hindsight daemon (profile=%s, provider=%s)",
+            profile,
+            daemon_config.get("HINDSIGHT_API_LLM_PROVIDER", ""),
         )
-        if self._llm_base_url:
-            kwargs["llm_base_url"] = self._llm_base_url
-        return HindsightEmbedded(**kwargs)
+        self._announce_slow_first_start(profile)
+        self._embedded_url = _start_daemon(daemon_config, profile)
+        logger.info("Connected to embedded Hindsight daemon at %s", self._embedded_url)
+        return Hindsight(base_url=self._embedded_url)
 
     def _new_cloud_client(self):
         from hindsight_client import Hindsight
@@ -744,11 +753,51 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return Hindsight(**kwargs)
 
+    def _announce_slow_first_start(self, profile: str) -> None:
+        """Tell the user once when the embedded daemon is about to be fetched, not just started.
+
+        With no ``hindsight-api`` binary in the environment the daemon runs through
+        ``uvx hindsight-api@<version>``, which downloads the server (and its ML stack) into uv's
+        cache before it can boot. Until now nothing reached the user during that: the manager's
+        Rich panel is written to ~/.hermes/logs/hindsight-embed.log and only after the attempt
+        ends, so a first run looked like Hermes hanging, and #4936 reported a reply that took
+        6m23s, retained nothing and printed no error. Same sink as the root-refusal notice.
+        """
+        if _daemon_is_running(profile) or _installed_api_binary_exists():
+            return
+        msg = (
+            "Hindsight is downloading its local memory server (0.5-3 GB on first use, depending "
+            "on platform). "
+            "Memory will start working once it finishes; progress is in "
+            f"{get_hermes_home() / 'logs' / 'hindsight-embed.log'}."
+        )
+        logger.info(msg)
+        with contextlib.suppress(Exception):
+            if self._warning_callback is not None:
+                self._warning_callback(msg)
+            else:
+                from gateway.warning_notifications import render_notification
+
+                render_notification(
+                    lambda: print(f"  ⏳ {msg}", file=sys.stderr, flush=True),
+                    platform=self._platform,
+                )
+
     def _get_client(self):
-        """Return the cached Hindsight client (created once, reused)."""
-        if self._client is None:
-            self._client = self._new_embedded_client() if self._mode == "local_embedded" else self._new_cloud_client()
-        return self._client
+        """Return the cached Hindsight client, creating it at most once.
+
+        Locked because in local_embedded the creation *starts the daemon*: the background start
+        worker and the first memory operation both land here, and an unguarded check-then-set let
+        them each start one and build one client, of which the loser was dropped without being
+        closed (an unclosed aiohttp session). threading.Lock, not asyncio: these are threads, and
+        the guarded section never awaits.
+        """
+        with self._client_lock:
+            if self._client is None:
+                self._client = (
+                    self._new_embedded_client() if self._mode == "local_embedded" else self._new_cloud_client()
+                )
+            return self._client
 
     def _run_sync(self, coro):
         """Schedule *coro* on the shared loop using the configured timeout."""
@@ -919,7 +968,7 @@ class HindsightMemoryProvider(MemoryProvider):
         minted at initialize / switch time) and don't pass ``update_mode`` at all — that's the only way the
         resume-overwrite fix (#6654) keeps working on legacy servers.
         """
-        url = getattr(self._client, "url", None) if self._mode == "local_embedded" else None
+        url = self._embedded_url if self._mode == "local_embedded" else None
         probe_url = str(url) if url else (self._api_url or "")
         if self._session_id and _check_api_supports_update_mode_append(probe_url, self._api_key):
             return self._session_id, "append"
@@ -938,7 +987,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._platform = str(kwargs.get("platform") or "cli")
         # session_id stays in tags so processes for one session remain filterable together.
         self._document_id = _mint_document_id(self._session_id)
-        _maybe_upgrade_client()
+        _warn_if_client_outdated()
 
         self._config = cfg = _load_config()
         for name in _SESSION_KWARGS:
@@ -953,12 +1002,12 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._mode == "local_embedded":
             # Must precede the daemon_embed_manager import, which reads it at import time.
             _export_port_health_grace_timeout(cfg)
-            available, reason = _check_local_runtime()
-            if not available:
+            status = _check_local_runtime()
+            if not status.available:
                 logger.warning(
                     "Hindsight local mode disabled because its runtime could not be imported: %s.%s",
-                    reason,
-                    _local_runtime_hint(reason),
+                    status.reason,
+                    _local_runtime_hint(status.reason),
                 )
                 self._mode = "disabled"
                 return
@@ -1013,7 +1062,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._api_key = _cloud_api_key(cfg)
         default_url = _DEFAULT_LOCAL_URL if self._mode in {"local_embedded", "local_external"} else _DEFAULT_API_URL
         self._api_url = cfg.get("api_url") or get_secret("HINDSIGHT_API_URL", "") or default_url
-        self._llm_base_url = cfg.get("llm_base_url", "")
 
         banks = cfg_get(cfg, "banks", "hermes", default={})
         self._bank_id_template = cfg.get("bank_id_template", "") or ""
@@ -1141,21 +1189,20 @@ class HindsightMemoryProvider(MemoryProvider):
 
             dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
 
-            client = self._get_client()
             profile = self._config.get("profile", "hermes")
             # Profile .env out of sync with config -> rewrite and restart a running daemon.
             # Fail-closed on key material: when this process holds no key (no secret
             # scope on this thread) but the file does, a rewrite would destroy the
             # only key copy the daemon subprocess can read. Skip the write AND the
             # stop: restarting the daemon now would boot it keyless, which is the
-            # exact outage this guards against. _get_client() above already passed
-            # whatever key WAS available into the in-process client kwargs.
+            # exact outage this guards against. _get_client() below sends the daemon
+            # whatever key WAS available (config, secret scope, or the file itself).
             if _load_simple_env(_embedded_profile_env_path(self._config)) != _build_embedded_profile_env(self._config):
                 if _may_rewrite_profile_env(self._config):
                     _materialize_embedded_profile_env(self._config)
-                    if client._manager.is_running(profile):
+                    if _daemon_is_running(profile):
                         _log("\n=== Config changed, restarting daemon ===\n")
-                        client._manager.stop(profile)
+                        _stop_daemon(profile)
                 else:
                     logger.warning(
                         "Hindsight profile env for %r holds an LLM API key this process cannot see "
@@ -1163,7 +1210,10 @@ class HindsightMemoryProvider(MemoryProvider):
                         profile,
                     )
                     _log("\n=== Profile env has a key this process cannot see; left untouched ===\n")
-            client._ensure_started()
+            # Builds the client, which starts (or reuses) the daemon. This runs AFTER the
+            # profile-env reconciliation above on purpose: the daemon reads that file at boot,
+            # so starting first would pin the stale values for the life of the process.
+            self._get_client()
             _log("\n=== Daemon started successfully ===\n")
         except Exception as e:
             _log(f"\n=== Daemon startup failed: {e} ===\n" + traceback.format_exc())
@@ -1574,19 +1624,14 @@ class HindsightMemoryProvider(MemoryProvider):
         )
 
     def _close_client(self) -> None:
-        if self._mode != "local_embedded":
-            self._run_sync(self._client.aclose())
-            return
-        # HindsightEmbedded.close() closes its sync client from this thread ("attached
-        # to a different loop" before aiohttp releases the session): aclose the inner
-        # client on the shared loop first, then let the wrapper clean up bookkeeping.
-        inner_client = getattr(self._client, "_client", None)
-        if inner_client is not None and hasattr(inner_client, "aclose"):
-            _run_sync(inner_client.aclose())
-            with contextlib.suppress(Exception):
-                self._client._client = None
-        with contextlib.suppress(RuntimeError):
-            self._client.close()
+        """Both modes now hold a plain ``hindsight_client.Hindsight``, so one aclose on the
+        shared loop is the whole story. The old local_embedded branch existed because
+        ``HindsightEmbedded.close()`` closed its inner sync client from the calling thread
+        ("attached to a different loop" before aiohttp released the session); there is no
+        wrapper to unwind any more. The daemon deliberately outlives us — it is shared with
+        the hindsight-embed CLI and other profiles' clients.
+        """
+        self._run_sync(self._client.aclose())
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")

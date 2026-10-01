@@ -40,8 +40,10 @@ export const CODING_AGENT_HARNESSES: CodingAgentHarness[] = [
   {id: 'copilot-cli', label: 'GitHub Copilot CLI', file: 'copilot-cli.svg'},
   {id: 'grok-build', label: 'Grok Build', file: 'grok-build.svg'},
   {id: 'qwen-code', label: 'Qwen Code', file: 'qwen-code.svg'},
+  {id: 'kimi-code', label: 'Kimi Code', file: 'kimi-code.svg'},
   {id: 'factory-droid', label: 'Factory Droid', file: 'factory-droid.svg'},
   {id: 'zcode', label: 'ZCode', file: 'zcode.svg'},
+  {id: 'traecode', label: 'TraeCode', file: 'traecode.png'},
   {id: 'antigravity-cli', label: 'Antigravity CLI', file: 'antigravity-cli.png'},
   {id: 'devin-cli', label: 'Devin CLI', file: 'devin-cli.svg'},
   {id: 'cline-cli', label: 'Cline CLI', file: 'cline-cli.svg'},
@@ -53,3 +55,14 @@ export const CODING_AGENT_HARNESSES: CodingAgentHarness[] = [
 /** Public path of a harness icon, for surfaces that want the URL rather than the file name. */
 export const harnessIconPath = (harness: CodingAgentHarness): string =>
   `/img/harness/${harness.file}`;
+
+/**
+ * Deep link to a harness's install section on the Coding Agents page.
+ *
+ * Docusaurus slugs those headings from their text, and the `<img>` each one opens with contributes a
+ * leading space — hence the `-` prefix on an otherwise ordinary slug. The integration's
+ * `src/docs-harness-roster.test.ts` asserts a `#### <img …/> <label>` section exists for every entry
+ * here, so the target of this link cannot quietly disappear.
+ */
+export const harnessDocLink = (harness: CodingAgentHarness): string =>
+  `/sdks/integrations/coding-agents#-${harness.label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;

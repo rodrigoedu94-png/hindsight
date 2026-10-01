@@ -36,13 +36,14 @@ from typing import Any
 
 from ....config import get_config
 from ...db.base import DatabaseConnection
-from ...retain.link_utils import (
+from ...search.tags import TagsMatch
+from ..base import EntityPrunePassResult, RelinkPassResult
+from .links import (
     MAX_TEMPORAL_LINKS_PER_UNIT,
     _bulk_insert_links,
     _normalize_datetime,
     compute_semantic_links_ann,
 )
-from ..base import EntityPrunePassResult, RelinkPassResult
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,7 @@ async def graph_units(
     document_id: str | None = None,
     chunk_id: str | None = None,
     tags: list[str] | None = None,
-    tags_match: str = "all_strict",
+    tags_match: TagsMatch = "all_strict",
     limit: int = 1000,
 ) -> dict[str, Any]:
     """Memory nodes for the graph view, plus the total matching count.
@@ -627,7 +628,7 @@ async def relink_pass(
     probe — so it has to acquire its own.
 
     ``config`` is the caller's resolved configuration. The Postgres pass takes
-    its caps from retain's link_utils (so relink and retain agree on what "full"
+    its caps from retain's links module (so relink and retain agree on what "full"
     means) and never reads it; it is accepted so a store that *does* tune its
     relinking gets it.
 

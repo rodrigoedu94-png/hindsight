@@ -65,7 +65,8 @@ _TOOL_ARG_MAX_TOKENS = 16000
 
 #: Default budget for ``search_observations``: the value the tool schema advertises
 #: to the model. It is the floor of the chain a bank can raise or lower through
-#: ``reflect_default_options.reflect_search_observations_max_tokens`` (or a mental model's trigger),
+#: ``reflect_default_options.reflect_search_observations_max_tokens`` (or, for a refresh, the
+#: mental model's own trigger, which does not read ``reflect_default_options``),
 #: which is why it stays a plain constant here rather than a ``config`` field.
 DEFAULT_OBSERVATIONS_TOOL_MAX_TOKENS = 5000
 
@@ -140,7 +141,7 @@ def _build_directives_applied(directives: list[dict[str, Any]] | None) -> list[D
 
 
 if TYPE_CHECKING:
-    from ..llm_wrapper import LLMProvider
+    from ..llm_wrapper import AnyLLMProvider
     from ..response_models import LLMToolCall
 
 logger = logging.getLogger(__name__)
@@ -250,7 +251,7 @@ def _is_done_tool(name: str) -> bool:
 async def _generate_structured_output(
     answer: str,
     response_schema: dict,
-    llm_config: "LLMProvider",
+    llm_config: "AnyLLMProvider",
     reflect_id: str,
     max_tokens: int | None = None,
 ) -> StructuredOutputResult:
@@ -513,7 +514,7 @@ def _spawn_cache_cleanup(
 
 
 async def run_reflect_agent(
-    llm_config: "LLMProvider",
+    llm_config: "AnyLLMProvider",
     bank_id: str,
     query: str,
     bank_profile: dict[str, Any],
@@ -572,7 +573,7 @@ async def run_reflect_agent(
 
 
 async def _run_reflect_agent_inner(
-    llm_config: "LLMProvider",
+    llm_config: "AnyLLMProvider",
     bank_id: str,
     query: str,
     bank_profile: dict[str, Any],
@@ -1638,7 +1639,7 @@ async def _rewrite_to_length_budget(
     answer: str,
     document: StructuredDocument | None,
     max_tokens: int | None,
-    llm_config: "LLMProvider | None",
+    llm_config: "AnyLLMProvider | None",
 ) -> LengthRewrite:
     """Shorten ``answer`` to the caller's visible-length budget, if it overruns.
 
@@ -1729,7 +1730,7 @@ async def _process_done_tool(
     log_completion: Callable,
     reflect_id: str,
     directives_applied: list[DirectiveInfo],
-    llm_config: "LLMProvider | None" = None,
+    llm_config: "AnyLLMProvider | None" = None,
     response_schema: dict | None = None,
     max_tokens: int | None = None,
 ) -> ReflectAgentResult:
