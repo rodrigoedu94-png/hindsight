@@ -22,7 +22,7 @@ import random
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta, timezone
@@ -321,7 +321,7 @@ def _ingress_for_contents(
     contents: "Iterable[Mapping[str, Any]]",
     document_id: str | None,
     *extra_contents: "Iterable[Mapping[str, Any]]",
-    keep: "Mapping[str, Sequence[str]] | None" = None,
+    keep: "Mapping[str, Iterable[str]] | None" = None,
 ) -> "Mapping[str, Sequence[str]] | None":
     """The slice of a request-wide ingress map this retain call covers.
 
@@ -357,6 +357,32 @@ def _ingress_for_contents(
         for d, ids in ingress_attachments.items()
         if d in covered
     }
+
+
+def _claim_ingress_contents(
+    committed_attachments: "MutableMapping[str, set[str]] | None",
+    contents: "Iterable[Mapping[str, Any]]",
+    document_id: str | None,
+) -> None:
+    """Record the short ids a successful retain call committed or queued.
+
+    The HTTP layer passes the same map to every strategy group of a request,
+    so the claims must reflect what the call actually retained — the
+    post-validator ``contents``, not what was submitted. A call that raises
+    never reaches this: only ids backed by a committed or queued retain get
+    kept out of a later group's refusal.
+    """
+    if committed_attachments is None:
+        return
+    from .retain.attachment_content import iter_placeholder_ids
+
+    for item in contents:
+        doc = item.get("document_id") or document_id
+        if not isinstance(doc, str):
+            continue
+        ids = committed_attachments.setdefault(doc, set())
+        ids.update(iter_placeholder_ids(str(item.get("content") or "")))
+        ids.update(item.get("attachment_filenames") or {})
 
 
 def fq_table(table_name: str) -> str:
@@ -6473,7 +6499,7 @@ class MemoryEngine(MemoryEngineInterface):
         strategy: str | None = None,
         fold_members: list[FoldMemberRef] | None = None,
         ingress_attachments: "Mapping[str, Sequence[str]] | None" = None,
-        committed_attachments: "Mapping[str, Sequence[str]] | None" = None,
+        committed_attachments: "MutableMapping[str, set[str]] | None" = None,
     ):
         """
         Store multiple content items as memory units in ONE batch operation.
@@ -6760,6 +6786,10 @@ class MemoryEngine(MemoryEngineInterface):
                 total_processed_content_tokens = merge_processed_content_tokens(
                     total_processed_content_tokens, group_outcome.processed_content_tokens
                 )
+
+        # The batch retained these contents — their attachment ids now back
+        # committed units, so a later group's refusal may not take them back.
+        _claim_ingress_contents(committed_attachments, contents, document_id)
 
         # A cancelled run (bank deleted mid-flight) skips the completion side
         # effects, mirroring the pre-grouping early return from the sub-batch loop.
@@ -22197,7 +22227,7 @@ class MemoryEngine(MemoryEngineInterface):
         strategy: str | None = None,
         operation_id: str | None = None,
         ingress_attachments: "Mapping[str, Sequence[str]] | None" = None,
-        committed_attachments: "Mapping[str, Sequence[str]] | None" = None,
+        committed_attachments: "MutableMapping[str, set[str]] | None" = None,
     ) -> dict[str, Any]:
         """Submit a batch retain operation to run asynchronously.
 
@@ -22492,6 +22522,10 @@ class MemoryEngine(MemoryEngineInterface):
         # synchronous execution against the now-committed rows.
         for full_payload in deferred_child_payloads:
             await self._task_backend.submit_task(full_payload)
+
+        # The children are queued — their contents' attachment ids now back a
+        # pending retain a later group's refusal may not take back.
+        _claim_ingress_contents(committed_attachments, contents, None)
 
         return {
             "operation_id": str(parent_operation_id),

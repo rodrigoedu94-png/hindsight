@@ -10084,8 +10084,10 @@ def _register_routes(app: FastAPI):
                 # Async processing: one submit per strategy group
                 all_operation_ids = []
                 total_items_count = 0
-                # Short ids an earlier group's items already queued a retain
-                # for — a later group's refusal must not take those back.
+                # Short ids an earlier group's queued retain now backs — a
+                # later group's refusal must not take those back. The engine
+                # adds to this map after a successful submit, using the
+                # post-validator contents rather than what was submitted.
                 claimed_attachments: dict[str, set[str]] = {}
                 for group_strategy, contents in strategy_groups.items():
                     result = await app.state.memory.submit_async_retain(
@@ -10098,12 +10100,6 @@ def _register_routes(app: FastAPI):
                         ingress_attachments=ingress_attachments,
                         committed_attachments=claimed_attachments,
                     )
-                    for item in contents:
-                        doc = item.get("document_id")
-                        if isinstance(doc, str):
-                            ids = claimed_attachments.setdefault(doc, set())
-                            ids.update(iter_placeholder_ids(str(item.get("content") or "")))
-                            ids.update(item.get("attachment_filenames") or {})
                     all_operation_ids.append(result["operation_id"])
                     total_items_count += result["items_count"]
                 return RetainResponse.model_validate(
@@ -10152,12 +10148,6 @@ def _register_routes(app: FastAPI):
                                 schema=_current_schema.get(),
                             ),
                         )
-                        for item in contents:
-                            doc = item.get("document_id")
-                            if isinstance(doc, str):
-                                ids = claimed_attachments.setdefault(doc, set())
-                                ids.update(iter_placeholder_ids(str(item.get("content") or "")))
-                                ids.update(item.get("attachment_filenames") or {})
                         total_items_count += len(contents)
                         if usage:
                             total_usage = TokenUsage(

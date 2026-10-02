@@ -644,4 +644,15 @@ mod tag_filter_tests {
         let f = tag_filter(vec![], None, Some("[]".into())).unwrap();
         assert_eq!((f.tags_match, f.tag_groups.as_deref()), (None, Some("[]")));
     }
+
+    #[test]
+    fn tags_and_tag_groups_are_mutually_exclusive() {
+        let groups = Some(r#"[["a","b"]]"#.to_string());
+        let err = tag_filter(vec!["user:kate".into()], None, groups.clone()).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+        let f = tag_filter(vec!["user:kate".into()], None, None).unwrap();
+        assert_eq!(f.tags, vec!["user:kate".to_string()]);
+        let f = tag_filter(vec![], None, groups).unwrap();
+        assert_eq!(f.tag_groups.as_deref(), Some(r#"[["a","b"]]"#));
+    }
 }
