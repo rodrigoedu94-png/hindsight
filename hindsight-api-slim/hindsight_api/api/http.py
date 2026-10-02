@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 
 from hindsight_api import MemoryEngine
 from hindsight_api.config import RETAIN_EXTRACTION_MODES
@@ -215,6 +215,7 @@ from hindsight_api.engine.interface import BankTemplateImportWrite
 from hindsight_api.engine.memory_engine import (
     KEEP_PARENT,
     Budget,
+    KnowledgeTagFilter,
     RetainOperationConflictError,
     VisionNotSupportedError,
     _current_schema,
@@ -249,6 +250,36 @@ from hindsight_api.engine.retain.attachment_content import (
 from hindsight_api.engine.retain.attachment_store import StoredAttachment
 from hindsight_api.engine.search.tag_resolution import needs_resolution
 from hindsight_api.engine.search.tags import TagGroup, TagsMatch
+
+_TAG_GROUPS_ADAPTER: TypeAdapter[list[TagGroup]] = TypeAdapter(list[TagGroup])
+
+_TAG_GROUPS_QUERY_DESCRIPTION = (
+    "Compound tag filter as a JSON-encoded list of tag groups — the same shape `tag_groups` takes in a "
+    "recall body (leaves {tags, match, resolve} and {and: [...]}, {or: [...]}, {not: ...}; groups are "
+    "AND-ed). Mutually exclusive with `tags`."
+)
+
+
+def _parse_tag_groups_query(raw: str | None, tags: list[str] | None) -> list[TagGroup] | None:
+    """Parse a ``tag_groups`` query parameter.
+
+    A GET cannot carry a body, so the tree that recall takes as JSON arrives as a
+    JSON-encoded string. Invalid JSON or an invalid tree is a 400, and so is sending it
+    alongside ``tags`` — the same rule recall enforces on its body.
+    """
+    if raw is None:
+        return None
+    if tags:
+        raise HTTPException(
+            status_code=400,
+            detail="'tags' and 'tag_groups' are mutually exclusive. Use 'tag_groups' for compound filtering.",
+        )
+    try:
+        return _TAG_GROUPS_ADAPTER.validate_json(raw)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid tag_groups: {e.errors(include_url=False)}")
+
+
 from hindsight_api.engine.structured_output import validate_response_schema
 from hindsight_api.engine.time_filter import DocumentTimeField, MemoryTimeField
 from hindsight_api.engine.token_encoding import count_tokens
@@ -3578,6 +3609,31 @@ def _knowledge_node_model(node: dict[str, Any]) -> KnowledgeNode:
     )
 
 
+def _knowledge_tag_filter(
+    tags: list[str] | None = Query(
+        None,
+        description="Only return pages carrying these tags (matched per `tags_match`, like recall).",
+    ),
+    tags_match: TagsMatch = Query(
+        "any",
+        description="How `tags` match a page's tags: any, all, any_strict, all_strict, exact. "
+        "'any'/'all' also return untagged pages; the _strict modes and 'exact' do not.",
+    ),
+    tag_groups: str | None = Query(
+        None,
+        description="JSON-encoded compound tag filter, same shape as recall's `tag_groups`, e.g. "
+        '`[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. '
+        "Top-level groups are AND-ed. Mutually exclusive with `tags`.",
+    ),
+) -> KnowledgeTagFilter:
+    """Query-string tag filter shared by the knowledge-base tree and search."""
+    groups = _parse_tag_groups_query(tag_groups, tags)
+    return KnowledgeTagFilter(tags=tags or None, tags_match=tags_match, tag_groups=groups)
+
+
+_TAG_GROUPS_ADAPTER: TypeAdapter[list[TagGroup]] = TypeAdapter(list[TagGroup])
+
+
 def _build_knowledge_tree(nodes: list[dict[str, Any]]) -> list[KnowledgeNode]:
     """Assemble the flat node list into a nested tree of roots."""
     models = {n["id"]: _knowledge_node_model(n) for n in nodes}
@@ -6581,12 +6637,27 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         limit: int = Query(default=100, ge=0, description="Maximum number of entities to return"),
         offset: int = Query(default=0, ge=0, description="Offset for pagination"),
+        tags: list[str] | None = Query(
+            default=None,
+            description=(
+                "Only count memories carrying these tags. An entity is returned only when a matching "
+                "memory mentions it, and its mention count and dates cover the matching memories only."
+            ),
+        ),
+        tags_match: TagsMatch = Query(default="any", description="How `tags` match (same modes as listing memories)."),
+        tag_groups: str | None = Query(default=None, description=_TAG_GROUPS_QUERY_DESCRIPTION),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """List entities for a memory bank with pagination."""
         try:
             data = await app.state.memory.list_entities(
-                bank_id, limit=limit, offset=offset, request_context=request_context
+                bank_id,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=_parse_tag_groups_query(tag_groups, tags),
+                limit=limit,
+                offset=offset,
+                request_context=request_context,
             )
             return EntityListResponse(
                 items=[EntityListItem(**e) for e in data["items"]],
@@ -6614,12 +6685,27 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         limit: int = Query(default=1000, ge=0, description="Maximum number of co-occurrence edges to return"),
         min_count: int = Query(default=1, description="Minimum cooccurrence_count to include an edge"),
+        tags: list[str] | None = Query(
+            default=None,
+            description=(
+                "Only count memories carrying these tags. Edges and node mention counts are "
+                "computed from the matching memories only."
+            ),
+        ),
+        tags_match: TagsMatch = Query(default="any", description="How `tags` match (same modes as listing memories)."),
+        tag_groups: str | None = Query(default=None, description=_TAG_GROUPS_QUERY_DESCRIPTION),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Return entity co-occurrence graph for a bank."""
         try:
             return await app.state.memory.get_entity_graph(
-                bank_id, limit=limit, min_count=min_count, request_context=request_context
+                bank_id,
+                limit=limit,
+                min_count=min_count,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=_parse_tag_groups_query(tag_groups, tags),
+                request_context=request_context,
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
@@ -6637,11 +6723,29 @@ def _register_routes(app: FastAPI):
         tags=["Entities"],
     )
     async def api_get_entity(
-        bank_id: str, entity_id: str, request_context: RequestContext = Depends(get_request_context)
+        bank_id: str,
+        entity_id: str,
+        tags: list[str] | None = Query(
+            default=None,
+            description=(
+                "Only count memories carrying these tags. The entity is a 404 when no matching memory "
+                "mentions it; its mention count and dates cover the matching memories only."
+            ),
+        ),
+        tags_match: TagsMatch = Query(default="any", description="How `tags` match (same modes as listing memories)."),
+        tag_groups: str | None = Query(default=None, description=_TAG_GROUPS_QUERY_DESCRIPTION),
+        request_context: RequestContext = Depends(get_request_context),
     ):
         """Get entity details with observations."""
         try:
-            entity = await app.state.memory.get_entity(bank_id, entity_id, request_context=request_context)
+            entity = await app.state.memory.get_entity(
+                bank_id,
+                entity_id,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=_parse_tag_groups_query(tag_groups, tags),
+                request_context=request_context,
+            )
 
             if entity is None:
                 raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
@@ -7085,12 +7189,13 @@ def _register_routes(app: FastAPI):
     )
     async def api_knowledge_base_tree(
         bank_id: str,
+        tag_filter: KnowledgeTagFilter = Depends(_knowledge_tag_filter),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Return the folder/page tree for a bank."""
         try:
             nodes = await app.state.memory.list_knowledge_nodes(
-                bank_id=bank_id, with_staleness=True, request_context=request_context
+                bank_id=bank_id, with_staleness=True, tag_filter=tag_filter, request_context=request_context
             )
             return KnowledgeTreeResponse(roots=_build_knowledge_tree(nodes))
         except OperationValidationError as e:
@@ -7244,12 +7349,13 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         q: str = Query(..., description="Search query", min_length=1),
         limit: int = Query(10, ge=1, le=50, description="Maximum results to return"),
+        tag_filter: KnowledgeTagFilter = Depends(_knowledge_tag_filter),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Return knowledge pages ranked by fused BM25 + vector relevance."""
         try:
             results = await app.state.memory.search_knowledge_pages(
-                bank_id=bank_id, query=q, limit=limit, request_context=request_context
+                bank_id=bank_id, query=q, limit=limit, tag_filter=tag_filter, request_context=request_context
             )
             return KnowledgePageSearchResponse(
                 results=[KnowledgePageSearchResult(**r) for r in results],
@@ -9493,6 +9599,7 @@ def _register_routes(app: FastAPI):
                 bank_id=bank_id,
                 request_context=request_context,
                 observation_scopes=observation_scopes,
+                caller_requested=True,
             )
             return ConsolidationResponse(
                 operation_id=result["operation_id"],
@@ -9977,6 +10084,11 @@ def _register_routes(app: FastAPI):
                 # Async processing: one submit per strategy group
                 all_operation_ids = []
                 total_items_count = 0
+                # Short ids an earlier group's queued retain now backs — a
+                # later group's refusal must not take those back. The engine
+                # adds to this map after a successful submit, using the
+                # post-validator contents rather than what was submitted.
+                claimed_attachments: dict[str, set[str]] = {}
                 for group_strategy, contents in strategy_groups.items():
                     result = await app.state.memory.submit_async_retain(
                         bank_id,
@@ -9986,6 +10098,7 @@ def _register_routes(app: FastAPI):
                         request_context=request_context,
                         operation_id=request.operation_id,
                         ingress_attachments=ingress_attachments,
+                        committed_attachments=claimed_attachments,
                     )
                     all_operation_ids.append(result["operation_id"])
                     total_items_count += result["items_count"]
@@ -10016,6 +10129,9 @@ def _register_routes(app: FastAPI):
                 total_items_count = 0
                 total_usage = TokenUsage(input_tokens=0, output_tokens=0, total_tokens=0)
                 with metrics.record_operation("retain", bank_id=bank_id, source="api"):
+                    # Same claim tracking as the async loop: an earlier group's
+                    # committed attachments stay out of a later group's refusal.
+                    claimed_attachments: dict[str, set[str]] = {}
                     for group_strategy, contents in strategy_groups.items():
                         result, usage = await app.state.memory.retain_batch_async(
                             bank_id=bank_id,
@@ -10025,6 +10141,7 @@ def _register_routes(app: FastAPI):
                             request_context=request_context,
                             return_usage=True,
                             ingress_attachments=ingress_attachments,
+                            committed_attachments=claimed_attachments,
                             outbox_callback_factory=app.state.memory._build_retain_outbox_callback_factory(
                                 bank_id=bank_id,
                                 operation_id=None,

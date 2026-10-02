@@ -69,10 +69,12 @@ async def _teardown_memory_engine(mem: MemoryEngine) -> None:
 
     LLM-trace recorders live in a process-global registry; ``MemoryEngine.close()`` is
     the only thing that removes the engine's recorder from it. If close() is skipped
-    (pool already closing) or raises before that step, the recorder leaks and a later
-    test's LLM calls get recorded into the shared DB — the flaky
-    test_llm_trace::test_disabled_writes_no_rows (#2229). Unregister unconditionally;
-    it's a no-op when close() already did it.
+    (pool already closing) or raises before that step, the recorder leaks and keeps
+    receiving every later test's LLM calls, writing rows for their banks through a
+    pool nobody owns. That used to flake a trace test that proved tracing-off by
+    counting rows in the shared table; that test now asserts on its own recorder
+    instead (#2229), but a recorder outliving its engine is still wrong. Unregister
+    unconditionally; it's a no-op when close() already did it.
     """
     try:
         if mem._pool and not mem._pool._closing:
@@ -131,12 +133,10 @@ def _cleanup_leaked_span_recorders():
 
     ``MemoryEngine.__init__`` registers its recorder in the shared registry, and
     only ``close()`` removes it. Tests that construct an engine directly (without
-    ``_teardown_memory_engine``/``close()``) leak an *enabled* recorder; a later
-    test's LLM calls then get recorded into the shared DB, flaking
-    ``test_llm_trace::test_disabled_writes_no_rows`` (it observes rows for its
-    bank even though its own recorder is disabled). ``_teardown_memory_engine``
-    guards the fixtures; this guards everything else by dropping any recorder a
-    test added to the registry.
+    ``_teardown_memory_engine``/``close()``) leak an *enabled* recorder, which then
+    records every later test's LLM calls into the shared ``llm_requests`` table under
+    their bank ids (#2229). ``_teardown_memory_engine`` guards the fixtures; this
+    guards everything else by dropping any recorder a test added to the registry.
     """
     from hindsight_api.tracing import get_span_recorder
 
@@ -383,13 +383,15 @@ def _oracle_admin_dsn():
 
     parsed = urlparse(dsn)
     if parsed.scheme in ("oracle", "oracle+oracledb"):
-        host = parsed.hostname or "localhost"
-        port = parsed.port or 1521
-        service = parsed.path.lstrip("/") if parsed.path else "FREEPDB1"
+        # Same parsing as the backend, so an Autonomous Database connect descriptor
+        # (oracle://user:pass@/?dsn=(description=...)) works here too.
+        from hindsight_api.engine.db.oracle import _oracle_connect_params
+
+        params = _oracle_connect_params(dsn)
         return {
-            "user": parsed.username or "SYSTEM",
-            "password": parsed.password or "oracle",
-            "dsn": f"{host}:{port}/{service}",
+            "user": params["user"] or "SYSTEM",
+            "password": params["password"] or "oracle",
+            "dsn": params["dsn"],
         }
     else:
         return {
@@ -444,42 +446,54 @@ def oracle_db_url(_oracle_admin_dsn):
                 # ORA-01031: we are not an admin. CI provisions the user with a
                 # privileged account before pytest runs and then points
                 # ORACLE_TEST_DSN at that same unprivileged user, so this bootstrap
-                # cannot (and need not) create it. Assume it exists — if it does
-                # not, run_migrations below fails with a plain login error.
-                pass
+                # cannot (and need not) create it: test as the DSN's own user (on an
+                # Autonomous Database it is pre-provisioned, with a strong password).
+                test_user, test_pass = admin_user, admin_pass
             else:
                 raise
 
-        # Grant required privileges (idempotent)
-        for grant in [
-            f"GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO {test_user}",
-            f"GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO {test_user}",
-            f"GRANT CTXAPP TO {test_user}",
-        ]:
+        # Grant required privileges (idempotent). In the ORA-01031 fallback above the test
+        # user IS the DSN user and cannot grant to itself — each statement would no-op
+        # through the same swallowed exception, so skip the grants outright.
+        if test_user != admin_user:
+            for grant in [
+                f"GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO {test_user}",
+                f"GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO {test_user}",
+                f"GRANT CTXAPP TO {test_user}",
+            ]:
+                try:
+                    cursor.execute(grant)
+                except oracledb.DatabaseError:
+                    pass
+
+            # Grant UTL_MATCH for fuzzy entity matching (may not be available)
             try:
-                cursor.execute(grant)
+                cursor.execute(f"GRANT EXECUTE ON UTL_MATCH TO {test_user}")
             except oracledb.DatabaseError:
                 pass
-
-        # Grant UTL_MATCH for fuzzy entity matching (may not be available)
-        try:
-            cursor.execute(f"GRANT EXECUTE ON UTL_MATCH TO {test_user}")
-        except oracledb.DatabaseError:
-            pass
 
         conn.commit()
     finally:
         cursor.close()
         conn.close()
 
-    # Return URL-format DSN for the test user
-    url = f"oracle://{test_user}:{test_pass}@{bare_dsn}"
+    # Return URL-format DSN for the test user (a full connect descriptor travels as ?dsn=)
+    from urllib.parse import quote
+
+    credentials = f"{quote(test_user, safe='')}:{quote(test_pass, safe='')}"
+    if bare_dsn.lstrip().startswith("("):
+        url = f"oracle://{credentials}@/?dsn={quote(bare_dsn, safe='')}"
+    else:
+        url = f"oracle://{credentials}@{bare_dsn}"
 
     # Run idempotent migrations once at session scope (mirrors PG's pg0_db_url).
     # This avoids re-running DDL checks on every function-scoped test.
+    # The DDL goes through HINDSIGHT_API_MIGRATION_DATABASE_URL when one is set — the
+    # DSN user may be least-privileged (the ORA-01031 fallback above), and swallowing a
+    # failed migration inside the fixture would fail every Oracle test with no signal.
     from hindsight_api.migrations import run_migrations
 
-    run_migrations(url)
+    run_migrations(url, migration_database_url=os.getenv("HINDSIGHT_API_MIGRATION_DATABASE_URL"))
 
     return url
 
