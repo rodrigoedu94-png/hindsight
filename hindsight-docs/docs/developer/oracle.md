@@ -388,10 +388,11 @@ internal details differ:
 - **Entity resolution uses Oracle fuzzy matching.** Fuzzy entity lookup during
   retain uses Oracle's text matching rather than PostgreSQL's `pg_trgm` trigram
   matching. Behaviour is equivalent; the underlying mechanism differs.
-- **Approximate search is limited to semantic recall.** `HINDSIGHT_API_ORACLE_VECTOR_SEARCH=approx`
-  affects the semantic arm of recall; the other vector-ordered lookups (temporal
-  recall, link expansion) always search exactly. Separately, semantic link
-  construction during retain always searches approx — `HINDSIGHT_API_ORACLE_VECTOR_SEARCH`
+- **Approximate search is opt-in for the recall-time lookups.**
+  `HINDSIGHT_API_ORACLE_VECTOR_SEARCH=approx` affects the semantic arm of
+  recall; the other recall-time vector-ordered lookups (temporal recall, link
+  expansion) always search exactly. Separately, semantic link construction
+  during retain always searches approx — `HINDSIGHT_API_ORACLE_VECTOR_SEARCH`
   does not change it.
 
 ## Troubleshooting

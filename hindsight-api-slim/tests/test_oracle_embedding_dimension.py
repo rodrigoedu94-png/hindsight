@@ -8,12 +8,13 @@ at the bottom exercise the same code against a live database.
 """
 
 import array
+import json
 import re
 import uuid
 
 import pytest
 
-from hindsight_api.migrations import _ensure_oracle_table_embedding_dimension
+from hindsight_api.migrations import _ORACLE_PENDING_INDEXES_MARKER, _ensure_oracle_table_embedding_dimension
 
 
 class _Crash(Exception):
@@ -170,7 +171,7 @@ def test_resize_locks_the_table_around_the_emptiness_check():
     """A writer must not slip an insert between the empty check and the column rename."""
     cursor = _ScriptedCursor(vector_info="VECTOR(384,FLOAT32,DENSE)")
     _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
-    assert "LOCK TABLE MEMORY_UNITS IN EXCLUSIVE MODE" in cursor.statements
+    assert "LOCK TABLE MEMORY_UNITS IN EXCLUSIVE MODE WAIT 30" in cursor.statements
 
 
 def test_resize_aborts_instead_of_dropping_a_row_that_raced_in():
@@ -189,6 +190,33 @@ def test_resize_restores_a_prior_column_comment():
         comments={"EMBEDDING": "operator note"},
     )
     _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert cursor.comments["EMBEDDING"] == "operator note"
+
+
+def test_resize_without_indexes_still_restores_a_prior_column_comment():
+    """The rename carries the comment onto the soon-dropped legacy column even with no marker."""
+    cursor = _ScriptedCursor(vector_info="VECTOR(384,FLOAT32,DENSE)", comments={"EMBEDDING": "operator note"})
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert cursor.comments["EMBEDDING"] == "operator note"
+
+
+def test_resume_restores_the_prior_comment_the_marker_carried():
+    """A crash after the marker overwrote the comment loses the local variable; the marker holds it."""
+    marker = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(
+        {
+            "ddl": [
+                'CREATE VECTOR INDEX "IDX_MU_EMBEDDING_HNSW" ON MEMORY_UNITS (embedding) '
+                "ORGANIZATION NEIGHBOR PARTITIONS DISTANCE COSINE WITH TARGET ACCURACY 95"
+            ],
+            "comment": "operator note",
+        }
+    )
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(1536,FLOAT32,DENSE)",
+        comments={"EMBEDDING": marker},
+    )
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert [i[0] for i in cursor.vector_indexes] == ["IDX_MU_EMBEDDING_HNSW"]
     assert cursor.comments["EMBEDDING"] == "operator note"
 
 
