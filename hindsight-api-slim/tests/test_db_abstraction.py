@@ -730,6 +730,38 @@ class TestOracleQueryRewriter:
         assert isinstance(params["4"], array.array)
         assert params["5"] == '["t"]'
 
+    def test_executemany_binds_embeddings_as_native_vectors(self):
+        """The batch write path (insert_facts_batch) carried the same str() embeddings but
+        never ran the conversion, so an oversized embedding still failed on retain."""
+        import array
+        from unittest.mock import MagicMock
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        cursor = AsyncMock()
+        cursor.setinputsizes = MagicMock()
+        cursor.close = MagicMock()
+        raw = MagicMock()
+        raw.cursor.return_value = cursor
+        conn = OracleConnection(raw)
+
+        asyncio.run(
+            conn.executemany(
+                "INSERT INTO memory_units (id, bank_id, text, embedding, tags) VALUES ($1, $2, $3, $4, $5)",
+                [
+                    ("id-1", "bank", "text a", "[0.123456789, -0.5]", "t1"),
+                    ("id-2", "bank", "text b", "[0.25, 0.5]", "t2"),
+                ],
+            )
+        )
+
+        query, rows = cursor.executemany.call_args.args
+        assert "embedding" in query
+        assert [type(row["4"]) for row in rows] == [array.array, array.array]
+        assert rows[0]["4"].typecode == "f"
+        assert list(rows[0]["4"]) == pytest.approx([0.123456789, -0.5])
+        assert rows[0]["5"] == "t1"
+
     def test_multiple_casts(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
