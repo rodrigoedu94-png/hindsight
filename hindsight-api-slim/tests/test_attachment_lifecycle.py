@@ -15,7 +15,11 @@ import uuid
 
 import pytest
 
-from hindsight_api.engine.retain.attachment_content import compute_attachment_hash, short_attachment_id
+from hindsight_api.engine.retain.attachment_content import (
+    attachment_placeholder,
+    compute_attachment_hash,
+    short_attachment_id,
+)
 from hindsight_api.extensions.operation_validator import ValidationResult
 
 PNG_BYTES = base64.b64decode(
@@ -299,12 +303,27 @@ async def test_a_legacy_shared_blob_survives_until_its_last_document_goes(api_cl
 
 
 class _RefuseMarked:
-    """Allows every retain except one whose content carries the marker."""
+    """Allows every retain except one whose content carries the marker.
+
+    Allowed calls are accepted with a rewrite that drops one placeholder, so
+    the caller's submitted items and the items actually retained differ — the
+    only shape under which the engine's post-validator claim can be told apart
+    from its pre-validator one.
+    """
+
+    def __init__(self, dropped: str) -> None:
+        self._dropped = dropped
 
     async def validate_retain(self, ctx) -> ValidationResult:
         if any("policy-block" in str(item.get("content")) for item in ctx.contents):
             return ValidationResult(allowed=False, reason="policy: marked", status_code=403)
-        return ValidationResult(allowed=True)
+        return ValidationResult(
+            allowed=True,
+            contents=[
+                {**item, "content": str(item.get("content") or "").replace(self._dropped, "a removed image")}
+                for item in ctx.contents
+            ],
+        )
 
     def __getattr__(self, name):
         async def permissive(*a, **k):
@@ -321,27 +340,37 @@ class _RefuseMarked:
 async def test_a_later_groups_refusal_keeps_an_earlier_groups_committed_attachment(api_client, memory, is_async):
     """claimed_attachments: the only thing between a refusal and live bytes.
 
-    One request, two strategy groups: the first commits an attachment into
-    "doc-a", the second is refused. The refused call's ingress reclaim must
-    not take back the copy the committed group just wrote — and must still
-    take back the copy no committed unit names ("doc-b"'s).
+    One request, two strategy groups: the first commits "doc-a" after the
+    validator rewrote its content to drop one of two attachments, the second
+    is refused. The refused call's ingress reclaim must take back the id the
+    committed unit no longer names, keep the one it still does — reading the
+    claim from anywhere but the post-validator contents flips those answers —
+    and must still take back the copy no committed unit names ("doc-b"'s).
     """
     bank_id = f"life-{uuid.uuid4().hex[:8]}"
     png = compute_attachment_hash(PNG_BYTES)
     other = compute_attachment_hash(OTHER_BYTES)
-    memory._operation_validator = _RefuseMarked()
+    memory._operation_validator = _RefuseMarked(dropped=attachment_placeholder(png))
     try:
         response = await api_client.post(
             f"/v1/default/banks/{bank_id}/memories",
             json={
                 "items": [
                     {
-                        "content": [{"type": "text", "text": "committed"}, _image_block()],
+                        "content": [
+                            {"type": "text", "text": "committed"},
+                            _image_block(),
+                            _image_block(OTHER_BYTES),
+                        ],
                         "document_id": "doc-a",
                         "strategy": "first",
                     },
                     {
-                        "content": [{"type": "text", "text": "policy-block"}, _image_block()],
+                        "content": [
+                            {"type": "text", "text": "policy-block"},
+                            _image_block(),
+                            _image_block(OTHER_BYTES),
+                        ],
                         "document_id": "doc-a",
                         "strategy": "second",
                     },
@@ -358,7 +387,16 @@ async def test_a_later_groups_refusal_keeps_an_earlier_groups_committed_attachme
         memory._operation_validator = None
 
     assert response.status_code == 403, response.text
-    assert ("doc-a", png) in await _attachment_rows(memory, bank_id)
-    assert await _blob_exists(memory, bank_id, "doc-a", png)
-    assert ("doc-b", other) not in await _attachment_rows(memory, bank_id)
+    rows = await _attachment_rows(memory, bank_id)
+    # The validator's rewrite dropped this placeholder: nothing committed
+    # names it, so the refused call's reclaim must take it back.
+    assert ("doc-a", png) not in rows
+    assert not await _blob_exists(memory, bank_id, "doc-a", png)
+    # Still named by the retained unit: protected by the committed claim.
+    assert ("doc-a", other) in rows
+    assert await _blob_exists(memory, bank_id, "doc-a", other)
+    # Refused outright: reclaimed as before.
+    assert ("doc-b", other) not in rows
     assert not await _blob_exists(memory, bank_id, "doc-b", other)
+    if not is_async:
+        assert await _edges(api_client, bank_id) == {("doc-a", short_attachment_id(other))}
