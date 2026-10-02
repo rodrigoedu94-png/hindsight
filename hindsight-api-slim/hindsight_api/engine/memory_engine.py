@@ -22526,8 +22526,10 @@ class MemoryEngine(MemoryEngineInterface):
             await self._task_backend.submit_task(full_payload)
 
         # The children are queued — their contents' attachment ids now back a
-        # pending retain a later group's refusal may not take back.
-        _claim_ingress_contents(committed_attachments, contents_copy, None)
+        # pending retain a later group's refusal may not take back. `contents`
+        # is still the post-validator list here; the worker does the mutating
+        # attachment processing later.
+        _claim_ingress_contents(committed_attachments, contents, None)
 
         return {
             "operation_id": str(parent_operation_id),
