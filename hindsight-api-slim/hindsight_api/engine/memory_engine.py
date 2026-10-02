@@ -321,6 +321,7 @@ def _ingress_for_contents(
     contents: "Iterable[Mapping[str, Any]]",
     document_id: str | None,
     *extra_contents: "Iterable[Mapping[str, Any]]",
+    keep: "Mapping[str, Sequence[str]] | None" = None,
 ) -> "Mapping[str, Sequence[str]] | None":
     """The slice of a request-wide ingress map this retain call covers.
 
@@ -333,11 +334,15 @@ def _ingress_for_contents(
     later, so nothing they carry was written under a key this map knows.
     ``extra_contents`` carries the validator's replacement list when it differs,
     since its rewrite must not widen or narrow what the refusal touches.
+    ``keep`` holds ids an earlier group of the same request already committed
+    or queued — shared attachments this call happens to reference too, which a
+    refusal here must not take from under them.
     """
     if not ingress_attachments:
         return ingress_attachments
     from .retain.attachment_content import iter_placeholder_ids
 
+    keep = keep or {}
     covered: "dict[str, set[str]]" = {}
     for items in (contents, *extra_contents):
         for item in items:
@@ -347,7 +352,11 @@ def _ingress_for_contents(
             ids = covered.setdefault(doc, set())
             ids.update(iter_placeholder_ids(str(item.get("content") or "")))
             ids.update(item.get("attachment_filenames") or {})
-    return {d: [sid for sid in ids if sid in covered[d]] for d, ids in ingress_attachments.items() if d in covered}
+    return {
+        d: [sid for sid in ids if sid in covered[d] and sid not in keep.get(d, ())]
+        for d, ids in ingress_attachments.items()
+        if d in covered
+    }
 
 
 def fq_table(table_name: str) -> str:
@@ -6464,6 +6473,7 @@ class MemoryEngine(MemoryEngineInterface):
         strategy: str | None = None,
         fold_members: list[FoldMemberRef] | None = None,
         ingress_attachments: "Mapping[str, Sequence[str]] | None" = None,
+        committed_attachments: "Mapping[str, Sequence[str]] | None" = None,
     ):
         """
         Store multiple content items as memory units in ONE batch operation.
@@ -6553,7 +6563,9 @@ class MemoryEngine(MemoryEngineInterface):
                 # Nothing else would: reclaim is otherwise driven by document
                 # deletion, and a rejected retain never creates a document.
                 await self._discard_unreferenced_attachments(
-                    bank_id, _ingress_for_contents(ingress_attachments, contents, document_id), request_context
+                    bank_id,
+                    _ingress_for_contents(ingress_attachments, contents, document_id, keep=committed_attachments),
+                    request_context,
                 )
                 raise
             if result and result.contents is not None:
@@ -6583,7 +6595,9 @@ class MemoryEngine(MemoryEngineInterface):
             # stored its ingress attachment bytes, so they must be taken back out too.
             await self._discard_unreferenced_attachments(
                 bank_id,
-                _ingress_for_contents(ingress_attachments, contents, document_id, ingress_contents),
+                _ingress_for_contents(
+                    ingress_attachments, contents, document_id, ingress_contents, keep=committed_attachments
+                ),
                 request_context,
             )
             raise
@@ -22183,6 +22197,7 @@ class MemoryEngine(MemoryEngineInterface):
         strategy: str | None = None,
         operation_id: str | None = None,
         ingress_attachments: "Mapping[str, Sequence[str]] | None" = None,
+        committed_attachments: "Mapping[str, Sequence[str]] | None" = None,
     ) -> dict[str, Any]:
         """Submit a batch retain operation to run asynchronously.
 
@@ -22219,7 +22234,9 @@ class MemoryEngine(MemoryEngineInterface):
                 # Same reclaim as the synchronous path: the bytes were stored at
                 # ingress, so a refusal here is the only chance to take them back.
                 await self._discard_unreferenced_attachments(
-                    bank_id, _ingress_for_contents(ingress_attachments, contents, None), request_context
+                    bank_id,
+                    _ingress_for_contents(ingress_attachments, contents, None, keep=committed_attachments),
+                    request_context,
                 )
                 raise
             if result and result.contents is not None:
@@ -22232,7 +22249,11 @@ class MemoryEngine(MemoryEngineInterface):
             # Same reclaim as the validator refusal above: the bytes were stored at
             # ingress, so a refusal here is the only chance to take them back.
             await self._discard_unreferenced_attachments(
-                bank_id, _ingress_for_contents(ingress_attachments, contents, None, ingress_contents), request_context
+                bank_id,
+                _ingress_for_contents(
+                    ingress_attachments, contents, None, ingress_contents, keep=committed_attachments
+                ),
+                request_context,
             )
             raise
 

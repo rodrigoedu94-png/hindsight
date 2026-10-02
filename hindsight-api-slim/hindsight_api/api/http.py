@@ -10084,6 +10084,9 @@ def _register_routes(app: FastAPI):
                 # Async processing: one submit per strategy group
                 all_operation_ids = []
                 total_items_count = 0
+                # Short ids an earlier group's items already queued a retain
+                # for — a later group's refusal must not take those back.
+                claimed_attachments: dict[str, set[str]] = {}
                 for group_strategy, contents in strategy_groups.items():
                     result = await app.state.memory.submit_async_retain(
                         bank_id,
@@ -10093,7 +10096,14 @@ def _register_routes(app: FastAPI):
                         request_context=request_context,
                         operation_id=request.operation_id,
                         ingress_attachments=ingress_attachments,
+                        committed_attachments=claimed_attachments,
                     )
+                    for item in contents:
+                        doc = item.get("document_id")
+                        if isinstance(doc, str):
+                            ids = claimed_attachments.setdefault(doc, set())
+                            ids.update(iter_placeholder_ids(str(item.get("content") or "")))
+                            ids.update(item.get("attachment_filenames") or {})
                     all_operation_ids.append(result["operation_id"])
                     total_items_count += result["items_count"]
                 return RetainResponse.model_validate(
@@ -10123,6 +10133,9 @@ def _register_routes(app: FastAPI):
                 total_items_count = 0
                 total_usage = TokenUsage(input_tokens=0, output_tokens=0, total_tokens=0)
                 with metrics.record_operation("retain", bank_id=bank_id, source="api"):
+                    # Same claim tracking as the async loop: an earlier group's
+                    # committed attachments stay out of a later group's refusal.
+                    claimed_attachments: dict[str, set[str]] = {}
                     for group_strategy, contents in strategy_groups.items():
                         result, usage = await app.state.memory.retain_batch_async(
                             bank_id=bank_id,
@@ -10132,12 +10145,19 @@ def _register_routes(app: FastAPI):
                             request_context=request_context,
                             return_usage=True,
                             ingress_attachments=ingress_attachments,
+                            committed_attachments=claimed_attachments,
                             outbox_callback_factory=app.state.memory._build_retain_outbox_callback_factory(
                                 bank_id=bank_id,
                                 operation_id=None,
                                 schema=_current_schema.get(),
                             ),
                         )
+                        for item in contents:
+                            doc = item.get("document_id")
+                            if isinstance(doc, str):
+                                ids = claimed_attachments.setdefault(doc, set())
+                                ids.update(iter_placeholder_ids(str(item.get("content") or "")))
+                                ids.update(item.get("attachment_filenames") or {})
                         total_items_count += len(contents)
                         if usage:
                             total_usage = TokenUsage(

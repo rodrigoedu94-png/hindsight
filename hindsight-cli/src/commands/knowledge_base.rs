@@ -57,6 +57,9 @@ pub fn tag_filter(
         .transpose()?;
     if let Some(raw) = tag_groups.as_deref() {
         validate_tag_groups_json(raw)?;
+        if !tags.is_empty() {
+            anyhow::bail!("--tags and --tag-groups are mutually exclusive — use --tag-groups for compound filtering");
+        }
     }
     Ok(KnowledgeTagFilter {
         tags,
