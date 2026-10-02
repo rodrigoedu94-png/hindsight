@@ -1707,8 +1707,53 @@ class TestOracleSessionAndClobBinding:
         payload = bytes(range(256)) * 20  # 5120 bytes
         params = {"1": "key", "2": payload, "3": bytes(16)}
 
-        await conn._bind_large_bytes_as_lobs(params)
+        await conn._bind_large_values_as_lobs(params)
 
         assert conn._conn.created == [oracledb.DB_TYPE_BLOB]
         assert isinstance(params["2"], FakeLob) and params["2"].data == payload
         assert params["1"] == "key" and params["3"] == bytes(16)
+
+    def test_clob_lob_covers_text_past_32k_bytes(self):
+        from hindsight_api.engine.db.oracle import _needs_clob_lob
+
+        assert _needs_clob_lob("x" * 32768)
+        assert _needs_clob_lob("é" * 16384)  # 32 768 bytes in UTF-8
+        assert not _needs_clob_lob("x" * 32767)
+        assert not _needs_clob_lob("é" * 8000)
+        assert not _needs_clob_lob(b"x" * 40000)
+        assert not _needs_clob_lob(None)
+
+    @pytest.mark.asyncio
+    async def test_large_text_binds_as_a_clob_lob(self):
+        # documents.original_text past 32 767 bytes fails with ORA-01461 in
+        # MERGE ... USING (SELECT :N AS col FROM DUAL) even with a CLOB input size.
+        import oracledb
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        class FakeLob:
+            def __init__(self):
+                self.data = None
+
+            async def write(self, data):
+                self.data = data
+
+        class FakeConn:
+            def __init__(self):
+                self.created = []
+
+            async def createlob(self, lob_type):
+                self.created.append(lob_type)
+                return FakeLob()
+
+        conn = OracleConnection.__new__(OracleConnection)
+        conn._conn = FakeConn()
+        text = "laudo pericial " * 4000  # 60 000 bytes
+        params = {"1": "doc-id", "2": text, "3": "short text", "4": "x" * 5000}
+
+        await conn._bind_large_values_as_lobs(params)
+
+        assert conn._conn.created == [oracledb.DB_TYPE_CLOB]
+        assert isinstance(params["2"], FakeLob) and params["2"].data == text
+        assert params["1"] == "doc-id" and params["3"] == "short text"
+        assert params["4"] == "x" * 5000  # 4 000-32 767 bytes stay a string with a CLOB input size
