@@ -6522,6 +6522,13 @@ class MemoryEngine(MemoryEngineInterface):
             if result and result.contents is not None:
                 contents = cast(list[RetainContentDict], result.contents)
 
+        # Engine-owned copy: the orchestrator clears per-item "content" strings
+        # after building the document's combined text (memory pressure
+        # optimization, see retain/orchestrator.py), and the document_id merge
+        # below writes into items — without an internal copy those mutations
+        # leak back to the caller's dicts.
+        contents = cast(list[RetainContentDict], [dict(c) for c in contents])
+
         # Apply batch-level document_id to contents that don't have their own (backwards
         # compatibility). This must land before the write-scope check: the check reads the
         # document_ids off the items, and a batch-level id merged afterwards would write into
@@ -6541,12 +6548,6 @@ class MemoryEngine(MemoryEngineInterface):
             raise
 
         await self._ensure_bank_exists(bank_id, request_context)
-
-        # Engine-owned copy: the orchestrator clears per-item "content" strings
-        # after building the document's combined text (memory pressure
-        # optimization, see retain/orchestrator.py). Without an internal copy
-        # those mutations leak back to the caller's dicts.
-        contents = cast(list[RetainContentDict], [dict(c) for c in contents])
 
         # Sanitize the whole item at ingress. A lone UTF-16 surrogate (e.g. a
         # half-emoji a client serialized as a `\udXXX` escape) crashes the
