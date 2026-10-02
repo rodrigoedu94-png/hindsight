@@ -762,6 +762,48 @@ class TestOracleQueryRewriter:
         assert list(rows[0]["4"]) == pytest.approx([0.123456789, -0.5])
         assert rows[0]["5"] == "t1"
 
+    def test_merge_upsert_binds_the_using_embedding_as_native_vector(self):
+        """ON CONFLICT DO UPDATE rewrites to MERGE: the bind key hides in `SELECT :N AS
+        embedding` — not in an assignment or INSERT column list — so a SET clause that
+        only touches other columns left the embedding a text bind (ORA-01461 again)."""
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection, _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "INSERT INTO memory_units (id, bank_id, embedding) VALUES ($1, $2, $3) "
+            "ON CONFLICT (id, bank_id) DO UPDATE SET bank_id = EXCLUDED.bank_id"
+        )
+        params = {"1": "id", "2": "bank", "3": "[0.5, -0.25]"}
+        OracleConnection._bind_vectors_natively(query, params)
+        assert isinstance(params["3"], array.array)
+
+    def test_multi_row_insert_binds_every_row_group_embedding(self):
+        """VALUES (:1,:2),(:3,:4) mispaired the column/value lists: the greedy capture
+        swallowed the second row group and the embedding param stayed a text bind."""
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        params = {"1": "id-1", "2": "[0.5, -0.25]", "3": "id-2", "4": "[0.25, 0.5]"}
+        OracleConnection._bind_vectors_natively(
+            "INSERT INTO memory_units (id, embedding) VALUES (:1, :2), (:3, :4)",
+            params,
+        )
+        assert isinstance(params["2"], array.array)
+        assert isinstance(params["4"], array.array)
+
+    def test_vector_distance_detection_is_case_insensitive(self):
+        """`vector_distance ( ... )` — lowercase or spaced — must still fetch EXACT."""
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        for query in (
+            "SELECT id FROM t ORDER BY vector_distance (embedding, :1, COSINE) LIMIT 5",
+            "SELECT id FROM t ORDER BY VECTOR_DISTANCE(embedding, :1, COSINE) LIMIT 5",
+        ):
+            rewritten, _, _ = _rewrite_pg_to_oracle(query)
+            assert "FETCH EXACT FIRST 5 ROWS ONLY" in rewritten
+
     def test_multiple_casts(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 

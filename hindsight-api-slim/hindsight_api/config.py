@@ -4104,9 +4104,9 @@ class HindsightConfig:
                 f"Must be one of: {', '.join(VALID_ORACLE_VECTOR_SEARCH)}"
             )
         # Inlined into the SQL text (WITH TARGET ACCURACY <n>), so it must be a plain integer.
-        if not 1 <= self.oracle_vector_target_accuracy <= 100:
+        if type(self.oracle_vector_target_accuracy) is not int or not 1 <= self.oracle_vector_target_accuracy <= 100:
             raise ValueError(
-                f"Invalid oracle_vector_target_accuracy: {self.oracle_vector_target_accuracy}. Must be between 1 and 100"
+                f"Invalid oracle_vector_target_accuracy: {self.oracle_vector_target_accuracy}. Must be an integer between 1 and 100"
             )
 
         # Validate bedrock_service_tier

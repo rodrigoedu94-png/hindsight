@@ -124,11 +124,11 @@ def test_exact_mode_ignores_the_vector_index_and_returns_the_true_top_k(indexed_
     assert {row[0] for row in rows} == indexed_table.true_top_k(bank_parity=0)
 
 
-def test_approx_mode_reads_the_vector_index(ivf_table, monkeypatch):
-    sql = _arm(ivf_table.name, "approx", monkeypatch)
-    binds = {"1": array.array("f", ivf_table.query), "2": "bank-0"}
+def test_approx_mode_reads_the_vector_index(indexed_table, monkeypatch):
+    sql = _arm(indexed_table.name, "approx", monkeypatch)
+    binds = {"1": array.array("f", indexed_table.query), "2": "bank-0"}
 
-    assert _reads_vector_index(ivf_table.cursor, sql, binds)
-    rows = _run(ivf_table, sql)
+    assert _reads_vector_index(indexed_table.cursor, sql, binds)
+    rows = _run(indexed_table, sql)
     assert rows
     assert {bank for _id, bank, *_ in rows} == {"bank-0"}
