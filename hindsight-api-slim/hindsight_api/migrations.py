@@ -960,6 +960,7 @@ def _oracle_vector_index_params(cursor: Any, table_name: str, index_name: str) -
     COSINE/95 changes retrieval semantics and must not pass unnoticed.
     """
     saw_index = False
+    unrecognized_distance = None
     for sql, binds in (
         (
             "SELECT distance_metric, accuracy FROM all_vector_indexes "
@@ -997,12 +998,20 @@ def _oracle_vector_index_params(cursor: Any, table_name: str, index_name: str) -
             return _OracleVectorIndexParams(
                 distance, accuracy if 1 <= accuracy <= 100 else _ORACLE_VECTOR_INDEX_TARGET_ACCURACY
             )
+        unrecognized_distance = distance or str(row[0])
     if not saw_index:
         logger.warning(
             f"No vector-index catalog could read {index_name} on {table_name}; "
             "the resize will rebuild it with the baseline defaults (COSINE, TARGET ACCURACY 95). "
             "If it was created with a custom DISTANCE or TARGET ACCURACY, grant the migration "
             "user read access to ALL_VECTOR_INDEXES / V$VECTOR_INDEX and restart."
+        )
+    else:
+        logger.warning(
+            f"{index_name} on {table_name} reports distance metric {unrecognized_distance!r}, "
+            "which this migration does not recognize; the resize will rebuild it with the "
+            "baseline defaults (COSINE, TARGET ACCURACY 95). If it was created with a custom "
+            "DISTANCE or TARGET ACCURACY, restore them after the resize."
         )
     return _OracleVectorIndexParams("COSINE", _ORACLE_VECTOR_INDEX_TARGET_ACCURACY)
 
