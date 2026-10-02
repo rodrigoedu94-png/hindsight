@@ -76,7 +76,9 @@ class _ScriptedCursor:
             subtype = "INMEMORY_NEIGHBOR_GRAPH_HNSW" if created.group(2) else "NEIGHBOR_PARTITIONS_IVF"
             self.vector_indexes.append((created.group(1), subtype, "YES" if sql.endswith(" LOCAL") else "NO"))
         if "all_col_comments" in sql:
-            self._result = [(c,) for c in self.comments.values()]
+            wanted = (binds or {}).get("column_name")
+            values = [self.comments.get(str(wanted).upper())] if wanted else self.comments.values()
+            self._result = [(c,) for c in values if c is not None]
         elif "vector_info" in sql.lower():
             self._result = ([("EMBEDDING", self.vector_info)] if self.vector_info is not None else []) + (
                 [("EMBEDDING_LEGACY", None)] if self.has_legacy else []
