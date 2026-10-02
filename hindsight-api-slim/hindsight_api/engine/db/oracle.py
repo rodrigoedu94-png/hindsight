@@ -811,6 +811,27 @@ class OracleConnection(DatabaseConnection):
         return params
 
     @staticmethod
+    def _vector_bind_keys(query: str) -> set[str]:
+        """Names of the bind parameters that carry an embedding in ``query`` (see _bind_vectors_natively)."""
+        keys = set(_VECTOR_DISTANCE_PARAM_RE.findall(query)) | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(query))
+        # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...): pair the lists by position.
+        insert = _INSERT_COLUMNS_VALUES_RE.search(query)
+        if insert:
+            columns = [c.strip().strip('"').lower() for c in insert.group(1).split(",")]
+            values = [v.strip() for v in _split_respecting_parens(insert.group(2))]
+            for column, value in zip(columns, values, strict=False):
+                if column == "embedding" and value.startswith(":"):
+                    keys.add(value[1:])
+        return keys
+
+    @staticmethod
+    def _convert_vector_params(keys: set[str], params: dict[str, Any]) -> None:
+        for key in keys:
+            value = params.get(key)
+            if isinstance(value, str) and value.startswith("["):
+                params[key] = array.array("f", json.loads(value))
+
+    @staticmethod
     def _bind_vectors_natively(query: str, params: dict[str, Any] | None) -> None:
         """Bind embedding parameters as native vectors instead of text.
 
@@ -825,19 +846,7 @@ class OracleConnection(DatabaseConnection):
         """
         if not params:
             return
-        keys = set(_VECTOR_DISTANCE_PARAM_RE.findall(query)) | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(query))
-        # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...): pair the lists by position.
-        insert = _INSERT_COLUMNS_VALUES_RE.search(query)
-        if insert:
-            columns = [c.strip().strip('"').lower() for c in insert.group(1).split(",")]
-            values = [v.strip() for v in _split_respecting_parens(insert.group(2))]
-            for column, value in zip(columns, values, strict=False):
-                if column == "embedding" and value.startswith(":"):
-                    keys.add(value[1:])
-        for key in keys:
-            value = params.get(key)
-            if isinstance(value, str) and value.startswith("["):
-                params[key] = array.array("f", json.loads(value))
+        OracleConnection._convert_vector_params(OracleConnection._vector_bind_keys(query), params)
 
     @staticmethod
     def _apply_clob_input_sizes(cursor: Any, query: str, params: dict[str, Any] | None) -> None:
@@ -1134,12 +1143,16 @@ class OracleConnection(DatabaseConnection):
     async def executemany(self, query: str, args: list[tuple[Any, ...]], *, timeout: float | None = None) -> None:
         query, ignore_dup, _ = _rewrite_pg_to_oracle(query)
         converted = _convert_args_list(args)
+        # Batch writes carry the same str() embeddings as single writes (e.g.
+        # insert_facts_batch), so they need the same native VECTOR binding.
+        vector_keys = self._vector_bind_keys(query)
         cursor = self._conn.cursor()
         try:
             if ignore_dup:
                 # Row-by-row with individual dup suppression
                 for row in converted:
                     params = {str(i + 1): v for i, v in enumerate(row)}
+                    self._convert_vector_params(vector_keys, params)
                     self._apply_clob_input_sizes(cursor, query, params)
                     try:
                         await cursor.execute(query, params)
@@ -1148,7 +1161,11 @@ class OracleConnection(DatabaseConnection):
                             raise
             else:
                 # Convert tuples to dicts for named binding (:1, :2, ...)
-                converted_dicts = [{str(i + 1): v for i, v in enumerate(row)} for row in converted]
+                converted_dicts = []
+                for row in converted:
+                    params = {str(i + 1): v for i, v in enumerate(row)}
+                    self._convert_vector_params(vector_keys, params)
+                    converted_dicts.append(params)
                 # The driver types each column from the first row, so a column holding
                 # any CLOB-sized value must be declared CLOB for the whole batch.
                 clob_keys = {k for row in converted_dicts for k, v in row.items() if _needs_clob_bind(v)}
