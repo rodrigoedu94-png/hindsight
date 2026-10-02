@@ -220,6 +220,20 @@ def test_resume_restores_the_prior_comment_the_marker_carried():
     assert cursor.comments["EMBEDDING"] == "operator note"
 
 
+def test_a_comment_too_long_for_the_marker_still_survives_the_resize():
+    """Marker + comment would exceed Oracle's 4000-byte comment cap, so only the DDL rides in it."""
+    note = "x" * 3900
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(384,FLOAT32,DENSE)",
+        vector_indexes=[("IDX_MU", "NEIGHBOR_PARTITIONS_IVF", "NO")],
+        comments={"EMBEDDING": note},
+    )
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert cursor.comments["EMBEDDING"] == note
+    markers = [s for s in cursor.statements if _ORACLE_PENDING_INDEXES_MARKER in s]
+    assert markers and all(note not in s for s in markers)
+
+
 def test_resize_refuses_an_index_it_cannot_rebuild():
     cursor = _ScriptedCursor(vector_info="VECTOR(384,FLOAT32,DENSE)", vector_indexes=[("X", "SOMETHING_NEW", "NO")])
     with pytest.raises(RuntimeError, match="unknown subtype 'SOMETHING_NEW'"):

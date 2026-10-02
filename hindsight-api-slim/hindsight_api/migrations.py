@@ -26,7 +26,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from alembic import command
 from alembic.config import Config
@@ -797,6 +797,16 @@ _ORACLE_PENDING_INDEXES_MARKER = "hindsight:pending-vector-indexes:"
 _ORACLE_RECONCILE_ATTEMPTS = 3
 
 
+class _OraclePendingIndexesPayload(TypedDict, total=False):
+    ddl: list[str]  # required: the CREATE VECTOR INDEX statements still owed
+    comment: str  # the column comment the marker overwrote
+
+
+#: Oracle caps a column comment at 4000 bytes; a marker that would not fit omits the carried
+#: comment rather than fail the COMMENT ON COLUMN (the uninterrupted run still restores it).
+_ORACLE_COLUMN_COMMENT_MAX_BYTES = 4000
+
+
 @dataclass(frozen=True)
 class _OracleEmbeddingColumns:
     vector_info: str | None  # VECTOR_INFO of EMBEDDING; None when the column (or table) is missing
@@ -828,7 +838,7 @@ def _oracle_embedding_columns(cursor: Any, table_name: str) -> _OracleEmbeddingC
                 # Newer markers also carry the comment they overwrote; ones written before
                 # that field existed are a bare DDL list.
                 pending_index_ddl = payload["ddl"]
-                prior_comment = payload.get("comment") or ""
+                prior_comment = payload.get("comment", "") or ""
             else:
                 pending_index_ddl = payload
             break
@@ -854,10 +864,18 @@ def _set_oracle_pending_indexes(
     """
     comment = ""
     if index_ddl:
-        payload: dict[str, Any] = {"ddl": index_ddl}
+        payload: _OraclePendingIndexesPayload = {"ddl": index_ddl}
+        comment = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(payload)
         if prior_comment:
             payload["comment"] = prior_comment
-        comment = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(payload)
+            with_comment = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(payload)
+            if len(with_comment.encode()) <= _ORACLE_COLUMN_COMMENT_MAX_BYTES:
+                comment = with_comment
+            else:
+                logger.warning(
+                    f"Column comment on {table_name}.{column} is too long to ride inside the pending-index "
+                    "marker; an interrupted resize will not restore it"
+                )
     _set_oracle_column_comment(cursor, table_name, column, comment)
 
 
