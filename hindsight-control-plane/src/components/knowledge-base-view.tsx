@@ -103,6 +103,10 @@ export function KnowledgeBaseView() {
   // The bank of the newest tree request, so a slow response for a bank we have
   // since left can't overwrite the current one.
   const treeRequestBankRef = useRef<string | null>(null);
+  // Sequence of the newest tree request — same-bank responses can race too: each
+  // tagFilter edit starts a new fetch, and a slower earlier filter's result must
+  // not overwrite the newer one.
+  const treeRequestSeqRef = useRef(0);
   // Root folder starts expanded so its contents are visible by default.
   const [expanded, setExpanded] = useState<Set<string>>(new Set([ROOT_ID]));
 
@@ -179,6 +183,7 @@ export function KnowledgeBaseView() {
       if (!currentBank) return;
       const bank = currentBank;
       treeRequestBankRef.current = bank;
+      const seq = ++treeRequestSeqRef.current;
       if (!opts?.silent) setLoading(true);
       let nextRoots: KnowledgeNode[] = [];
       try {
@@ -189,7 +194,7 @@ export function KnowledgeBaseView() {
       } finally {
         if (!opts?.silent) setLoading(false);
       }
-      if (treeRequestBankRef.current !== bank) return;
+      if (treeRequestBankRef.current !== bank || seq !== treeRequestSeqRef.current) return;
       // Stamped even when the fetch failed (empty tree), so the selection effects
       // don't stay parked forever waiting for a tree that isn't coming.
       setTree({ bank, roots: nextRoots });
