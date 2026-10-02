@@ -6521,9 +6521,24 @@ class MemoryEngine(MemoryEngineInterface):
                 raise
             if result and result.contents is not None:
                 contents = cast(list[RetainContentDict], result.contents)
-        await self._check_retain_writes(
-            bank_id, contents, request_context, strategy=strategy, document_tags=document_tags
-        )
+
+        # Apply batch-level document_id to contents that don't have their own (backwards
+        # compatibility). This must land before the write-scope check: the check reads the
+        # document_ids off the items, and a batch-level id merged afterwards would write into
+        # a document the caller may not be scoped to.
+        if document_id:
+            for item in contents:
+                if "document_id" not in item:
+                    item["document_id"] = document_id
+        try:
+            await self._check_retain_writes(
+                bank_id, contents, request_context, strategy=strategy, document_tags=document_tags
+            )
+        except Exception:
+            # Same reclaim as the validator refusal above: a retain refused here has already
+            # stored its ingress attachment bytes, so they must be taken back out too.
+            await self._discard_unreferenced_attachments(bank_id, ingress_attachments, request_context)
+            raise
 
         await self._ensure_bank_exists(bank_id, request_context)
 
@@ -6558,12 +6573,6 @@ class MemoryEngine(MemoryEngineInterface):
                     for entity in item["entities"]
                     if (entity.get("text") or "").strip()
                 ]
-
-        # Apply batch-level document_id to contents that don't have their own (backwards compatibility)
-        if document_id:
-            for item in contents:
-                if "document_id" not in item:
-                    item["document_id"] = document_id
 
         # NOTE: items sharing a document_id are ALLOWED here and folded into one
         # document (see the grouping dispatch below). The synchronous in-process
@@ -22170,9 +22179,15 @@ class MemoryEngine(MemoryEngineInterface):
                 raise
             if result and result.contents is not None:
                 contents = result.contents
-        await self._check_retain_writes(
-            bank_id, contents, request_context, strategy=strategy, document_tags=document_tags
-        )
+        try:
+            await self._check_retain_writes(
+                bank_id, contents, request_context, strategy=strategy, document_tags=document_tags
+            )
+        except Exception:
+            # Same reclaim as the validator refusal above: the bytes were stored at
+            # ingress, so a refusal here is the only chance to take them back.
+            await self._discard_unreferenced_attachments(bank_id, ingress_attachments, request_context)
+            raise
 
         # Sanitize at the same ingress point the synchronous path does, and for a
         # second reason on top of it: the whole item is serialized into

@@ -344,10 +344,15 @@ def label_tag_candidates(labels_cfg: "EntityLabelsConfig | dict | list | None") 
     for group in labels_cfg.attributes:
         if not (group.tag and group.key):
             continue
+        # Keys are canonical-lowercase (``label_tag_keys`` lowercases them and
+        # ``split_label_tags`` matches case-insensitively), so a candidate keyed
+        # with the config's raw casing would demand a write-scope grant for a
+        # key case the stored tags never actually use.
+        key = group.key.lower()
         if group.type in ("text", "multi-text", "map"):
-            out.append(f"{group.key}:*")
+            out.append(f"{key}:*")
         else:
-            out.extend(f"{group.key}:{v.value}" for v in group.values if v.value)
+            out.extend(f"{key}:{v.value}" for v in group.values if v.value)
     return out
 
 

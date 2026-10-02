@@ -3623,14 +3623,11 @@ def _knowledge_tag_filter(
         None,
         description="JSON-encoded compound tag filter, same shape as recall's `tag_groups`, e.g. "
         '`[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. '
-        "Top-level groups are AND-ed, and AND-ed with `tags`.",
+        "Top-level groups are AND-ed. Mutually exclusive with `tags`.",
     ),
 ) -> KnowledgeTagFilter:
     """Query-string tag filter shared by the knowledge-base tree and search."""
-    try:
-        groups = _TAG_GROUPS_ADAPTER.validate_json(tag_groups) if tag_groups else None
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=f"Invalid tag_groups: {e}")
+    groups = _parse_tag_groups_query(tag_groups, tags)
     return KnowledgeTagFilter(tags=tags or None, tags_match=tags_match, tag_groups=groups)
 
 

@@ -120,13 +120,15 @@ export function KnowledgeBaseView() {
   const removeTag = (tag: string) =>
     setTagFilter((f) => ({ ...f, tags: (f.tags ?? []).filter((x) => x !== tag) }));
   // Enter/space/comma closes a `#tag` token into a chip; backspace on an empty box pops one.
+  // Only a box holding exactly `#tag` becomes a chip — a `#` inside a longer
+  // query (e.g. "issue #42") is search text, not a tag.
   const onSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    const token = query.match(/(?:^|\s)#(\S+)$/);
+    const token = query.match(/^#(\S+)$/);
     if (token && (e.key === "Enter" || e.key === " " || e.key === ",")) {
       e.preventDefault();
       const tag = token[1];
       setTagFilter((f) => ({ ...f, tags: [...new Set([...(f.tags ?? []), tag])] }));
-      setQuery(query.slice(0, token.index).trimEnd() + (token.index ? " " : ""));
+      setQuery("");
     } else if (e.key === "Backspace" && !query && tagFilter.tags?.length) {
       removeTag(tagFilter.tags[tagFilter.tags.length - 1]);
     }
@@ -195,12 +197,18 @@ export function KnowledgeBaseView() {
     [currentBank, tagFilter]
   );
 
+  // Switching banks closes the open tabs. This must not ride on `loadTree`'s
+  // identity: it changes on every tagFilter edit, and closing the tabs on each
+  // chip add/remove loses the pages the user had open.
   useEffect(() => {
     if (currentBank) {
       setTabs([]);
       setActiveId(null);
-      loadTree();
     }
+  }, [currentBank]);
+
+  useEffect(() => {
+    if (currentBank) loadTree();
   }, [currentBank, loadTree]);
 
   // Debounced hybrid search — a non-empty query drives the sidebar's result list.
@@ -536,7 +544,9 @@ export function KnowledgeBaseView() {
                 <button
                   onClick={() => {
                     setQuery("");
-                    setTagFilter({ ...tagFilter, tags: [] });
+                    // Full reset, not just the chips: a kept `tags_match` (e.g.
+                    // "exact" from the advanced dialog) would still filter.
+                    setTagFilter({ tags_match: "any_strict" });
                   }}
                   className="absolute right-1.5 top-1.5 rounded p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted"
                   aria-label={t("clearSearch")}

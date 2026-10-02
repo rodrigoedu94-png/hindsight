@@ -55,11 +55,59 @@ pub fn tag_filter(
             })
         })
         .transpose()?;
+    if let Some(raw) = tag_groups.as_deref() {
+        validate_tag_groups_json(raw)?;
+    }
     Ok(KnowledgeTagFilter {
         tags,
         tags_match,
         tag_groups,
     })
+}
+
+/// Validate `--tag-groups` locally so a malformed filter fails with a CLI error
+/// instead of a server 400 — same shape as recall's `tag_groups`: a top-level
+/// array whose members are leaves `{"tags": [...], "match"?, "resolve"?}` or
+/// compound `{"and"|"or": [...]}` / `{"not": {...}}` nodes.
+fn validate_tag_groups_json(raw: &str) -> Result<()> {
+    fn check(node: &serde_json::Value, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let Some(obj) = node.as_object() else {
+            return false;
+        };
+        if let Some(tags) = obj.get("tags") {
+            tags.is_array()
+                && tags.as_array().unwrap().iter().all(|t| t.is_string())
+                && obj.get("match").map_or(true, |m| {
+                    m.as_str().map_or(false, |s| {
+                        ["any", "all", "any_strict", "all_strict", "exact"]
+                            .contains(&s)
+                    })
+                })
+                && obj.get("resolve").map_or(true, |r| {
+                    r.as_str().map_or(false, |s| ["exact", "fuzzy"].contains(&s))
+                })
+        } else if let Some(list) = obj.get("and").or_else(|| obj.get("or")) {
+            list.as_array()
+                .map_or(false, |items| items.iter().all(|g| check(g, depth + 1)))
+        } else if let Some(g) = obj.get("not") {
+            check(g, depth + 1)
+        } else {
+            false
+        }
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("invalid --tag-groups JSON: {e}"))?;
+    match parsed.as_array() {
+        Some(items) if items.iter().all(|g| check(g, 0)) => Ok(()),
+        _ => anyhow::bail!(
+            "invalid --tag-groups: expected a JSON array of tag groups \
+             (leaves {{\"tags\": [...]}} or {{\"and\"/\"or\"/\"not\": ...}})"
+        ),
+    }
 }
 
 /// Show the folder/page tree for a bank
