@@ -320,22 +320,34 @@ def _ingress_for_contents(
     ingress_attachments: "Mapping[str, Sequence[str]] | None",
     contents: "Iterable[Mapping[str, Any]]",
     document_id: str | None,
+    *extra_contents: "Iterable[Mapping[str, Any]]",
 ) -> "Mapping[str, Sequence[str]] | None":
     """The slice of a request-wide ingress map this retain call covers.
 
     The HTTP layer stores attachments once for the whole request, then calls
-    retain once per strategy group — so a refusal here may only take back the
-    attachments of the documents in ``contents`` (plus the batch-level
-    ``document_id``), not what an earlier group already committed or queued.
-    Items without a document id generate one later, so nothing they carry was
-    written under a key this map knows.
+    retain once per strategy group — and groups can share a document. A refusal
+    here may only take back the short ids this call's items actually referenced
+    (the placeholders in their content, plus any named in
+    ``attachment_filenames``), never what an earlier group already committed or
+    queued into the same document. Items without a document id generate one
+    later, so nothing they carry was written under a key this map knows.
+    ``extra_contents`` carries the validator's replacement list when it differs,
+    since its rewrite must not widen or narrow what the refusal touches.
     """
     if not ingress_attachments:
         return ingress_attachments
-    covered = {item.get("document_id") for item in contents}
-    if document_id:
-        covered.add(document_id)
-    return {d: ids for d, ids in ingress_attachments.items() if d in covered}
+    from .retain.attachment_content import iter_placeholder_ids
+
+    covered: "dict[str, set[str]]" = {}
+    for items in (contents, *extra_contents):
+        for item in items:
+            doc = item.get("document_id") or document_id
+            if not isinstance(doc, str):
+                continue
+            ids = covered.setdefault(doc, set())
+            ids.update(iter_placeholder_ids(str(item.get("content") or "")))
+            ids.update(item.get("attachment_filenames") or {})
+    return {d: [sid for sid in ids if sid in covered[d]] for d, ids in ingress_attachments.items() if d in covered}
 
 
 def fq_table(table_name: str) -> str:
@@ -6517,6 +6529,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Validate operation if validator is configured
         contents_copy = [dict(c) for c in contents]  # Convert TypedDict to regular dict for extension
+        ingress_contents = contents  # Pre-validator items: their document_ids keyed the ingress writes.
         if self._operation_validator:
             from hindsight_api.extensions import RetainContext
 
@@ -6569,7 +6582,9 @@ class MemoryEngine(MemoryEngineInterface):
             # Same reclaim as the validator refusal above: a retain refused here has already
             # stored its ingress attachment bytes, so they must be taken back out too.
             await self._discard_unreferenced_attachments(
-                bank_id, _ingress_for_contents(ingress_attachments, contents, document_id), request_context
+                bank_id,
+                _ingress_for_contents(ingress_attachments, contents, document_id, ingress_contents),
+                request_context,
             )
             raise
 
@@ -22185,6 +22200,7 @@ class MemoryEngine(MemoryEngineInterface):
         # Run operation validator (bank access, credits, etc.) before queuing.
         # This runs on every retry too, so a replay cannot bypass access/credit
         # checks even though it performs no ingestion work.
+        ingress_contents = contents  # Pre-validator items: their document_ids keyed the ingress writes.
         if self._operation_validator:
             from hindsight_api.extensions import RetainContext
 
@@ -22216,7 +22232,7 @@ class MemoryEngine(MemoryEngineInterface):
             # Same reclaim as the validator refusal above: the bytes were stored at
             # ingress, so a refusal here is the only chance to take them back.
             await self._discard_unreferenced_attachments(
-                bank_id, _ingress_for_contents(ingress_attachments, contents, None), request_context
+                bank_id, _ingress_for_contents(ingress_attachments, contents, None, ingress_contents), request_context
             )
             raise
 
