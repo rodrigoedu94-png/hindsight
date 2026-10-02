@@ -775,6 +775,9 @@ _ORACLE_VECTOR_INDEX_ORGANIZATIONS = {
     "INMEMORY_NEIGHBOR_GRAPH_HNSW": "INMEMORY NEIGHBOR GRAPH",
 }
 
+#: Distance metric names the vector-index catalogs may report (see _oracle_vector_index_params).
+_ORACLE_VECTOR_INDEX_DISTANCES = {"EUCLIDEAN", "EUCLIDEAN_SQUARED", "COSINE", "DOT", "MANHATTAN", "HAMMING"}
+
 #: Prefix of the column comment that carries the vector-index DDL a resize still has to replay.
 #: Oracle DDL is not transactional, so the definitions of the indexes a resize drops are written
 #: to the catalog first; a run interrupted anywhere before the rebuild finds them there.
@@ -834,6 +837,53 @@ def _rebuild_pending_oracle_indexes(cursor: Any, table_name: str, index_ddl: lis
         _create_oracle_vector_index(cursor, ddl)
     _set_oracle_pending_indexes(cursor, table_name, "embedding", [])
     logger.warning(f"Rebuilt {len(index_ddl)} vector index(es) an interrupted resize left on {table_name}")
+
+
+def _oracle_vector_index_params(cursor: Any, table_name: str, index_name: str) -> tuple[str, int]:
+    """The DISTANCE and TARGET ACCURACY ``index_name`` was created with.
+
+    ``ALL_VECTOR_INDEXES`` reports them to the index owner on any deployment; the
+    fallbacks cover where it may be empty — ``V$VECTOR_INDEX`` on Autonomous AI
+    Database, ``VECSYS.VECTOR$INDEX`` elsewhere (each is documented as unavailable
+    on the other). An index created without the clauses reports COSINE and 95 —
+    also the fallback when the migration user cannot read any of the catalogs —
+    while other tuning parameters (neighbors, centroids, DOP) reset to defaults.
+    """
+    for sql, binds in (
+        (
+            "SELECT distance_metric, accuracy FROM all_vector_indexes "
+            "WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') "
+            "AND index_name = :index_name AND target_table = :table_name",
+            {"index_name": index_name, "table_name": table_name},
+        ),
+        (
+            "SELECT distance_type, default_accuracy FROM v$vector_index "
+            "WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND index_name = :index_name",
+            {"index_name": index_name},
+        ),
+        (
+            "SELECT JSON_VALUE(idx_params, '$.distance'), JSON_VALUE(idx_params, '$.accuracy' RETURNING NUMBER) "
+            "FROM vecsys.vector$index WHERE idx_name = :index_name AND idx_base_table_objn = "
+            "(SELECT object_id FROM all_objects WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') "
+            "AND object_name = :table_name AND object_type = 'TABLE')",
+            {"index_name": index_name, "table_name": table_name},
+        ),
+    ):
+        try:
+            cursor.execute(sql, binds)
+            row = cursor.fetchone()
+        except Exception:
+            continue
+        if row is None:
+            continue
+        distance = str(row[0]).upper() if row[0] is not None else None
+        if distance in _ORACLE_VECTOR_INDEX_DISTANCES:
+            try:
+                accuracy = int(row[1])
+            except (TypeError, ValueError):
+                accuracy = 0
+            return distance, accuracy if 1 <= accuracy <= 100 else _ORACLE_VECTOR_INDEX_TARGET_ACCURACY
+    return "COSINE", _ORACLE_VECTOR_INDEX_TARGET_ACCURACY
 
 
 def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, required_dimension: int) -> None:
@@ -911,12 +961,14 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
     # with ORA-51859 even on an empty table (verified on 23.26.3), so the column is replaced.
     # The steps are ordered so that an interruption leaves EMBEDDING_LEGACY behind, which the
     # next run finishes (see above). Vector indexes are dropped first and rebuilt with the same
-    # organization and locality; their DDL is recorded in a column comment before the drop and
-    # cleared after the rebuild, so a run interrupted in between rebuilds them (see above). Oracle
-    # keeps a column's comment across RENAME COLUMN, and the recovery moves it off the legacy
-    # column before dropping it. They cannot be replayed from DBMS_METADATA.GET_DDL, which on
-    # 23.26.3 returns a plain CREATE INDEX without the VECTOR clauses (ORA-02327 on replay);
-    # custom index parameters are not kept, which is harmless on the empty table this runs on.
+    # organization, locality, distance metric, and target accuracy; their DDL is recorded in a
+    # column comment before the drop and cleared after the rebuild, so a run interrupted in
+    # between rebuilds them (see above). Oracle keeps a column's comment across RENAME COLUMN,
+    # and the recovery moves it off the legacy column before dropping it. They cannot be
+    # replayed from DBMS_METADATA.GET_DDL, which on 23.26.3 returns a plain CREATE INDEX
+    # without the VECTOR clauses (ORA-02327 on replay), so the clauses are rebuilt from the
+    # catalog instead; tuning parameters beyond distance/accuracy reset to defaults, which is
+    # harmless on the empty table this runs on.
     cursor.execute(
         "SELECT index_name, index_subtype, partitioned FROM all_indexes "
         "WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND table_name = :table_name "
@@ -929,11 +981,11 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
         organization = _ORACLE_VECTOR_INDEX_ORGANIZATIONS.get(subtype)
         if organization is None:
             raise RuntimeError(f"Cannot rebuild vector index {name} of unknown subtype {subtype!r} on {table_name}")
+        distance, accuracy = _oracle_vector_index_params(cursor, table_name, name)
         index_names.append(name)
         index_ddl.append(
             f'CREATE VECTOR INDEX "{name}" ON {table_name} (embedding) ORGANIZATION {organization} '
-            f"DISTANCE COSINE WITH TARGET ACCURACY {_ORACLE_VECTOR_INDEX_TARGET_ACCURACY}"
-            + (" LOCAL" if partitioned == "YES" else "")
+            f"DISTANCE {distance} WITH TARGET ACCURACY {accuracy}" + (" LOCAL" if partitioned == "YES" else "")
         )
     if index_ddl:
         _set_oracle_pending_indexes(cursor, table_name, "embedding", index_ddl)

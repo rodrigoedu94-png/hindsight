@@ -34,6 +34,7 @@ class _ScriptedCursor:
         vector_info: str | None,
         stored_dimensions: list[int] | None = None,
         vector_indexes: list[tuple[str, str, str]] | None = None,  # (name, INDEX_SUBTYPE, PARTITIONED)
+        vector_index_params: dict[str, tuple[str, int]] | None = None,  # name -> (DISTANCE, ACCURACY)
         has_legacy: bool = False,
         comments: dict[str, str] | None = None,
         fail_on: str | None = None,
@@ -41,6 +42,7 @@ class _ScriptedCursor:
         self.vector_info = vector_info
         self.stored_dimensions = stored_dimensions or []
         self.vector_indexes = vector_indexes or []
+        self.vector_index_params = vector_index_params or {}
         self.has_legacy = has_legacy
         self.comments: dict[str, str] = dict(comments or {})  # column -> comment
         self.fail_on = fail_on  # raise when a statement contains this text (simulated crash)
@@ -83,6 +85,9 @@ class _ScriptedCursor:
             self._result = [(d,) for d in matches[:1]]
         elif "index_type = 'VECTOR'" in sql:
             self._result = list(self.vector_indexes)
+        elif "all_vector_indexes" in sql or "v$vector_index" in sql or "vecsys.vector$index" in sql:
+            params = self.vector_index_params.get((binds or {}).get("index_name", ""))
+            self._result = [params] if params else []
         else:
             self._result = []
 
@@ -131,6 +136,30 @@ def test_resize_keeps_a_local_hnsw_index_local():
         'CREATE VECTOR INDEX "MU_HNSW" ON MEMORY_UNITS (embedding) '
         "ORGANIZATION INMEMORY NEIGHBOR GRAPH DISTANCE COSINE WITH TARGET ACCURACY 95 LOCAL"
     )
+
+
+def test_resize_keeps_a_custom_index_distance_and_accuracy():
+    """A non-baseline DISTANCE/TARGET ACCURACY must survive the rebuild, not revert to COSINE/95."""
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(384,FLOAT32,DENSE)",
+        vector_indexes=[("IDX_MU_EUCLIDEAN", "NEIGHBOR_PARTITIONS_IVF", "NO")],
+        vector_index_params={"IDX_MU_EUCLIDEAN": ("EUCLIDEAN", 80)},
+    )
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert _ddl(cursor)[-1] == (
+        'CREATE VECTOR INDEX "IDX_MU_EUCLIDEAN" ON MEMORY_UNITS (embedding) '
+        "ORGANIZATION NEIGHBOR PARTITIONS DISTANCE EUCLIDEAN WITH TARGET ACCURACY 80"
+    )
+
+
+def test_resize_defaults_when_the_index_params_catalog_is_unreadable():
+    """ALL_VECTOR_INDEXES/V$VECTOR_INDEX/VECSYS.VECTOR$INDEX may all be unreadable or empty."""
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(384,FLOAT32,DENSE)",
+        vector_indexes=[("IDX_MU_EMBEDDING_HNSW", "NEIGHBOR_PARTITIONS_IVF", "NO")],
+    )
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert "DISTANCE COSINE WITH TARGET ACCURACY 95" in _ddl(cursor)[-1]
 
 
 def test_resize_refuses_an_index_it_cannot_rebuild():
@@ -258,6 +287,19 @@ def _vector_indexes(cursor, table: str) -> list[str]:
     return [r[0] for r in cursor.fetchall()]
 
 
+def _vector_index_params(cursor, table: str) -> dict[str, tuple[str, int]]:
+    """DISTANCE_METRIC/ACCURACY of the table's vector indexes, as ALL_VECTOR_INDEXES reports them."""
+    try:
+        cursor.execute(
+            "SELECT index_name, distance_metric, accuracy FROM all_vector_indexes "
+            "WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND target_table = :t",
+            {"t": table},
+        )
+    except Exception:
+        return {}
+    return {name: (metric, acc) for name, metric, acc in cursor.fetchall()}
+
+
 @pytest.mark.oracle
 def test_live_resize_replaces_the_column_and_keeps_the_vector_index(oracle_cursor):
     cursor, table = oracle_cursor
@@ -286,6 +328,23 @@ def test_live_resize_replaces_the_column_and_keeps_the_vector_index(oracle_curso
     with pytest.raises(RuntimeError, match="from 1536 to 768"):
         _ensure_oracle_table_embedding_dimension(cursor, table, 768)
     assert _vector_info(cursor, table) == "VECTOR(1536,FLOAT32,DENSE)"
+
+
+@pytest.mark.oracle
+def test_live_resize_preserves_a_custom_index_distance_and_accuracy(oracle_cursor):
+    """The rebuilt index must keep the original DISTANCE/TARGET ACCURACY, not revert to COSINE/95."""
+    cursor, table = oracle_cursor
+    cursor.execute(f"CREATE TABLE {table} (id NUMBER PRIMARY KEY, embedding VECTOR(384, FLOAT32))")
+    cursor.execute(
+        f"CREATE VECTOR INDEX {table}_IVF ON {table} (embedding) ORGANIZATION NEIGHBOR PARTITIONS "
+        "DISTANCE EUCLIDEAN WITH TARGET ACCURACY 80"
+    )
+    if _vector_index_params(cursor, table).get(f"{table}_IVF") is None:
+        pytest.skip("no vector-index catalog is readable from this account")
+
+    _ensure_oracle_table_embedding_dimension(cursor, table, 1536)
+
+    assert _vector_index_params(cursor, table).get(f"{table}_IVF") == ("EUCLIDEAN", 80)
 
 
 class _CrashingCursor:
