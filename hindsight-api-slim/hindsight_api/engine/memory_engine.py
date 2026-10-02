@@ -6789,7 +6789,9 @@ class MemoryEngine(MemoryEngineInterface):
 
         # The batch retained these contents — their attachment ids now back
         # committed units, so a later group's refusal may not take them back.
-        _claim_ingress_contents(committed_attachments, contents, document_id)
+        # contents_copy still describes every attachment: retain processing
+        # may have emptied an item's content by now.
+        _claim_ingress_contents(committed_attachments, contents_copy, document_id)
 
         # A cancelled run (bank deleted mid-flight) skips the completion side
         # effects, mirroring the pre-grouping early return from the sub-batch loop.
@@ -22525,7 +22527,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         # The children are queued — their contents' attachment ids now back a
         # pending retain a later group's refusal may not take back.
-        _claim_ingress_contents(committed_attachments, contents, None)
+        _claim_ingress_contents(committed_attachments, contents_copy, None)
 
         return {
             "operation_id": str(parent_operation_id),
