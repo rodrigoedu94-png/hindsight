@@ -597,8 +597,8 @@ def visible_entity_stats_sql(fq_table, tag_clause_sql: str) -> str:
 
     ``$1`` must be the bank id. ``tag_clause_sql`` is a :func:`build_tag_filter_clause`
     clause built WITHOUT a table alias: the Oracle rewriter turns ``tags && :n`` into
-    a ``JSON_TABLE`` probe by matching a bare column name, so ``mu.tags`` would come
-    out as ``mu.EXISTS(...)``. That is why the filter runs on an unaliased subquery.
+    a ``JSON_TABLE`` probe and now accepts qualified columns too, but the unaliased
+    subquery keeps the filter working identically on both dialects.
     """
     return f"""
         SELECT ue.entity_id,
