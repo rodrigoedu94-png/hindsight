@@ -36,6 +36,7 @@ class _ScriptedCursor:
         vector_indexes: list[tuple[str, str, str]] | None = None,  # (name, INDEX_SUBTYPE, PARTITIONED)
         vector_index_params: dict[str, tuple[str, int]] | None = None,  # name -> (DISTANCE, ACCURACY)
         has_legacy: bool = False,
+        legacy_rows: int = 0,  # rows sitting in EMBEDDING_LEGACY (a write that raced the resize)
         comments: dict[str, str] | None = None,
         fail_on: str | None = None,
     ) -> None:
@@ -44,6 +45,7 @@ class _ScriptedCursor:
         self.vector_indexes = vector_indexes or []
         self.vector_index_params = vector_index_params or {}
         self.has_legacy = has_legacy
+        self.legacy_rows = legacy_rows
         self.comments: dict[str, str] = dict(comments or {})  # column -> comment
         self.fail_on = fail_on  # raise when a statement contains this text (simulated crash)
         self.statements: list[str] = []
@@ -78,6 +80,8 @@ class _ScriptedCursor:
             self._result = ([("EMBEDDING", self.vector_info)] if self.vector_info is not None else []) + (
                 [("EMBEDDING_LEGACY", None)] if self.has_legacy else []
             )
+        elif "embedding_legacy IS NOT NULL" in sql:
+            self._result = [(1,)] * min(self.legacy_rows, 1)
         elif "VECTOR_DIMENSION_COUNT" in sql:
             # With :dim bound the query looks for a row of any OTHER dimension; without it, any row.
             wanted = (binds or {}).get("dim")
@@ -160,6 +164,32 @@ def test_resize_defaults_when_the_index_params_catalog_is_unreadable():
     )
     _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
     assert "DISTANCE COSINE WITH TARGET ACCURACY 95" in _ddl(cursor)[-1]
+
+
+def test_resize_locks_the_table_around_the_emptiness_check():
+    """A writer must not slip an insert between the empty check and the column rename."""
+    cursor = _ScriptedCursor(vector_info="VECTOR(384,FLOAT32,DENSE)")
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert "LOCK TABLE MEMORY_UNITS IN EXCLUSIVE MODE" in cursor.statements
+
+
+def test_resize_aborts_instead_of_dropping_a_row_that_raced_in():
+    """A write landing mid-resize ends up in embedding_legacy; dropping it would lose the row."""
+    cursor = _ScriptedCursor(vector_info="VECTOR(1536,FLOAT32,DENSE)", has_legacy=True, legacy_rows=1)
+    with pytest.raises(RuntimeError, match="embedding_legacy"):
+        _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert not any("DROP COLUMN embedding_legacy" in s for s in cursor.statements)
+
+
+def test_resize_restores_a_prior_column_comment():
+    """The pending-index marker borrows the column comment; the operator's own text must survive."""
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(384,FLOAT32,DENSE)",
+        vector_indexes=[("IDX_MU", "NEIGHBOR_PARTITIONS_IVF", "NO")],
+        comments={"EMBEDDING": "operator note"},
+    )
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    assert cursor.comments["EMBEDDING"] == "operator note"
 
 
 def test_resize_refuses_an_index_it_cannot_rebuild():
