@@ -16,6 +16,7 @@ import uuid
 import pytest
 
 from hindsight_api.engine.retain.attachment_content import compute_attachment_hash, short_attachment_id
+from hindsight_api.extensions.operation_validator import ValidationResult
 
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -295,3 +296,69 @@ async def test_a_legacy_shared_blob_survives_until_its_last_document_goes(api_cl
     assert (await api_client.delete(f"/v1/default/banks/{bank_id}/documents/doc-b")).status_code == 200
     with pytest.raises(FileNotFoundError):
         await memory._file_storage.retrieve(shared_key)
+
+
+class _RefuseMarked:
+    """Allows every retain except one whose content carries the marker."""
+
+    async def validate_retain(self, ctx) -> ValidationResult:
+        if any("policy-block" in str(item.get("content")) for item in ctx.contents):
+            return ValidationResult(allowed=False, reason="policy: marked", status_code=403)
+        return ValidationResult(allowed=True)
+
+    def __getattr__(self, name):
+        async def permissive(*a, **k):
+            # The tag-scope hooks answer with a scope, not a verdict: None means unrestricted.
+            if name.startswith("resolve_"):
+                return None
+            return ValidationResult(allowed=True)
+
+        return permissive
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+async def test_a_later_groups_refusal_keeps_an_earlier_groups_committed_attachment(api_client, memory, is_async):
+    """claimed_attachments: the only thing between a refusal and live bytes.
+
+    One request, two strategy groups: the first commits an attachment into
+    "doc-a", the second is refused. The refused call's ingress reclaim must
+    not take back the copy the committed group just wrote — and must still
+    take back the copy no committed unit names ("doc-b"'s).
+    """
+    bank_id = f"life-{uuid.uuid4().hex[:8]}"
+    png = compute_attachment_hash(PNG_BYTES)
+    other = compute_attachment_hash(OTHER_BYTES)
+    memory._operation_validator = _RefuseMarked()
+    try:
+        response = await api_client.post(
+            f"/v1/default/banks/{bank_id}/memories",
+            json={
+                "items": [
+                    {
+                        "content": [{"type": "text", "text": "committed"}, _image_block()],
+                        "document_id": "doc-a",
+                        "strategy": "first",
+                    },
+                    {
+                        "content": [{"type": "text", "text": "policy-block"}, _image_block()],
+                        "document_id": "doc-a",
+                        "strategy": "second",
+                    },
+                    {
+                        "content": [{"type": "text", "text": "policy-block"}, _image_block(OTHER_BYTES)],
+                        "document_id": "doc-b",
+                        "strategy": "second",
+                    },
+                ],
+                "async": is_async,
+            },
+        )
+    finally:
+        memory._operation_validator = None
+
+    assert response.status_code == 403, response.text
+    assert ("doc-a", png) in await _attachment_rows(memory, bank_id)
+    assert await _blob_exists(memory, bank_id, "doc-a", png)
+    assert ("doc-b", other) not in await _attachment_rows(memory, bank_id)
+    assert not await _blob_exists(memory, bank_id, "doc-b", other)

@@ -6612,6 +6612,13 @@ class MemoryEngine(MemoryEngineInterface):
             for item in contents:
                 if "document_id" not in item:
                     item["document_id"] = document_id
+
+        # Post-validator, pre-processing snapshot for the commit claim at the
+        # end of this call. The validator may have replaced the item list
+        # wholesale, so contents_copy cannot speak for what was retained; and
+        # the live list cannot either — the orchestrator empties an item's
+        # content once it has described its attachments.
+        claim_contents = [dict(c) for c in contents]
         try:
             await self._check_retain_writes(
                 bank_id, contents, request_context, strategy=strategy, document_tags=document_tags
@@ -6789,9 +6796,9 @@ class MemoryEngine(MemoryEngineInterface):
 
         # The batch retained these contents — their attachment ids now back
         # committed units, so a later group's refusal may not take them back.
-        # contents_copy still describes every attachment: retain processing
-        # may have emptied an item's content by now.
-        _claim_ingress_contents(committed_attachments, contents_copy, document_id)
+        # Claim from the post-validator snapshot taken before processing
+        # emptied any content strings.
+        _claim_ingress_contents(committed_attachments, claim_contents, document_id)
 
         # A cancelled run (bank deleted mid-flight) skips the completion side
         # effects, mirroring the pre-grouping early return from the sub-batch loop.
