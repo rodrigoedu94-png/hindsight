@@ -817,10 +817,46 @@ def _oracle_embedding_columns(cursor: Any, table_name: str) -> _OracleEmbeddingC
     )
 
 
+def _set_oracle_column_comment(cursor: Any, table_name: str, column: str, comment: str) -> None:
+    cursor.execute(f"COMMENT ON COLUMN {table_name}.{column} IS '{comment.replace(chr(39), chr(39) * 2)}'")
+
+
 def _set_oracle_pending_indexes(cursor: Any, table_name: str, column: str, index_ddl: list[str]) -> None:
     """Record (or, with an empty list, clear) the vector-index DDL still owed on ``table_name``."""
-    comment = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(index_ddl) if index_ddl else ""
-    cursor.execute(f"COMMENT ON COLUMN {table_name}.{column} IS '{comment.replace(chr(39), chr(39) * 2)}'")
+    _set_oracle_column_comment(
+        cursor, table_name, column, _ORACLE_PENDING_INDEXES_MARKER + json.dumps(index_ddl) if index_ddl else ""
+    )
+
+
+def _oracle_column_comment(cursor: Any, table_name: str, column: str) -> str:
+    """The comment currently recorded on ``table_name.column`` ("" when unset)."""
+    cursor.execute(
+        "SELECT comments FROM all_col_comments "
+        "WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') "
+        "AND table_name = :table_name AND column_name = :column",
+        {"table_name": table_name, "column": column.upper()},
+    )
+    row = cursor.fetchone()
+    return str(row[0]) if row and row[0] else ""
+
+
+def _drop_oracle_embedding_legacy(cursor: Any, table_name: str) -> None:
+    """Drop ``embedding_legacy`` once it provably holds no row.
+
+    Oracle DDL commits at every statement, so no lock spans a resize: a write that slips in
+    between the emptiness check and the rename lands in ``embedding`` and moves into
+    ``embedding_legacy`` with it. Dropping the column then would delete that row silently,
+    so the run aborts instead — the pending-index marker still on the table lets the next
+    attempt finish once the row is handled.
+    """
+    cursor.execute(f"SELECT 1 FROM {table_name} WHERE embedding_legacy IS NOT NULL FETCH FIRST 1 ROWS ONLY")
+    if cursor.fetchone() is not None:
+        raise RuntimeError(
+            f"Cannot drop {table_name}.embedding_legacy: it holds a row written while the resize "
+            "was in flight. Delete the row (or re-embed it into embedding with the configured "
+            "model), then restart to finish the resize."
+        )
+    cursor.execute(f"ALTER TABLE {table_name} DROP COLUMN embedding_legacy")
 
 
 def _create_oracle_vector_index(cursor: Any, ddl: str) -> None:
@@ -839,7 +875,13 @@ def _rebuild_pending_oracle_indexes(cursor: Any, table_name: str, index_ddl: lis
     logger.warning(f"Rebuilt {len(index_ddl)} vector index(es) an interrupted resize left on {table_name}")
 
 
-def _oracle_vector_index_params(cursor: Any, table_name: str, index_name: str) -> tuple[str, int]:
+@dataclass(frozen=True)
+class _OracleVectorIndexParams:
+    distance: str
+    accuracy: int
+
+
+def _oracle_vector_index_params(cursor: Any, table_name: str, index_name: str) -> _OracleVectorIndexParams:
     """The DISTANCE and TARGET ACCURACY ``index_name`` was created with.
 
     ``ALL_VECTOR_INDEXES`` reports them to the index owner on any deployment; the
@@ -848,7 +890,11 @@ def _oracle_vector_index_params(cursor: Any, table_name: str, index_name: str) -
     on the other). An index created without the clauses reports COSINE and 95 —
     also the fallback when the migration user cannot read any of the catalogs —
     while other tuning parameters (neighbors, centroids, DOP) reset to defaults.
+    A catalog row proves the index exists; when none answers at all the rebuild
+    still assumes the defaults, but loudly — a custom-metric index rebuilt as
+    COSINE/95 changes retrieval semantics and must not pass unnoticed.
     """
+    saw_index = False
     for sql, binds in (
         (
             "SELECT distance_metric, accuracy FROM all_vector_indexes "
@@ -876,14 +922,24 @@ def _oracle_vector_index_params(cursor: Any, table_name: str, index_name: str) -
             continue
         if row is None:
             continue
+        saw_index = True
         distance = str(row[0]).upper() if row[0] is not None else None
         if distance in _ORACLE_VECTOR_INDEX_DISTANCES:
             try:
                 accuracy = int(row[1])
             except (TypeError, ValueError):
                 accuracy = 0
-            return distance, accuracy if 1 <= accuracy <= 100 else _ORACLE_VECTOR_INDEX_TARGET_ACCURACY
-    return "COSINE", _ORACLE_VECTOR_INDEX_TARGET_ACCURACY
+            return _OracleVectorIndexParams(
+                distance, accuracy if 1 <= accuracy <= 100 else _ORACLE_VECTOR_INDEX_TARGET_ACCURACY
+            )
+    if not saw_index:
+        logger.warning(
+            f"No vector-index catalog could read {index_name} on {table_name}; "
+            "the resize will rebuild it with the baseline defaults (COSINE, TARGET ACCURACY 95). "
+            "If it was created with a custom DISTANCE or TARGET ACCURACY, grant the migration "
+            "user read access to ALL_VECTOR_INDEXES / V$VECTOR_INDEX and restart."
+        )
+    return _OracleVectorIndexParams("COSINE", _ORACLE_VECTOR_INDEX_TARGET_ACCURACY)
 
 
 def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, required_dimension: int) -> None:
@@ -901,13 +957,14 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
     columns = _oracle_embedding_columns(cursor, table_name)
     if columns.has_legacy:
         # A previous resize stopped between its DDL steps (Oracle DDL is not transactional).
-        # It only ever runs on an empty table, so finishing it cannot lose data.
+        # It only ever runs on an empty table, so finishing it cannot lose data — unless a
+        # write raced the interrupted run's check; _drop_oracle_embedding_legacy refuses that.
         if columns.vector_info is None:
             cursor.execute(f"ALTER TABLE {table_name} ADD (embedding VECTOR({required_dimension}, FLOAT32))")
         if columns.pending_index_ddl:
             # The marker may still sit on the legacy column; move it before that column goes.
             _set_oracle_pending_indexes(cursor, table_name, "embedding", columns.pending_index_ddl)
-        cursor.execute(f"ALTER TABLE {table_name} DROP COLUMN embedding_legacy")
+        _drop_oracle_embedding_legacy(cursor, table_name)
         logger.warning(f"Finished an interrupted resize of {table_name}.embedding")
         columns = _oracle_embedding_columns(cursor, table_name)
 
@@ -946,6 +1003,11 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
     logger.info(
         f"Embedding dimension mismatch on {table_name}: database has {declared}, model requires {required_dimension}"
     )
+    # Hold off writers while the emptiness check decides whether the column can be replaced:
+    # an insert landing between the check and the rename below would move into embedding_legacy
+    # and be dropped with it. DDL releases the lock at its first commit, so the guarded drop in
+    # _drop_oracle_embedding_legacy is the hard stop for anything the lock still misses.
+    cursor.execute(f"LOCK TABLE {table_name} IN EXCLUSIVE MODE")
     cursor.execute(
         f"SELECT VECTOR_DIMENSION_COUNT(embedding) FROM {table_name} WHERE embedding IS NOT NULL FETCH FIRST 1 ROWS ONLY"
     )
@@ -981,13 +1043,17 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
         organization = _ORACLE_VECTOR_INDEX_ORGANIZATIONS.get(subtype)
         if organization is None:
             raise RuntimeError(f"Cannot rebuild vector index {name} of unknown subtype {subtype!r} on {table_name}")
-        distance, accuracy = _oracle_vector_index_params(cursor, table_name, name)
+        params = _oracle_vector_index_params(cursor, table_name, name)
         index_names.append(name)
         index_ddl.append(
             f'CREATE VECTOR INDEX "{name}" ON {table_name} (embedding) ORGANIZATION {organization} '
-            f"DISTANCE {distance} WITH TARGET ACCURACY {accuracy}" + (" LOCAL" if partitioned == "YES" else "")
+            f"DISTANCE {params.distance} WITH TARGET ACCURACY {params.accuracy}"
+            + (" LOCAL" if partitioned == "YES" else "")
         )
     if index_ddl:
+        # The pending marker overwrites the column comment — capture any existing one
+        # first so the restore at the end puts it back instead of erasing it.
+        prior_comment = _oracle_column_comment(cursor, table_name, "embedding")
         _set_oracle_pending_indexes(cursor, table_name, "embedding", index_ddl)
     for name in index_names:
         cursor.execute(f'DROP INDEX "{name}"')
@@ -995,11 +1061,13 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
     cursor.execute(f"ALTER TABLE {table_name} ADD (embedding VECTOR({required_dimension}, FLOAT32))")
     if index_ddl:
         _set_oracle_pending_indexes(cursor, table_name, "embedding", index_ddl)
-    cursor.execute(f"ALTER TABLE {table_name} DROP COLUMN embedding_legacy")
+    _drop_oracle_embedding_legacy(cursor, table_name)
     for ddl in index_ddl:
         _create_oracle_vector_index(cursor, ddl)
     if index_ddl:
         _set_oracle_pending_indexes(cursor, table_name, "embedding", [])
+        if prior_comment:
+            _set_oracle_column_comment(cursor, table_name, "embedding", prior_comment)
     logger.info(
         f"Changed {table_name}.embedding dimension to {required_dimension} ({len(index_ddl)} vector index(es) rebuilt)"
     )

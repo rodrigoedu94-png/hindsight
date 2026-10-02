@@ -148,9 +148,9 @@ export HINDSIGHT_API_DATABASE_SCHEMA=HINDSIGHT   # the owner, not the runtime us
 
 With `HINDSIGHT_API_MIGRATION_DATABASE_URL` set, the startup migrations and the
 embedding-dimension check run as the owner; everything else runs as the runtime
-user. On Oracle Database 23ai, which has no schema privileges, grant the four
-object privileges on each table instead, and re-run the grants after migrations
-that add tables.
+user. On Oracle Database 23ai, which lacks the schema-level DML grants that 26ai
+adds, grant the four object privileges on each table instead, and re-run the
+grants after migrations that add tables.
 
 ### 2. Build the connection URL
 
@@ -389,8 +389,10 @@ internal details differ:
   retain uses Oracle's text matching rather than PostgreSQL's `pg_trgm` trigram
   matching. Behaviour is equivalent; the underlying mechanism differs.
 - **Approximate search is limited to semantic recall.** `HINDSIGHT_API_ORACLE_VECTOR_SEARCH=approx`
-  affects the semantic recall arm; the other vector-ordered lookups (temporal
-  recall, link expansion) always search exactly.
+  affects the semantic arm of recall; the other vector-ordered lookups (temporal
+  recall, link expansion) always search exactly. Separately, semantic link
+  construction during retain always searches approx — `HINDSIGHT_API_ORACLE_VECTOR_SEARCH`
+  does not change it.
 
 ## Troubleshooting
 
