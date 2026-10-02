@@ -127,12 +127,21 @@ def test_exact_mode_ignores_the_vector_index_and_returns_the_true_top_k(indexed_
 def test_approx_mode_reads_the_vector_index(ivf_table, monkeypatch):
     # Global IVF only. On a partitioned table with a LOCAL HNSW index the optimizer plans
     # TABLE ACCESS FULL for FETCH APPROX on Oracle Free 23.26.3 even with the index populated,
-    # so the plan assertion cannot hold there; that shape is covered by the exact-mode test.
+    # so the plan assertion cannot hold there; bank isolation for that shape is checked below.
     indexed_table = ivf_table
     sql = _arm(indexed_table.name, "approx", monkeypatch)
     binds = {"1": array.array("f", indexed_table.query), "2": "bank-0"}
 
     assert _reads_vector_index(indexed_table.cursor, sql, binds)
+    rows = _run(indexed_table, sql)
+    assert rows
+    assert {bank for _id, bank, *_ in rows} == {"bank-0"}
+
+
+def test_approx_mode_stays_inside_the_bank_for_every_index_shape(indexed_table, monkeypatch):
+    # No plan assertion: whether the optimizer reads the index is shape- and edition-dependent,
+    # but approximate results must never cross banks regardless.
+    sql = _arm(indexed_table.name, "approx", monkeypatch)
     rows = _run(indexed_table, sql)
     assert rows
     assert {bank for _id, bank, *_ in rows} == {"bank-0"}
