@@ -316,6 +316,28 @@ def _shared_document_id(contents: "Iterable[Mapping[str, Any]]") -> str | None:
     return ids.pop() if len(ids) == 1 else None
 
 
+def _ingress_for_contents(
+    ingress_attachments: "Mapping[str, Sequence[str]] | None",
+    contents: "Iterable[Mapping[str, Any]]",
+    document_id: str | None,
+) -> "Mapping[str, Sequence[str]] | None":
+    """The slice of a request-wide ingress map this retain call covers.
+
+    The HTTP layer stores attachments once for the whole request, then calls
+    retain once per strategy group — so a refusal here may only take back the
+    attachments of the documents in ``contents`` (plus the batch-level
+    ``document_id``), not what an earlier group already committed or queued.
+    Items without a document id generate one later, so nothing they carry was
+    written under a key this map knows.
+    """
+    if not ingress_attachments:
+        return ingress_attachments
+    covered = {item.get("document_id") for item in contents}
+    if document_id:
+        covered.add(document_id)
+    return {d: ids for d, ids in ingress_attachments.items() if d in covered}
+
+
 def fq_table(table_name: str) -> str:
     """Get fully-qualified table name with current schema.
 
@@ -6517,7 +6539,9 @@ class MemoryEngine(MemoryEngineInterface):
                 # keep them out of the bank is to take them back out here.
                 # Nothing else would: reclaim is otherwise driven by document
                 # deletion, and a rejected retain never creates a document.
-                await self._discard_unreferenced_attachments(bank_id, ingress_attachments, request_context)
+                await self._discard_unreferenced_attachments(
+                    bank_id, _ingress_for_contents(ingress_attachments, contents, document_id), request_context
+                )
                 raise
             if result and result.contents is not None:
                 contents = cast(list[RetainContentDict], result.contents)
@@ -6544,7 +6568,9 @@ class MemoryEngine(MemoryEngineInterface):
         except Exception:
             # Same reclaim as the validator refusal above: a retain refused here has already
             # stored its ingress attachment bytes, so they must be taken back out too.
-            await self._discard_unreferenced_attachments(bank_id, ingress_attachments, request_context)
+            await self._discard_unreferenced_attachments(
+                bank_id, _ingress_for_contents(ingress_attachments, contents, document_id), request_context
+            )
             raise
 
         await self._ensure_bank_exists(bank_id, request_context)
@@ -22176,7 +22202,9 @@ class MemoryEngine(MemoryEngineInterface):
             except Exception:
                 # Same reclaim as the synchronous path: the bytes were stored at
                 # ingress, so a refusal here is the only chance to take them back.
-                await self._discard_unreferenced_attachments(bank_id, ingress_attachments, request_context)
+                await self._discard_unreferenced_attachments(
+                    bank_id, _ingress_for_contents(ingress_attachments, contents, None), request_context
+                )
                 raise
             if result and result.contents is not None:
                 contents = result.contents
@@ -22187,7 +22215,9 @@ class MemoryEngine(MemoryEngineInterface):
         except Exception:
             # Same reclaim as the validator refusal above: the bytes were stored at
             # ingress, so a refusal here is the only chance to take them back.
-            await self._discard_unreferenced_attachments(bank_id, ingress_attachments, request_context)
+            await self._discard_unreferenced_attachments(
+                bank_id, _ingress_for_contents(ingress_attachments, contents, None), request_context
+            )
             raise
 
         # Sanitize at the same ingress point the synchronous path does, and for a
