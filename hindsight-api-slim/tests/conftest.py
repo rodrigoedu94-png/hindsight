@@ -452,22 +452,25 @@ def oracle_db_url(_oracle_admin_dsn):
             else:
                 raise
 
-        # Grant required privileges (idempotent)
-        for grant in [
-            f"GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO {test_user}",
-            f"GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO {test_user}",
-            f"GRANT CTXAPP TO {test_user}",
-        ]:
+        # Grant required privileges (idempotent). In the ORA-01031 fallback above the test
+        # user IS the DSN user and cannot grant to itself — each statement would no-op
+        # through the same swallowed exception, so skip the grants outright.
+        if test_user != admin_user:
+            for grant in [
+                f"GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO {test_user}",
+                f"GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO {test_user}",
+                f"GRANT CTXAPP TO {test_user}",
+            ]:
+                try:
+                    cursor.execute(grant)
+                except oracledb.DatabaseError:
+                    pass
+
+            # Grant UTL_MATCH for fuzzy entity matching (may not be available)
             try:
-                cursor.execute(grant)
+                cursor.execute(f"GRANT EXECUTE ON UTL_MATCH TO {test_user}")
             except oracledb.DatabaseError:
                 pass
-
-        # Grant UTL_MATCH for fuzzy entity matching (may not be available)
-        try:
-            cursor.execute(f"GRANT EXECUTE ON UTL_MATCH TO {test_user}")
-        except oracledb.DatabaseError:
-            pass
 
         conn.commit()
     finally:
@@ -485,9 +488,12 @@ def oracle_db_url(_oracle_admin_dsn):
 
     # Run idempotent migrations once at session scope (mirrors PG's pg0_db_url).
     # This avoids re-running DDL checks on every function-scoped test.
+    # The DDL goes through HINDSIGHT_API_MIGRATION_DATABASE_URL when one is set — the
+    # DSN user may be least-privileged (the ORA-01031 fallback above), and swallowing a
+    # failed migration inside the fixture would fail every Oracle test with no signal.
     from hindsight_api.migrations import run_migrations
 
-    run_migrations(url)
+    run_migrations(url, migration_database_url=os.getenv("HINDSIGHT_API_MIGRATION_DATABASE_URL"))
 
     return url
 

@@ -88,12 +88,16 @@ _JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both
 _JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?)\s*\?\s*'(\w+)'")
 _JSONB_CONTAINS_RE = re.compile(r"(\w+)\s*@>\s*:(\d+)")
 # Parameters that carry an embedding: the query-side operand of VECTOR_DISTANCE(<column>, :N, ...),
-# bare or wrapped in TO_VECTOR (which accepts a native VECTOR bind too), and values written to an
-# embedding column (SET embedding = :N, or INSERT column/value lists).
+# bare or wrapped in TO_VECTOR (which accepts a native VECTOR bind too), values written to an
+# embedding column (SET embedding = :N, INSERT column/value lists), and the source column of an
+# upsert rewritten to MERGE (:N AS embedding in the USING select — the INSERT arm writes s.embedding,
+# bound by that same :N).
 _VECTOR_DISTANCE_PARAM_RE = re.compile(r"VECTOR_DISTANCE\(\s*[\w.\"]+\s*,\s*(?:TO_VECTOR\(\s*)?:(\w+)", re.IGNORECASE)
-_EMBEDDING_ASSIGN_PARAM_RE = re.compile(r"\bembedding\s*=\s*:(\w+)", re.IGNORECASE)
+_VECTOR_DISTANCE_CALL_RE = re.compile(r"\bVECTOR_DISTANCE\s*\(", re.IGNORECASE)
+_EMBEDDING_ASSIGN_PARAM_RE = re.compile(r'\b"?embedding"?\s*=\s*:(\w+)', re.IGNORECASE)
+_MERGE_SOURCE_EMBEDDING_RE = re.compile(r":(\w+)\s+AS\s+\"?embedding\"?", re.IGNORECASE)
 _INSERT_COLUMNS_VALUES_RE = re.compile(
-    r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*\((.*)\)", re.IGNORECASE | re.DOTALL
+    r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*(\(.*)", re.IGNORECASE | re.DOTALL
 )
 
 # ---------------------------------------------------------------------------
@@ -272,6 +276,28 @@ def _split_respecting_parens(s: str) -> list[str]:
     if current:
         parts.append("".join(current).strip())
     return parts
+
+
+def _top_level_paren_contents(s: str) -> list[str]:
+    """Inner text of each top-level parenthesized group in ``s``.
+
+    e.g. "(:1, :2), (:3, :4)" → [":1, :2", ":3, :4"] — the row groups of a
+    multi-row VALUES list, which naive splitting mispairs against the columns.
+    """
+    groups: list[str] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(s):
+        if ch == "(":
+            if depth == 0:
+                start = i + 1
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                groups.append(s[start:i])
+                start = -1
+    return groups
 
 
 def _rewrite_upsert_to_merge(query: str) -> str | None:
@@ -521,7 +547,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         # A query ranking by vector distance asks for EXACT: on Autonomous Database a bare
         # FETCH FIRST is answered from a vector index whenever one exists, which made these
         # nearest-neighbour lookups (temporal arm, link expansion) silently approximate.
-        fetch_first = "FETCH EXACT FIRST" if "VECTOR_DISTANCE(" in query else "FETCH FIRST"
+        fetch_first = "FETCH EXACT FIRST" if _VECTOR_DISTANCE_CALL_RE.search(query) else "FETCH FIRST"
         # First handle "LIMIT N OFFSET M" → "OFFSET M ROWS FETCH FIRST N ROWS ONLY"
         query = re.sub(
             r"\bLIMIT\s+(\d+|:\w+)\s+OFFSET\s+(\d+|:\w+)\b",
@@ -813,15 +839,21 @@ class OracleConnection(DatabaseConnection):
     @staticmethod
     def _vector_bind_keys(query: str) -> set[str]:
         """Names of the bind parameters that carry an embedding in ``query`` (see _bind_vectors_natively)."""
-        keys = set(_VECTOR_DISTANCE_PARAM_RE.findall(query)) | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(query))
-        # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...): pair the lists by position.
+        keys = (
+            set(_VECTOR_DISTANCE_PARAM_RE.findall(query))
+            | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(query))
+            | set(_MERGE_SOURCE_EMBEDDING_RE.findall(query))
+        )
+        # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...) [, (...)]: pair each
+        # row group's column/value lists by position (one list per row on multi-row inserts).
         insert = _INSERT_COLUMNS_VALUES_RE.search(query)
         if insert:
             columns = [c.strip().strip('"').lower() for c in insert.group(1).split(",")]
-            values = [v.strip() for v in _split_respecting_parens(insert.group(2))]
-            for column, value in zip(columns, values, strict=False):
-                if column == "embedding" and value.startswith(":"):
-                    keys.add(value[1:])
+            for group in _top_level_paren_contents(insert.group(2)):
+                values = _split_respecting_parens(group)
+                for column, value in zip(columns, values, strict=False):
+                    if column == "embedding" and value.startswith(":"):
+                        keys.add(value[1:])
         return keys
 
     @staticmethod
