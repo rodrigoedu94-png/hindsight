@@ -635,6 +635,21 @@ class TestOracleQueryRewriter:
         assert "result_metadata IS NOT NULL" in query
         assert "JSON_VALUE(result_metadata, '$.is_parent') = 'true'" in query
 
+    def test_result_metadata_contains_bind_compares_parent_operation_id(self):
+        # Parent/sibling lookup: the generic JSON_EXISTS(col, '$' PASSING :N) rewrite matches no row.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT 1 FROM async_operations child WHERE result_metadata::jsonb @> $1::jsonb "
+            "AND child.result_metadata::jsonb @> $2::jsonb"
+        )
+        assert "JSON_EXISTS" not in query
+        assert "JSON_VALUE(result_metadata, '$.parent_operation_id') = JSON_VALUE(:1, '$.parent_operation_id')" in query
+        assert (
+            "JSON_VALUE(child.result_metadata, '$.parent_operation_id') = JSON_VALUE(:2, '$.parent_operation_id')"
+            in query
+        )
+
     def test_connect_params_host_port_service(self):
         from hindsight_api.engine.db.oracle import _oracle_connect_params
 

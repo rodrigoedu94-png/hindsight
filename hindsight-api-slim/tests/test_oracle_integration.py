@@ -736,10 +736,9 @@ class TestOracleRetainSql:
         self, oracle_memory: MemoryEngine, request_context: RequestContext
     ):
         """result_metadata @> is the parent/sibling lookup: on Oracle it must
-        filter on the bound key, not match every row in the bank. The generic
-        JSON_EXISTS(..., '$' PASSING :N) rewrite is always true, which left
-        batch_retain parents pending forever — the rollup saw the whole bank
-        as siblings and bailed (LIN-94)."""
+        filter on the bound key. The generic JSON_EXISTS(..., '$' PASSING :N)
+        rewrite matched no row at all, so a batch_retain parent never found its
+        children and stayed pending forever."""
         bank_id = _bank_id("batchparent")
         parent_id, child_a, child_b, stray = (uuid.uuid4() for _ in range(4))
         try:

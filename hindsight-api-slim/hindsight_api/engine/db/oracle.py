@@ -86,6 +86,7 @@ _JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both
 # column group must accept the quoted form too — same shape as the arrow regex above.
 _JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?)\s*\?\s*'(\w+)'")
 _JSONB_CONTAINS_RE = re.compile(r"(\w+)\s*@>\s*:(\d+)")
+_RESULT_METADATA_CONTAINS_RE = re.compile(r"((?:\w+\.)?result_metadata)\s*@>\s*:(\d+)", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Argument conversion helpers
@@ -474,13 +475,9 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # Runs BEFORE the generic rewrite below: that one emits
     # JSON_EXISTS(col, '$' PASSING :N AS cond), which declares a bind variable
     # the '$' path never references — Oracle evaluates it to false for every
-    # row, so the parent would never find its children (upstream issue: a
-    # batch_retain parent stayed pending forever on Oracle).
-    query = re.sub(
-        r"((?:\w+\.)?result_metadata)\s*@>\s*:(\d+)",
-        r"JSON_VALUE(\1, '$.parent_operation_id') = JSON_VALUE(:\2, '$.parent_operation_id')",
-        query,
-        flags=re.IGNORECASE,
+    # row, so a batch_retain parent never found its children and stayed pending.
+    query = _RESULT_METADATA_CONTAINS_RE.sub(
+        r"JSON_VALUE(\1, '$.parent_operation_id') = JSON_VALUE(:\2, '$.parent_operation_id')", query
     )
     query = _JSONB_CONTAINS_RE.sub(r"JSON_EXISTS(\1, '$' PASSING :\2 AS cond)", query)
 
