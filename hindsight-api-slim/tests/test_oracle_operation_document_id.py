@@ -3,8 +3,11 @@
 import json
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
+
+import hindsight_api
 
 from hindsight_api.engine.retain.orchestrator import (
     _persist_facts_committed_checkpoint,
@@ -87,3 +90,21 @@ async def test_oracle_streaming_checkpoint_is_idempotent():
 
     assert conn.metadata["facts_committed_document_ids"] == ["doc-a"]
     assert conn.metadata["unit_ids_count"] == 3
+
+
+def test_no_unguarded_jsonb_set_in_engine_sql():
+    """``jsonb_set`` is PostgreSQL-only, so every use needs an Oracle branch.
+
+    The Oracle rewriter (engine/db/oracle.py) translates the plain ``col || :N::jsonb``
+    merge but not ``jsonb_set`` / ``->`` / ``@>`` on a column, which fails with
+    ORA-00936 at runtime. Both checkpoint writers in orchestrator.py shipped without an
+    Oracle path and silently lost their crash-recovery metadata (#4645, #5040). Keep the
+    list closed so the next one is caught here instead of in production.
+    """
+    engine = Path(hindsight_api.__file__).parent / "engine"
+    users = {path.relative_to(engine).as_posix() for path in engine.rglob("*.py") if "jsonb_set" in path.read_text()}
+
+    assert users == {"retain/orchestrator.py"}, (
+        "jsonb_set appeared in new engine SQL. Add an `if conn.backend_type == 'oracle'` "
+        "path (see _oracle_append_operation_metadata) and add the file here."
+    )
