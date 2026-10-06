@@ -819,8 +819,8 @@ class OracleConnection(DatabaseConnection):
         """Bind bytes past RAW's 2000-byte limit as a BLOB and text past 32 767 bytes as a CLOB.
 
         The thin driver binds bytes as RAW and does not honour a DB_TYPE_BLOB input size
-        for them, so storing a file past that size fails with ORA-01461 ("exceeded the
-        maximum VARCHAR2 length"); the same happens to text past 32 767 bytes despite a
+        for them, so storing a file past that size fails with ORA-01461 ("can bind a LONG
+        value only for insert into a LONG column"); the same happens to text past 32 767 bytes despite a
         DB_TYPE_CLOB input size. A temporary LOB holding the value binds as a real LOB.
         """
         if not params:
@@ -1145,7 +1145,10 @@ class OracleConnection(DatabaseConnection):
                         if "ORA-00001" not in str(e):
                             raise
             else:
-                # Convert tuples to dicts for named binding (:1, :2, ...)
+                # Convert tuples to dicts for named binding (:1, :2, ...). No temporary
+                # LOBs here: the batched callers are plain INSERT ... VALUES (chunks,
+                # attachments, links), where a CLOB input size binds long text fine —
+                # ORA-01461 only hits a bind in a select list such as MERGE ... USING.
                 converted_dicts = [{str(i + 1): v for i, v in enumerate(row)} for row in converted]
                 # The driver types each column from the first row, so a column holding
                 # any CLOB-sized value must be declared CLOB for the whole batch.
