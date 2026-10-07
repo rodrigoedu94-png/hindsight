@@ -79,16 +79,16 @@ _RETURNING_RE = re.compile(r"\bRETURNING\s+(?!(?:CLOB|BLOB|VARCHAR2|JSON)\b)(.+)
 _ANY_RE = re.compile(r"=\s*ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 _NOT_ALL_RE = re.compile(r"!=\s*ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 # LIKE ANY / NOT LIKE ALL — capture the column name before the operator
-_LIKE_ANY_RE = re.compile(r"(\w+)\s+LIKE\s+ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
-_NOT_LIKE_ALL_RE = re.compile(r"(\w+)\s+NOT\s+LIKE\s+ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
+_LIKE_ANY_RE = re.compile(r"(\w+(?:\.\w+)?)\s+LIKE\s+ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
+_NOT_LIKE_ALL_RE = re.compile(r"(\w+(?:\.\w+)?)\s+NOT\s+LIKE\s+ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 # array_position(:N, col) — PostgreSQL idiom for "keep the input list order"
 _ARRAY_POSITION_RE = re.compile(r"\barray_position\s*\(\s*:(\d+)\s*,\s*([\w.]+)\s*\)", re.IGNORECASE)
 
-_JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both col and "col"
+_JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?(?:\."?\w+"?)?)\s*->>\s*\'(\w+)\'')  # handles both col and "col"
 # Reserved-word columns ("trigger") are already quoted by the time this runs, so the
 # column group must accept the quoted form too — same shape as the arrow regex above.
-_JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?)\s*\?\s*'(\w+)'")
-_JSONB_CONTAINS_RE = re.compile(r"(\w+)\s*@>\s*:(\d+)")
+_JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?(?:\.\"?\w+\"?)?)\s*\?\s*'(\w+)'")
+_JSONB_CONTAINS_RE = re.compile(r"(\w+(?:\.\w+)?)\s*@>\s*:(\d+)")
 _RESULT_METADATA_CONTAINS_RE = re.compile(r"((?:\w+\.)?result_metadata)\s*@>\s*:(\d+)", re.IGNORECASE)
 # Parameters that carry an embedding: the query-side operand of VECTOR_DISTANCE(<column>, :N, ...),
 # bare or wrapped in TO_VECTOR (which accepts a native VECTOR bind too), values written to an
@@ -403,7 +403,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # with NULL ON ERROR, so a merged document over 4000 bytes silently becomes NULL
     # (e.g. ORA-01407 when updating the NOT NULL banks.config column).
     query = re.sub(
-        r"(\w+)\s*\|\|\s*(:\w+)::jsonb", r"JSON_MERGEPATCH(\1, \2 RETURNING CLOB)", query, flags=re.IGNORECASE
+        r"(\w+(?:\.\w+)?)\s*\|\|\s*(:\w+)::jsonb", r"JSON_MERGEPATCH(\1, \2 RETURNING CLOB)", query, flags=re.IGNORECASE
     )
 
     # JSONB merge with complex left-hand expression (e.g. COALESCE(...)):
@@ -438,7 +438,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         return f"JSON_VALUE({col}, '$.{key}') = '{val}'"
 
     query = re.sub(
-        r"""\((\w+)\s*->>\s*'(\w+)'\)::boolean\s*=\s*(true|false)""",
+        r"""\((\w+(?:\.\w+)?)\s*->>\s*'(\w+)'\)::boolean\s*=\s*(true|false)""",
         _rewrite_json_bool,
         query,
         flags=re.IGNORECASE,
@@ -459,7 +459,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         )
 
     query = re.sub(
-        r"""NOT\s*\(\s*(\w+)(?:::jsonb)?\s*@>\s*'\{\s*["']?is_parent["']?\s*:\s*true\s*\}'(?:::jsonb)?\s*\)""",
+        r"""NOT\s*\(\s*(\w+(?:\.\w+)?)(?:::jsonb)?\s*@>\s*'\{\s*["']?is_parent["']?\s*:\s*true\s*\}'(?:::jsonb)?\s*\)""",
         _rewrite_not_jsonb_is_parent,
         query,
         flags=re.IGNORECASE,
@@ -624,7 +624,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
 
     # PG non-empty array check: tags != '{}' → Oracle: NOT (DBMS_LOB empty check)
     query = re.sub(
-        r"(\w+)\s*!=\s*'\{\}'",
+        r"(\w+(?:\.\w+)?)\s*!=\s*'\{\}'",
         r"NOT (DBMS_LOB.GETLENGTH(\1) IS NULL OR DBMS_LOB.GETLENGTH(\1) <= 2)",
         query,
     )
@@ -637,9 +637,9 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         return f"(DBMS_LOB.GETLENGTH({col}) IS NULL OR DBMS_LOB.GETLENGTH({col}) <= 2)"
 
     # Match col = '{}' preceded by OR/AND/WHERE or opening paren (comparison context)
-    query = re.sub(r"(?<=\bOR\s)(\w+)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
-    query = re.sub(r"(?<=\bAND\s)(\w+)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
-    query = re.sub(r"(?<=\bWHERE\s)(\w+)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
+    query = re.sub(r"(?<=\bOR\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
+    query = re.sub(r"(?<=\bAND\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
+    query = re.sub(r"(?<=\bWHERE\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
 
     # PG array overlap: tags && :N → Oracle: JSON array overlap check using JSON_TABLE
     def _rewrite_array_overlap(m):
@@ -647,7 +647,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         param = m.group(2)
         return f"EXISTS (SELECT 1 FROM JSON_TABLE({param}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) jt WHERE JSON_EXISTS({col}, '$[*]?(@ == $v)' PASSING jt.val AS \"v\"))"
 
-    query = re.sub(r"(\w+)\s*&&\s*(:\w+)", _rewrite_array_overlap, query)
+    query = re.sub(r"(\w+(?:\.\w+)?)\s*&&\s*(:\w+)", _rewrite_array_overlap, query)
 
     # PG array containment: tags @> :N → Oracle: all elements from param exist in col
     # (Override the JSONB contains regex which doesn't work for array containment)
@@ -664,14 +664,14 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
 
     # Fix the already-rewritten @> pattern if it was handled by _JSONB_CONTAINS_RE
     query = re.sub(
-        r"JSON_EXISTS\((\w+),\s*'\$'\s*PASSING\s*(:\w+)\s*AS\s*cond\)",
+        r"JSON_EXISTS\((\w+(?:\.\w+)?),\s*'\$'\s*PASSING\s*(:\w+)\s*AS\s*cond\)",
         _rewrite_array_contains,
         query,
     )
 
     # ILIKE → UPPER(...) LIKE UPPER(...)
     query = re.sub(
-        r"(\w+)\s+ILIKE\s+(:\w+)",
+        r"(\w+(?:\.\w+)?)\s+ILIKE\s+(:\w+)",
         r"UPPER(\1) LIKE UPPER(\2)",
         query,
         flags=re.IGNORECASE,
@@ -1071,7 +1071,7 @@ class OracleConnection(DatabaseConnection):
         query = expand_re.sub(_replace, query)
 
         # Expand LIKE ANY: col /*LIKE_ANY:N:col*/ → (col LIKE :p0 OR col LIKE :p1 ...)
-        like_any_re = re.compile(r"(\w+)\s*/\*LIKE_ANY:(\d+):(\w+)\*/")
+        like_any_re = re.compile(r"(\w+(?:\.\w+)?)\s*/\*LIKE_ANY:(\d+):(\w+(?:\.\w+)?)\*/")
 
         def _replace_like_any(m):
             _col = m.group(1)  # redundant column ref before marker
@@ -1093,7 +1093,7 @@ class OracleConnection(DatabaseConnection):
         query = like_any_re.sub(_replace_like_any, query)
 
         # Expand NOT LIKE ALL: col /*NOT_LIKE_ALL:N:col*/ → (col NOT LIKE :p0 AND ...)
-        not_like_all_re = re.compile(r"(\w+)\s*/\*NOT_LIKE_ALL:(\d+):(\w+)\*/")
+        not_like_all_re = re.compile(r"(\w+(?:\.\w+)?)\s*/\*NOT_LIKE_ALL:(\d+):(\w+(?:\.\w+)?)\*/")
 
         def _replace_not_like_all(m):
             _col = m.group(1)
