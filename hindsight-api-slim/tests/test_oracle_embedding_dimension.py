@@ -76,8 +76,11 @@ class _ScriptedCursor:
             subtype = "INMEMORY_NEIGHBOR_GRAPH_HNSW" if created.group(2) else "NEIGHBOR_PARTITIONS_IVF"
             self.vector_indexes.append((created.group(1), subtype, "YES" if sql.endswith(" LOCAL") else "NO"))
         if "all_col_comments" in sql:
+            wants_one = "column_name = :column_name" in sql
+            if wants_one and not (binds or {}).get("column_name"):
+                raise AssertionError(f"single-column comment read missing :column_name bind: {sql}")
             wanted = (binds or {}).get("column_name")
-            values = [self.comments.get(str(wanted).upper())] if wanted else self.comments.values()
+            values = [self.comments.get(str(wanted).upper())] if wants_one else self.comments.values()
             self._result = [(c,) for c in values if c is not None]
         elif "vector_info" in sql.lower():
             self._result = ([("EMBEDDING", self.vector_info)] if self.vector_info is not None else []) + (
