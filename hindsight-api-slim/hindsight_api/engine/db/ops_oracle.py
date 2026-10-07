@@ -256,7 +256,7 @@ class OracleOps(DataAccessOps):
     @staticmethod
     async def _links_with_live_units(conn: DatabaseConnection, links: list[tuple]) -> list[tuple]:
         """Keep the links whose from/to units still exist (Oracle's stand-in for WHERE EXISTS)."""
-        from ..schema import fq_table
+        from ..schema import fq_store_table
 
         ids = list({str(i).lower() for lnk in links for i in (lnk[0], lnk[1])})
         live: set[str] = set()
@@ -264,7 +264,7 @@ class OracleOps(DataAccessOps):
         for start in range(0, len(ids), 500):
             chunk = [uuid_mod.UUID(i) for i in ids[start : start + 500]]
             rows = await conn.fetch(
-                f"SELECT id FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
+                f"SELECT id FROM {fq_store_table('memory_units')} WHERE id = ANY($1::uuid[])",
                 chunk,
             )
             live.update(str(r["id"]).lower() for r in rows)

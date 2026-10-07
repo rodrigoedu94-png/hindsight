@@ -684,7 +684,7 @@ class TestOracleRetainSql:
     ):
         # ANN neighbours are found before the write phase; one deleted since (an observation
         # dropped when its document is re-retained) made the link insert fail with ORA-02291.
-        from hindsight_api.engine.retain.link_utils import _bulk_insert_links
+        from hindsight_api.engine.memories.pg.links import _bulk_insert_links
 
         bank_id = _bank_id("linkgone")
         dim = oracle_memory.embeddings.dimension
