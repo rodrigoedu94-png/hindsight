@@ -828,6 +828,15 @@ class TestOracleQueryRewriter:
         params = _oracle_connect_params(f"oracle://u:p@/?dsn={quote(desc)}")
         assert params["dsn"] == desc
 
+    def test_now_at_utc_to_sys_extract_utc(self):
+        # The worker reads the DB clock this way at startup. SYSTIMESTAMP AT TIME ZONE 'UTC'
+        # is a named-region TIMESTAMP WITH TIME ZONE, which the thin driver cannot decode
+        # (DPY-3022), so the poller died before its first claim.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("SELECT now() AT TIME ZONE 'UTC'")
+        assert query == "SELECT SYS_EXTRACT_UTC(SYSTIMESTAMP)"
+
     def test_now_to_systimestamp(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
