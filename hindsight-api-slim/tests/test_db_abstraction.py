@@ -1777,6 +1777,56 @@ class TestOracleSessionAndClobBinding:
         assert not _needs_blob_bind("x" * 5000)
         assert not _needs_blob_bind(None)
 
+    @pytest.mark.asyncio
+    async def test_long_embedding_binds_as_vector_not_clob(self):
+        # A 1536-dimension embedding at full float precision is ~33 KB of text: it must be
+        # bound as a native VECTOR before the temporary-LOB pass, or it becomes a CLOB.
+        import array
+        import json
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        class FakeCursor:
+            def __init__(self):
+                self.params = None
+
+            def setinputsizes(self, **kwargs):
+                pass
+
+            async def execute(self, query, params):
+                self.params = dict(params)
+
+            async def fetchall(self):
+                return []
+
+            def close(self):
+                pass
+
+            description = None
+            rowcount = 0
+
+        class FakeConn:
+            def __init__(self):
+                self.cursor_obj = FakeCursor()
+                self.created = []
+
+            def cursor(self):
+                return self.cursor_obj
+
+            async def createlob(self, lob_type):
+                self.created.append(lob_type)
+                raise AssertionError("an embedding must not be bound as a LOB")
+
+        conn = OracleConnection.__new__(OracleConnection)
+        conn._conn = FakeConn()
+        embedding = json.dumps([-0.1234567890123456789 - i * 1e-9 for i in range(1536)])
+        assert len(embedding.encode()) > 32767
+        await conn.execute("UPDATE memory_units SET embedding = $1 WHERE id = $2", embedding, "unit-1")
+
+        bound = conn._conn.cursor_obj.params["1"]
+        assert isinstance(bound, array.array) and len(bound) == 1536
+        assert conn._conn.created == []
+
     def test_clob_lob_covers_text_past_32k_bytes(self):
         from hindsight_api.engine.db.oracle import _needs_clob_lob
 
