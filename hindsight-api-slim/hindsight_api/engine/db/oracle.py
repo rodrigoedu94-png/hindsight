@@ -1245,8 +1245,10 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
-            await self._bind_large_values_as_lobs(params)
+            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+            # not a temporary CLOB.
             self._bind_vectors_natively(query, params)
+            await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1363,8 +1365,10 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
-            await self._bind_large_values_as_lobs(params)
+            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+            # not a temporary CLOB.
             self._bind_vectors_natively(query, params)
+            await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1406,8 +1410,10 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
-            await self._bind_large_values_as_lobs(params)
+            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+            # not a temporary CLOB.
             self._bind_vectors_natively(query, params)
+            await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1449,8 +1455,10 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
-            await self._bind_large_values_as_lobs(params)
+            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+            # not a temporary CLOB.
             self._bind_vectors_natively(query, params)
+            await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
