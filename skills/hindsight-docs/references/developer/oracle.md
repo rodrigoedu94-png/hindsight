@@ -126,7 +126,7 @@ the requirements are unchanged: an **ASSM** default tablespace (needed for
 #### Runtime user without DDL privileges
 
 The schema user above owns the tables and runs the migrations. The API itself
-does not need DDL: on Oracle AI Database 26ai, give it a separate user with
+does not need DDL: on Oracle Database 23ai or 26ai, give it a separate user with
 **schema privileges**, which cover the owner's current *and future* tables, so a
 later migration does not need new grants:
 
@@ -148,9 +148,7 @@ export HINDSIGHT_API_DATABASE_SCHEMA=HINDSIGHT   # the owner, not the runtime us
 
 With `HINDSIGHT_API_MIGRATION_DATABASE_URL` set, the startup migrations and the
 embedding-dimension check run as the owner; everything else runs as the runtime
-user. On Oracle Database 23ai, which lacks the schema-level DML grants that 26ai
-adds, grant the four object privileges on each table instead, and re-run the
-grants after migrations that add tables.
+user.
 
 ### 2. Build the connection URL
 
@@ -246,7 +244,8 @@ is fully supported on Oracle — see [Limitations](#limitations-vs-postgresql).)
 #### Embedding dimension
 
 The baseline creates the embedding columns as `VECTOR(384, FLOAT32)`. On every
-startup — and with `hindsight-admin run-db-migration --embedding-dimension <N>` —
+startup that runs migrations (`HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP=true`, the default) — and with
+`hindsight-admin run-db-migration --embedding-dimension <N>` —
 Hindsight reconciles `memory_units.embedding` and `mental_models.embedding` with
 the configured embeddings model, as it does on PostgreSQL:
 

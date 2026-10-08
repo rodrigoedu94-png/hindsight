@@ -205,6 +205,20 @@ def test_resize_without_indexes_still_restores_a_prior_column_comment():
     assert cursor.comments["EMBEDDING"] == "operator note"
 
 
+def test_crash_at_the_legacy_drop_keeps_the_operator_comment_on_the_live_column():
+    """The comment must reach the new column before the legacy one (its only other holder) is dropped."""
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(384,FLOAT32,DENSE)",
+        comments={"EMBEDDING": "operator note"},
+        fail_on="DROP COLUMN embedding_legacy",
+    )
+    with pytest.raises(_Crash):
+        _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+
+    assert cursor.has_legacy, "the crash happened before the drop"
+    assert cursor.comments.get("EMBEDDING") == "operator note"
+
+
 def test_resume_restores_the_prior_comment_the_marker_carried():
     """A crash after the marker overwrote the comment loses the local variable; the marker holds it."""
     marker = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(
@@ -223,6 +237,48 @@ def test_resume_restores_the_prior_comment_the_marker_carried():
     _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
     assert [i[0] for i in cursor.vector_indexes] == ["IDX_MU_EMBEDDING_HNSW"]
     assert cursor.comments["EMBEDDING"] == "operator note"
+
+
+def test_resume_restores_the_comment_directly_over_the_marker():
+    """Clearing the marker and restoring the comment must be one DDL: a crash between the two
+    leaves the column uncommented with the marker's copy of the text already gone."""
+    marker = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(
+        {
+            "ddl": [
+                'CREATE VECTOR INDEX "IDX_MU" ON MEMORY_UNITS (embedding) '
+                "ORGANIZATION NEIGHBOR PARTITIONS DISTANCE COSINE WITH TARGET ACCURACY 95"
+            ],
+            "comment": "operator note",
+        }
+    )
+    cursor = _ScriptedCursor(vector_info="VECTOR(1536,FLOAT32,DENSE)", comments={"EMBEDDING": marker})
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    comments_ddl = [s for s in cursor.statements if s.startswith("COMMENT ON")]
+    assert comments_ddl == ["COMMENT ON COLUMN MEMORY_UNITS.embedding IS 'operator note'"]
+    assert cursor.comments["EMBEDDING"] == "operator note"
+
+
+def test_resize_restores_the_comment_directly_over_the_marker():
+    """The uninterrupted resize has the same single-statement restore as the resume path."""
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(384,FLOAT32,DENSE)",
+        vector_indexes=[("IDX_MU", "NEIGHBOR_PARTITIONS_IVF", "NO")],
+        comments={"EMBEDDING": "operator note"},
+    )
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    comments_ddl = [s for s in cursor.statements if s.startswith("COMMENT ON")]
+    assert comments_ddl[-1] == "COMMENT ON COLUMN MEMORY_UNITS.embedding IS 'operator note'"
+    assert not any(s.endswith("IS ''") for s in comments_ddl)
+
+
+def test_pending_marker_round_trips_through_the_typed_payload():
+    """The marker is read back with the same typed model that writes it."""
+    from hindsight_api.migrations import _OraclePendingIndexesPayload
+
+    payload = _OraclePendingIndexesPayload(ddl=["DDL"], comment="operator note")
+    assert _OraclePendingIndexesPayload.from_json(payload.to_json()) == payload
+    # Markers written before the comment field existed are a bare DDL list.
+    assert _OraclePendingIndexesPayload.from_json('["DDL"]') == _OraclePendingIndexesPayload(ddl=["DDL"])
 
 
 def test_a_comment_too_long_for_the_marker_still_survives_the_resize():
