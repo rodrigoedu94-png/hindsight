@@ -1198,9 +1198,11 @@ class TestConfig:
 
         assert DEFAULT_DATABASE_BACKEND == "postgresql"
 
-    def test_oracle_vector_search_defaults_to_exact(self):
+    def test_oracle_vector_search_defaults_to_exact(self, monkeypatch):
         from hindsight_api.config import HindsightConfig
 
+        monkeypatch.delenv("HINDSIGHT_API_ORACLE_VECTOR_SEARCH", raising=False)
+        monkeypatch.delenv("HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY", raising=False)
         config = HindsightConfig.from_env()
         assert config.oracle_vector_search == "exact"
         assert config.oracle_vector_target_accuracy == 95

@@ -205,6 +205,20 @@ def test_resize_without_indexes_still_restores_a_prior_column_comment():
     assert cursor.comments["EMBEDDING"] == "operator note"
 
 
+def test_crash_at_the_legacy_drop_keeps_the_operator_comment_on_the_live_column():
+    """The comment must reach the new column before the legacy one (its only other holder) is dropped."""
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(384,FLOAT32,DENSE)",
+        comments={"EMBEDDING": "operator note"},
+        fail_on="DROP COLUMN embedding_legacy",
+    )
+    with pytest.raises(_Crash):
+        _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+
+    assert cursor.has_legacy, "the crash happened before the drop"
+    assert cursor.comments.get("EMBEDDING") == "operator note"
+
+
 def test_resume_restores_the_prior_comment_the_marker_carried():
     """A crash after the marker overwrote the comment loses the local variable; the marker holds it."""
     marker = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(

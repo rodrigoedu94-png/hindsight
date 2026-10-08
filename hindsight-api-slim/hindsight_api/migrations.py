@@ -26,7 +26,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any
 
 from alembic import command
 from alembic.config import Config
@@ -797,9 +797,14 @@ _ORACLE_PENDING_INDEXES_MARKER = "hindsight:pending-vector-indexes:"
 _ORACLE_RECONCILE_ATTEMPTS = 3
 
 
-class _OraclePendingIndexesPayload(TypedDict, total=False):
-    ddl: list[str]  # required: the CREATE VECTOR INDEX statements still owed
-    comment: str  # the column comment the marker overwrote
+@dataclass
+class _OraclePendingIndexesPayload:
+    ddl: list[str]  # the CREATE VECTOR INDEX statements still owed
+    comment: str = ""  # the column comment the marker overwrote ("" = not carried)
+
+    def to_json(self) -> str:
+        # "comment" is left out when empty, so the marker stays byte-identical to the older ones.
+        return json.dumps({"ddl": self.ddl, **({"comment": self.comment} if self.comment else {})})
 
 
 #: Oracle caps a column comment at 4000 bytes; a marker that would not fit omits the carried
@@ -864,11 +869,11 @@ def _set_oracle_pending_indexes(
     """
     comment = ""
     if index_ddl:
-        payload: _OraclePendingIndexesPayload = {"ddl": index_ddl}
-        comment = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(payload)
+        comment = _ORACLE_PENDING_INDEXES_MARKER + _OraclePendingIndexesPayload(index_ddl).to_json()
         if prior_comment:
-            payload["comment"] = prior_comment
-            with_comment = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(payload)
+            with_comment = (
+                _ORACLE_PENDING_INDEXES_MARKER + _OraclePendingIndexesPayload(index_ddl, prior_comment).to_json()
+            )
             if len(with_comment.encode()) <= _ORACLE_COLUMN_COMMENT_MAX_BYTES:
                 comment = with_comment
             else:
@@ -909,14 +914,15 @@ def _drop_oracle_embedding_legacy(cursor: Any, table_name: str) -> None:
         )
     # The rename carried embedding's comment here; hand it back to the new column unless the
     # marker (or an already-restored comment) occupies it — never overwrite the pending DDL.
+    # Done before the drop: a crash between the two must not lose the comment with the column.
     legacy_comment = _oracle_column_comment(cursor, table_name, "embedding_legacy")
-    cursor.execute(f"ALTER TABLE {table_name} DROP COLUMN embedding_legacy")
     if (
         legacy_comment
         and not legacy_comment.startswith(_ORACLE_PENDING_INDEXES_MARKER)
         and not _oracle_column_comment(cursor, table_name, "embedding")
     ):
         _set_oracle_column_comment(cursor, table_name, "embedding", legacy_comment)
+    cursor.execute(f"ALTER TABLE {table_name} DROP COLUMN embedding_legacy")
 
 
 def _create_oracle_vector_index(cursor: Any, ddl: str) -> None:

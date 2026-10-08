@@ -40,9 +40,13 @@ class _IndexedTable:
         return {ids[j] for j in np.argsort(-similarity)[:TOP_K]}
 
 
-def _indexed_table(oracle_admin_dsn, index_clause: str):
+def _indexed_table(oracle_db_url, index_clause: str):
     oracledb = pytest.importorskip("oracledb")
-    conn = oracledb.connect(**oracle_admin_dsn)
+    from hindsight_api.engine.db.oracle import _oracle_connect_params
+
+    # oracle_db_url is the test user, whose tablespace is ASSM; the admin user's default is SYSTEM on
+    # Oracle Free/XE, which rejects VECTOR columns (ORA-43853).
+    conn = oracledb.connect(**_oracle_connect_params(oracle_db_url))
     conn.autocommit = True
     cursor = conn.cursor()
     name = f"HS_VS_{uuid.uuid4().hex[:8].upper()}"
@@ -63,8 +67,8 @@ def _indexed_table(oracle_admin_dsn, index_clause: str):
 
 
 @pytest.fixture(params=[pytest.param(IVF_GLOBAL, id="ivf-global"), pytest.param(HNSW_LOCAL, id="hnsw-local")])
-def indexed_table(request, _oracle_admin_dsn):
-    conn, table = _indexed_table(_oracle_admin_dsn, request.param)
+def indexed_table(request, oracle_db_url):
+    conn, table = _indexed_table(oracle_db_url, request.param)
     try:
         yield table
     finally:
@@ -73,8 +77,8 @@ def indexed_table(request, _oracle_admin_dsn):
 
 
 @pytest.fixture()
-def ivf_table(_oracle_admin_dsn):
-    conn, table = _indexed_table(_oracle_admin_dsn, IVF_GLOBAL)
+def ivf_table(oracle_db_url):
+    conn, table = _indexed_table(oracle_db_url, IVF_GLOBAL)
     try:
         yield table
     finally:

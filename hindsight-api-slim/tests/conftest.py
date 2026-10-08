@@ -511,7 +511,8 @@ def oracle_db_url(_oracle_admin_dsn):
     from urllib.parse import quote
 
     credentials = f"{quote(test_user, safe='')}:{quote(test_pass, safe='')}"
-    if bare_dsn.lstrip().startswith("("):
+    # A connect descriptor or a TNS alias (anything that is not host:port/service) travels as ?dsn=
+    if bare_dsn.lstrip().startswith("(") or "/" not in bare_dsn:
         url = f"oracle://{credentials}@/?dsn={quote(bare_dsn, safe='')}"
     else:
         url = f"oracle://{credentials}@{bare_dsn}"
