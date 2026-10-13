@@ -1517,12 +1517,35 @@ class TestOracleLinksWithLiveUnits:
         conn = AsyncMock(spec=DatabaseConnection)
         conn.fetch = AsyncMock(return_value=[{"id": unit_a}])  # unit B is already gone
 
-        links = [(unit_a, unit_b, "semantic", 0.9, None)]
+        # Links arrive in reverse id order: the bound ids only come out sorted
+        # if the helper sorts them before locking.
+        links = [(unit_b, unit_a, "semantic", 0.9, None)]
         assert await OracleOps()._links_with_live_units(conn, links) == []
 
         sql, bound = conn.fetch.await_args.args
         assert "FOR UPDATE" in sql and "ORDER BY id" in sql
-        assert sorted(str(i) for i in bound) == [unit_a, unit_b]
+        assert [str(i) for i in bound] == [unit_a, unit_b]
+
+    @pytest.mark.asyncio
+    async def test_delete_unit_links_locks_the_parent_units_first(self):
+        """The delete path takes the same parents-before-children lock order as
+        the retain check; otherwise a retain holding a unit lock can deadlock a
+        delete that holds link locks (ORA-00060)."""
+        from hindsight_api.engine.db.ops_oracle import OracleOps
+
+        unit_a = "00000000-0000-0000-0000-00000000000a"
+        unit_b = "00000000-0000-0000-0000-00000000000b"
+        conn = AsyncMock(spec=DatabaseConnection)
+        conn.fetch = AsyncMock(return_value=[])
+
+        await OracleOps().delete_unit_links(conn, "memory_links", "bank-1", [unit_b, unit_a])
+
+        # The FOR UPDATE on the parents runs before the links DELETE.
+        assert conn.mock_calls[0][0] == "fetch"
+        sql, bound = conn.fetch.await_args.args
+        assert "FOR UPDATE" in sql and "ORDER BY id" in sql
+        assert [str(i) for i in bound] == [unit_a, unit_b]
+        assert "DELETE" in conn.execute.await_args.args[0].upper()
 
 
 # ---------------------------------------------------------------------------

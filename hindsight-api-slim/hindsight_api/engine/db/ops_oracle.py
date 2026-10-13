@@ -205,7 +205,13 @@ class OracleOps(DataAccessOps):
     ) -> None:
         if not unit_ids:
             return
-        # No ordered-lock form here (see prune_stale_cooccurrences): a plain delete.
+        # Callers delete the units right after these links, so take the parent
+        # locks first in the same sorted order retains take them (see
+        # _lock_units_for_update): both paths then go parents-then-children and
+        # a retain holding a unit lock can't deadlock a delete holding link locks
+        # (ORA-00060). The link delete itself stays a plain delete (see
+        # prune_stale_cooccurrences).
+        await self._lock_units_for_update(conn, unit_ids)
         keep = " AND NOT (link_type = ANY($3::text[]))" if keep_link_types else ""
         await conn.execute(
             f"DELETE FROM {table} WHERE bank_id = $2 "
@@ -256,13 +262,18 @@ class OracleOps(DataAccessOps):
         )
 
     @staticmethod
-    async def _links_with_live_units(conn: DatabaseConnection, links: list[tuple]) -> list[tuple]:
-        """Keep the links whose from/to units still exist (Oracle's stand-in for WHERE EXISTS)."""
+    async def _lock_units_for_update(conn: DatabaseConnection, unit_ids) -> set[str]:
+        """Lock the given memory_units rows FOR UPDATE in sorted id order; return the ids that exist.
+
+        Parent rows are locked before their links on every path that touches
+        both tables — retain's existence check here and delete_unit_links — in
+        one global order (chunk boundaries included, same convention as the
+        (from, to) link sort), so concurrent writers take the row locks
+        consistently instead of deadlocking (ORA-00060).
+        """
         from ..schema import fq_store_table
 
-        # Sorted once so concurrent retains take the row locks in the same global order,
-        # chunk boundaries included (same convention as the (from, to) link sort).
-        ids = sorted({str(i).lower() for lnk in links for i in (lnk[0], lnk[1])})
+        ids = sorted({str(i).lower() for i in unit_ids})
         live: set[str] = set()
         # ANY() expands to an IN list, which Oracle caps at 1000 entries (ORA-01795).
         for start in range(0, len(ids), 500):
@@ -277,6 +288,11 @@ class OracleOps(DataAccessOps):
                 chunk,
             )
             live.update(str(r["id"]).lower() for r in rows)
+        return live
+
+    async def _links_with_live_units(self, conn: DatabaseConnection, links: list[tuple]) -> list[tuple]:
+        """Keep the links whose from/to units still exist (Oracle's stand-in for WHERE EXISTS)."""
+        live = await self._lock_units_for_update(conn, {str(i).lower() for lnk in links for i in (lnk[0], lnk[1])})
         return [lnk for lnk in links if str(lnk[0]).lower() in live and str(lnk[1]).lower() in live]
 
     async def bulk_insert_entities(
