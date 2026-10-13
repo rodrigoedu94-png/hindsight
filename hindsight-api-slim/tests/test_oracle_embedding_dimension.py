@@ -239,6 +239,48 @@ def test_resume_restores_the_prior_comment_the_marker_carried():
     assert cursor.comments["EMBEDDING"] == "operator note"
 
 
+def test_resume_restores_the_comment_directly_over_the_marker():
+    """Clearing the marker and restoring the comment must be one DDL: a crash between the two
+    leaves the column uncommented with the marker's copy of the text already gone."""
+    marker = _ORACLE_PENDING_INDEXES_MARKER + json.dumps(
+        {
+            "ddl": [
+                'CREATE VECTOR INDEX "IDX_MU" ON MEMORY_UNITS (embedding) '
+                "ORGANIZATION NEIGHBOR PARTITIONS DISTANCE COSINE WITH TARGET ACCURACY 95"
+            ],
+            "comment": "operator note",
+        }
+    )
+    cursor = _ScriptedCursor(vector_info="VECTOR(1536,FLOAT32,DENSE)", comments={"EMBEDDING": marker})
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    comments_ddl = [s for s in cursor.statements if s.startswith("COMMENT ON")]
+    assert comments_ddl == ["COMMENT ON COLUMN MEMORY_UNITS.embedding IS 'operator note'"]
+    assert cursor.comments["EMBEDDING"] == "operator note"
+
+
+def test_resize_restores_the_comment_directly_over_the_marker():
+    """The uninterrupted resize has the same single-statement restore as the resume path."""
+    cursor = _ScriptedCursor(
+        vector_info="VECTOR(384,FLOAT32,DENSE)",
+        vector_indexes=[("IDX_MU", "NEIGHBOR_PARTITIONS_IVF", "NO")],
+        comments={"EMBEDDING": "operator note"},
+    )
+    _ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    comments_ddl = [s for s in cursor.statements if s.startswith("COMMENT ON")]
+    assert comments_ddl[-1] == "COMMENT ON COLUMN MEMORY_UNITS.embedding IS 'operator note'"
+    assert not any(s.endswith("IS ''") for s in comments_ddl)
+
+
+def test_pending_marker_round_trips_through_the_typed_payload():
+    """The marker is read back with the same typed model that writes it."""
+    from hindsight_api.migrations import _OraclePendingIndexesPayload
+
+    payload = _OraclePendingIndexesPayload(ddl=["DDL"], comment="operator note")
+    assert _OraclePendingIndexesPayload.from_json(payload.to_json()) == payload
+    # Markers written before the comment field existed are a bare DDL list.
+    assert _OraclePendingIndexesPayload.from_json('["DDL"]') == _OraclePendingIndexesPayload(ddl=["DDL"])
+
+
 def test_a_comment_too_long_for_the_marker_still_survives_the_resize():
     """Marker + comment would exceed Oracle's 4000-byte comment cap, so only the DDL rides in it."""
     note = "x" * 3900

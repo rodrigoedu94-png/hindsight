@@ -26,7 +26,8 @@ HNSW_LOCAL = "ORGANIZATION INMEMORY NEIGHBOR GRAPH DISTANCE COSINE WITH TARGET A
 
 
 class _IndexedTable:
-    def __init__(self, cursor, name: str, vectors: dict[int, list[float]], query: list[float]) -> None:
+    def __init__(self, conn, cursor, name: str, vectors: dict[int, list[float]], query: list[float]) -> None:
+        self.conn = conn
         self.cursor = cursor
         self.name = name
         self.vectors = vectors
@@ -63,27 +64,27 @@ def _indexed_table(oracle_db_url, index_clause: str):
     )
     cursor.execute(f"CREATE VECTOR INDEX {name}_VI ON {name} (embedding) {index_clause}")
     query = [rng.uniform(-1.0, 1.0) for _ in range(DIMENSION)]
-    return conn, _IndexedTable(cursor, name, vectors, query)
+    return _IndexedTable(conn, cursor, name, vectors, query)
 
 
 @pytest.fixture(params=[pytest.param(IVF_GLOBAL, id="ivf-global"), pytest.param(HNSW_LOCAL, id="hnsw-local")])
 def indexed_table(request, oracle_db_url):
-    conn, table = _indexed_table(oracle_db_url, request.param)
+    table = _indexed_table(oracle_db_url, request.param)
     try:
         yield table
     finally:
         table.cursor.execute(f"DROP TABLE {table.name} PURGE")
-        conn.close()
+        table.conn.close()
 
 
 @pytest.fixture()
 def ivf_table(oracle_db_url):
-    conn, table = _indexed_table(oracle_db_url, IVF_GLOBAL)
+    table = _indexed_table(oracle_db_url, IVF_GLOBAL)
     try:
         yield table
     finally:
         table.cursor.execute(f"DROP TABLE {table.name} PURGE")
-        conn.close()
+        table.conn.close()
 
 
 def _arm(table: str, mode: str, monkeypatch) -> str:

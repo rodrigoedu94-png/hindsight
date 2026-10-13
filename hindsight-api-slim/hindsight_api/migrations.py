@@ -806,6 +806,14 @@ class _OraclePendingIndexesPayload:
         # "comment" is left out when empty, so the marker stays byte-identical to the older ones.
         return json.dumps({"ddl": self.ddl, **({"comment": self.comment} if self.comment else {})})
 
+    @classmethod
+    def from_json(cls, raw: str) -> "_OraclePendingIndexesPayload":
+        """Parse a marker back; markers written before the comment field existed are a bare DDL list."""
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            return cls(ddl=list(payload["ddl"]), comment=payload.get("comment") or "")
+        return cls(ddl=list(payload))
+
 
 #: Oracle caps a column comment at 4000 bytes; a marker that would not fit omits the carried
 #: comment rather than fail the COMMENT ON COLUMN (the uninterrupted run still restores it).
@@ -838,14 +846,9 @@ def _oracle_embedding_columns(cursor: Any, table_name: str) -> _OracleEmbeddingC
     prior_comment = ""
     for (c,) in cursor.fetchall():
         if c and c.startswith(_ORACLE_PENDING_INDEXES_MARKER):
-            payload = json.loads(c[len(_ORACLE_PENDING_INDEXES_MARKER) :])
-            if isinstance(payload, dict):
-                # Newer markers also carry the comment they overwrote; ones written before
-                # that field existed are a bare DDL list.
-                pending_index_ddl = payload["ddl"]
-                prior_comment = payload.get("comment", "") or ""
-            else:
-                pending_index_ddl = payload
+            payload = _OraclePendingIndexesPayload.from_json(c[len(_ORACLE_PENDING_INDEXES_MARKER) :])
+            pending_index_ddl = payload.ddl
+            prior_comment = payload.comment
             break
     return _OracleEmbeddingColumns(
         vector_info=next((info for name, info in rows if name == "EMBEDDING"), None),
@@ -939,9 +942,10 @@ def _rebuild_pending_oracle_indexes(
 ) -> None:
     for ddl in index_ddl:
         _create_oracle_vector_index(cursor, ddl)
-    _set_oracle_pending_indexes(cursor, table_name, "embedding", [])
-    if prior_comment:
-        _set_oracle_column_comment(cursor, table_name, "embedding", prior_comment)
+    # One DDL lands the restore directly on the marker ("" clears it when it carried no
+    # comment): clearing the marker first and restoring after would leave a crash window
+    # where the column has neither — the marker's copy of the comment already gone.
+    _set_oracle_column_comment(cursor, table_name, "embedding", prior_comment)
     logger.warning(f"Rebuilt {len(index_ddl)} vector index(es) an interrupted resize left on {table_name}")
 
 
@@ -1146,9 +1150,8 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
     _drop_oracle_embedding_legacy(cursor, table_name)
     for ddl in index_ddl:
         _create_oracle_vector_index(cursor, ddl)
-    if index_ddl:
-        _set_oracle_pending_indexes(cursor, table_name, "embedding", [])
-    if prior_comment:
+    # Same single-DDL restore as the resume path above: no clear-then-restore window.
+    if index_ddl or prior_comment:
         _set_oracle_column_comment(cursor, table_name, "embedding", prior_comment)
     logger.info(
         f"Changed {table_name}.embedding dimension to {required_dimension} ({len(index_ddl)} vector index(es) rebuilt)"

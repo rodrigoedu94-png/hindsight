@@ -1500,6 +1500,32 @@ class TestOracleOpsInsertFactsBatch:
 
 
 # ---------------------------------------------------------------------------
+# OracleOps._links_with_live_units: the WHERE EXISTS stand-in must lock the
+# referenced units, or a concurrent delete still trips ORA-02291 on the insert.
+# ---------------------------------------------------------------------------
+
+
+class TestOracleLinksWithLiveUnits:
+    @pytest.mark.asyncio
+    async def test_locks_the_referenced_units_for_update_in_stable_order(self):
+        """A plain SELECT only shrinks the ORA-02291 window; FOR UPDATE (Oracle's
+        FOR KEY SHARE) closes it by holding the parents until the insert commits."""
+        from hindsight_api.engine.db.ops_oracle import OracleOps
+
+        unit_a = "00000000-0000-0000-0000-00000000000a"
+        unit_b = "00000000-0000-0000-0000-00000000000b"
+        conn = AsyncMock(spec=DatabaseConnection)
+        conn.fetch = AsyncMock(return_value=[{"id": unit_a}])  # unit B is already gone
+
+        links = [(unit_a, unit_b, "semantic", 0.9, None)]
+        assert await OracleOps()._links_with_live_units(conn, links) == []
+
+        sql, bound = conn.fetch.await_args.args
+        assert "FOR UPDATE" in sql and "ORDER BY id" in sql
+        assert sorted(str(i) for i in bound) == [unit_a, unit_b]
+
+
+# ---------------------------------------------------------------------------
 # PostgreSQL search_vector handling (insert). Since the curation archive drops
 # search_vector (#2503), the insert is the single place it is populated, and
 # pg_search_vector_expr is its one source of truth (shared with revert recompute).

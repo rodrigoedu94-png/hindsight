@@ -231,6 +231,8 @@ class OracleOps(DataAccessOps):
         # here, inside the caller's transaction: ANN neighbours found before the write
         # phase can point at units deleted since (observations dropped when a document
         # is re-retained), and inserting them fails with ORA-02291 on FK_ML_FROM/FK_ML_TO.
+        # The check locks what it finds — a plain SELECT would only shrink the window,
+        # not close it (see _links_with_live_units).
         if exists_clause:
             sorted_links = await self._links_with_live_units(conn, sorted_links)
             if not sorted_links:
@@ -258,13 +260,20 @@ class OracleOps(DataAccessOps):
         """Keep the links whose from/to units still exist (Oracle's stand-in for WHERE EXISTS)."""
         from ..schema import fq_store_table
 
-        ids = list({str(i).lower() for lnk in links for i in (lnk[0], lnk[1])})
+        # Sorted once so concurrent retains take the row locks in the same global order,
+        # chunk boundaries included (same convention as the (from, to) link sort).
+        ids = sorted({str(i).lower() for lnk in links for i in (lnk[0], lnk[1])})
         live: set[str] = set()
         # ANY() expands to an IN list, which Oracle caps at 1000 entries (ORA-01795).
         for start in range(0, len(ids), 500):
             chunk = [uuid_mod.UUID(i) for i in ids[start : start + 500]]
+            # FOR UPDATE is Oracle's FOR KEY SHARE (see bulk_reassert_entities and the
+            # PostgreSQL bulk_insert_links): the matched rows stay locked until this
+            # transaction commits, so a concurrent DELETE either commits first — and the
+            # row is absent here — or blocks and then fails its own FK check. Without it
+            # a unit could still vanish between the check and the INSERT (ORA-02291).
             rows = await conn.fetch(
-                f"SELECT id FROM {fq_store_table('memory_units')} WHERE id = ANY($1::uuid[])",
+                f"SELECT id FROM {fq_store_table('memory_units')} WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
                 chunk,
             )
             live.update(str(r["id"]).lower() for r in rows)
