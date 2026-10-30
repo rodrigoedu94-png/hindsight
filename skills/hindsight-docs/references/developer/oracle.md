@@ -246,7 +246,7 @@ is fully supported on Oracle — see [Limitations](#limitations-vs-postgresql).)
 The baseline creates the embedding columns as `VECTOR(384, FLOAT32)`. On every
 startup that runs migrations (`HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP=true`, the default) — and with
 `hindsight-admin run-db-migration --embedding-dimension <N>` —
-Hindsight reconciles `memory_units.embedding` and `mental_models.embedding` with
+with the built-in SQL memory store, Hindsight reconciles `memory_units.embedding` and `mental_models.embedding` with
 the configured embeddings model, as it does on PostgreSQL:
 
 | Column state | What happens |
@@ -296,9 +296,10 @@ manage the schema, users, grants and the connection.
   to *Not required* and restrict access with an access control list or a private
   endpoint. The `_low` or `_tp` service suits the API.
 - **Sessions.** Always Free instances accept 30 concurrent sessions, shared with
-  every other client of the database. Size `HINDSIGHT_API_DB_POOL_MAX_SIZE`
-  (default `100`) well below that — for example `10` — so a load spike cannot
-  exhaust the sessions other clients need.
+  every other client of the database. `HINDSIGHT_API_DB_POOL_MAX_SIZE`
+  (default `100`) is a per-process limit; budget all API/worker replicas and any separate
+  read pool (controlled by `HINDSIGHT_API_READ_DB_POOL_MAX_SIZE`, default `100`) below 30,
+  leaving capacity for other clients.
 - **Storage.** Always Free instances have 20 GB. `memory_units` is list-partitioned
   by bank, and every partition allocates its LOB segments up front, so each bank
   costs tens of MB even when nearly empty. The audit log

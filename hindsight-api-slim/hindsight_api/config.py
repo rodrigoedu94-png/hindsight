@@ -4726,7 +4726,7 @@ class HindsightConfig:
                 DEFAULT_BM25_MAX_QUERY_TERMS,
             ),
             bm25_selective_terms=_parse_boolean_env(ENV_BM25_SELECTIVE_TERMS, DEFAULT_BM25_SELECTIVE_TERMS),
-            oracle_vector_search=os.getenv(ENV_ORACLE_VECTOR_SEARCH, DEFAULT_ORACLE_VECTOR_SEARCH).lower(),
+            oracle_vector_search=os.getenv(ENV_ORACLE_VECTOR_SEARCH, DEFAULT_ORACLE_VECTOR_SEARCH).strip().lower(),
             oracle_vector_target_accuracy=_parse_non_negative_int(
                 ENV_ORACLE_VECTOR_TARGET_ACCURACY,
                 os.getenv(ENV_ORACLE_VECTOR_TARGET_ACCURACY),

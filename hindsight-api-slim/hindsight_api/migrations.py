@@ -846,7 +846,11 @@ def _oracle_embedding_columns(cursor: Any, table_name: str) -> _OracleEmbeddingC
     prior_comment = ""
     for (c,) in cursor.fetchall():
         if c and c.startswith(_ORACLE_PENDING_INDEXES_MARKER):
-            payload = _OraclePendingIndexesPayload.from_json(c[len(_ORACLE_PENDING_INDEXES_MARKER) :])
+            try:
+                payload = _OraclePendingIndexesPayload.from_json(c[len(_ORACLE_PENDING_INDEXES_MARKER) :])
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning(f"Ignoring unparseable pending-index marker on {table_name}: {exc}")
+                continue
             pending_index_ddl = payload.ddl
             prior_comment = payload.comment
             break
@@ -873,6 +877,11 @@ def _set_oracle_pending_indexes(
     comment = ""
     if index_ddl:
         comment = _ORACLE_PENDING_INDEXES_MARKER + _OraclePendingIndexesPayload(index_ddl).to_json()
+        if len(comment.encode()) > _ORACLE_COLUMN_COMMENT_MAX_BYTES:
+            raise RuntimeError(
+                f"Too many vector indexes on {table_name}.{column} to record in the pending-index marker "
+                f"({len(comment.encode())} bytes > {_ORACLE_COLUMN_COMMENT_MAX_BYTES})"
+            )
         if prior_comment:
             with_comment = (
                 _ORACLE_PENDING_INDEXES_MARKER + _OraclePendingIndexesPayload(index_ddl, prior_comment).to_json()
