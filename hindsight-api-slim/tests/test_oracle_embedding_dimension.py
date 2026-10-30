@@ -14,7 +14,11 @@ import uuid
 
 import pytest
 
-from hindsight_api.migrations import _ORACLE_PENDING_INDEXES_MARKER, _ensure_oracle_table_embedding_dimension
+from hindsight_api.migrations import (
+    _ORACLE_PENDING_INDEXES_MARKER,
+    _ensure_oracle_table_embedding_dimension,
+    _oracle_connect_params,
+)
 
 
 class _Crash(Exception):
@@ -389,10 +393,10 @@ def test_missing_table_is_skipped():
 
 
 @pytest.fixture()
-def oracle_cursor(_oracle_admin_dsn):
+def oracle_cursor(oracle_db_url):
     """A live cursor on the test schema plus a scratch table name, dropped afterwards."""
     oracledb = pytest.importorskip("oracledb")
-    conn = oracledb.connect(**_oracle_admin_dsn)
+    conn = oracledb.connect(**_oracle_connect_params(oracle_db_url))
     conn.autocommit = True
     cursor = conn.cursor()
     table = f"HS_DIM_{uuid.uuid4().hex[:8].upper()}"
