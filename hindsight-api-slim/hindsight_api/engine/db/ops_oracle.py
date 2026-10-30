@@ -205,7 +205,13 @@ class OracleOps(DataAccessOps):
     ) -> None:
         if not unit_ids:
             return
-        # No ordered-lock form here (see prune_stale_cooccurrences): a plain delete.
+        # Callers delete the units right after these links, so take the parent
+        # locks first in the same sorted order retains take them (see
+        # _lock_units_for_update): both paths then go parents-then-children and
+        # a retain holding a unit lock can't deadlock a delete holding link locks
+        # (ORA-00060). The link delete itself stays a plain delete (see
+        # prune_stale_cooccurrences).
+        await self._lock_units_for_update(conn, unit_ids)
         keep = " AND NOT (link_type = ANY($3::text[]))" if keep_link_types else ""
         await conn.execute(
             f"DELETE FROM {table} WHERE bank_id = $2 "
@@ -226,8 +232,17 @@ class OracleOps(DataAccessOps):
         chunk_size: int = 5000,
     ) -> None:
         # The backend rewrites ON CONFLICT DO NOTHING for duplicate suppression.
-        # WHERE EXISTS checks are intentionally skipped: executemany does not support
-        # correlated subqueries in this form, and callers guarantee unit validity.
+        # executemany cannot carry PostgreSQL's correlated WHERE EXISTS, so when the
+        # caller asks for it (exists_clause) the links whose units are gone are dropped
+        # here, inside the caller's transaction: ANN neighbours found before the write
+        # phase can point at units deleted since (observations dropped when a document
+        # is re-retained), and inserting them fails with ORA-02291 on FK_ML_FROM/FK_ML_TO.
+        # The check locks what it finds — a plain SELECT would only shrink the window,
+        # not close it (see _links_with_live_units).
+        if exists_clause:
+            sorted_links = await self._links_with_live_units(conn, sorted_links)
+            if not sorted_links:
+                return
         from_ids = [lnk[0] for lnk in sorted_links]
         to_ids = [lnk[1] for lnk in sorted_links]
         types = [lnk[2] for lnk in sorted_links]
@@ -245,6 +260,40 @@ class OracleOps(DataAccessOps):
             """,
             [(from_ids[i], to_ids[i], types[i], weights[i], entity_ids[i], bank_id) for i in range(len(sorted_links))],
         )
+
+    @staticmethod
+    async def _lock_units_for_update(conn: DatabaseConnection, unit_ids) -> set[str]:
+        """Lock the given memory_units rows FOR UPDATE in sorted id order; return the ids that exist.
+
+        Parent rows are locked before their links on every path that touches
+        both tables — retain's existence check here and delete_unit_links — in
+        one global order (chunk boundaries included, same convention as the
+        (from, to) link sort), so concurrent writers take the row locks
+        consistently instead of deadlocking (ORA-00060).
+        """
+        from ..schema import fq_store_table
+
+        ids = sorted({str(i).lower() for i in unit_ids})
+        live: set[str] = set()
+        # ANY() expands to an IN list, which Oracle caps at 1000 entries (ORA-01795).
+        for start in range(0, len(ids), 500):
+            chunk = [uuid_mod.UUID(i) for i in ids[start : start + 500]]
+            # FOR UPDATE is Oracle's FOR KEY SHARE (see bulk_reassert_entities and the
+            # PostgreSQL bulk_insert_links): the matched rows stay locked until this
+            # transaction commits, so a concurrent DELETE either commits first — and the
+            # row is absent here — or blocks and then fails its own FK check. Without it
+            # a unit could still vanish between the check and the INSERT (ORA-02291).
+            rows = await conn.fetch(
+                f"SELECT id FROM {fq_store_table('memory_units')} WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+                chunk,
+            )
+            live.update(str(r["id"]).lower() for r in rows)
+        return live
+
+    async def _links_with_live_units(self, conn: DatabaseConnection, links: list[tuple]) -> list[tuple]:
+        """Keep the links whose from/to units still exist (Oracle's stand-in for WHERE EXISTS)."""
+        live = await self._lock_units_for_update(conn, {str(i).lower() for lnk in links for i in (lnk[0], lnk[1])})
+        return [lnk for lnk in links if str(lnk[0]).lower() in live and str(lnk[1]).lower() in live]
 
     async def bulk_insert_entities(
         self,
