@@ -522,9 +522,17 @@ def oracle_db_url(_oracle_admin_dsn):
     # The DDL goes through HINDSIGHT_API_MIGRATION_DATABASE_URL when one is set — the
     # DSN user may be least-privileged (the ORA-01031 fallback above), and swallowing a
     # failed migration inside the fixture would fail every Oracle test with no signal.
+    from hindsight_api.db_url import is_oracle_url
     from hindsight_api.migrations import run_migrations
 
-    run_migrations(url, migration_database_url=os.getenv("HINDSIGHT_API_MIGRATION_DATABASE_URL"))
+    migration_url = os.getenv("HINDSIGHT_API_MIGRATION_DATABASE_URL")
+    if migration_url and not is_oracle_url(migration_url):
+        migration_url = None
+    run_migrations(
+        url,
+        schema=test_user.upper() if migration_url else None,
+        migration_database_url=migration_url,
+    )
 
     return url
 

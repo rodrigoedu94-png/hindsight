@@ -597,9 +597,11 @@ def test_reconcile_gives_up_after_repeated_ddl_failures_and_never_retries_a_data
     from hindsight_api import migrations
 
     error = _FakeOracleDriver.DatabaseError("ORA-00054: resource busy")
-    _patch_reconcile(monkeypatch, [error, error, error])
+    attempts = migrations._ORACLE_RECONCILE_ATTEMPTS
+    calls = _patch_reconcile(monkeypatch, [error] * attempts)
     with pytest.raises(_FakeOracleDriver.DatabaseError):
         migrations._ensure_embedding_dimension_oracle("oracle://x", 1536, None, store_owned_memories=False)
+    assert calls == ["MEMORY_UNITS"] * attempts
 
     calls = _patch_reconcile(monkeypatch, [RuntimeError("Cannot change embedding dimension")])
     with pytest.raises(RuntimeError):
