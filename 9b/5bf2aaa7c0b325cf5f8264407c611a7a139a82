@@ -1,0 +1,19 @@
+hindsight-api-slim/tests/conftest.py
+  s_676f91be3e6baf::t_0377c204d0b67b 531
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9b5bf2aaa7c0b325cf5f8264407c611a7a139a82",
+  "prompts": {},
+  "sessions": {
+    "s_676f91be3e6baf": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1793330769",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
