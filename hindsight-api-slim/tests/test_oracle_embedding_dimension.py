@@ -14,10 +14,10 @@ import uuid
 
 import pytest
 
+from hindsight_api.engine.db.oracle import _oracle_connect_params
 from hindsight_api.migrations import (
     _ORACLE_PENDING_INDEXES_MARKER,
     _ensure_oracle_table_embedding_dimension,
-    _oracle_connect_params,
 )
 
 

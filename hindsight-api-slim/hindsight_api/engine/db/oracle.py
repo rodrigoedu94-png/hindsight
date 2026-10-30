@@ -95,7 +95,7 @@ _RESULT_METADATA_CONTAINS_RE = re.compile(r"((?:\w+\.)?result_metadata)\s*@>\s*:
 # embedding column (SET embedding = :N, INSERT column/value lists), and the source column of an
 # upsert rewritten to MERGE (:N AS embedding in the USING select — the INSERT arm writes s.embedding,
 # bound by that same :N).
-_VECTOR_DISTANCE_PARAM_RE = re.compile(r"VECTOR_DISTANCE\s*\(\s*[\w.\"]+\s*,\s*(?:TO_VECTOR\(\s*)?:(\w+)", re.IGNORECASE)
+_VECTOR_DISTANCE_PARAM_RE = re.compile(r"\bVECTOR_DISTANCE\s*\(\s*[\w.\"]+\s*,\s*(?:TO_VECTOR\(\s*)?:(\w+)", re.IGNORECASE)
 _VECTOR_DISTANCE_CALL_RE = re.compile(r"\bVECTOR_DISTANCE\s*\(", re.IGNORECASE)
 _EMBEDDING_ASSIGN_PARAM_RE = re.compile(r'\b"?embedding"?\s*=\s*:(\w+)', re.IGNORECASE)
 _MERGE_SOURCE_EMBEDDING_RE = re.compile(r":(\w+)\s+AS\s+\"?embedding\"?", re.IGNORECASE)
