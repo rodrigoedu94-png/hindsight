@@ -335,8 +335,8 @@ class PostgreSQLOps(DataAccessOps):
         # deferred check, and the INSERT only takes links whose endpoints are in
         # the locked set, so rows that already vanished are dropped. Folding it
         # into the one INSERT keeps this to a single round-trip — no extra query
-        # and no surrounding transaction needed. (Oracle's immediate FK has no
-        # such window and uses exists_clause via its own bulk_insert_links.)
+        # and no surrounding transaction needed. (Oracle's bulk_insert_links locks
+        # and filters the referenced units in a preceding SELECT ... FOR UPDATE.)
         from ..schema import fq_store_table
 
         mu_table = fq_store_table("memory_units")

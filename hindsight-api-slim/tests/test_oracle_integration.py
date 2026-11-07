@@ -678,6 +678,47 @@ class TestOracleRetainSql:
         return chunk_id, unit_ids
 
     @pytest.mark.asyncio
+    async def test_links_to_a_deleted_unit_are_dropped(
+        self, oracle_memory: MemoryEngine, request_context: RequestContext
+    ):
+        """Links whose target unit was deleted before insert are dropped instead of raising ORA-02291."""
+        # ANN and temporal neighbours are found before the link insert; one deleted since
+        # (an observation dropped when its document is re-retained) made the insert fail
+        # with ORA-02291 on FK_ML_TO. Direct SQL is used here to forge the vanished-unit
+        # race and check raw memory_links row counts (get_graph_data dedupes edges).
+        from hindsight_api.engine.memories.pg.links import _bulk_insert_links
+
+        bank_id = _bank_id("linkgone")
+        dim = oracle_memory.embeddings.dimension
+        try:
+            await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+            backend = await oracle_memory._get_backend()
+            async with backend.transaction() as conn:
+                _, unit_ids = await self._seed(conn, backend, bank_id, dim)
+            link = (unit_ids[0], unit_ids[1], "semantic", 0.9, None)
+
+            async with backend.transaction() as conn:
+                await _bulk_insert_links(conn, [link], bank_id=bank_id, ops=backend.ops)
+            async with backend.acquire() as conn:
+                assert await conn.fetchval("SELECT COUNT(*) FROM memory_links WHERE bank_id = $1", bank_id) == 1
+
+            async with backend.transaction() as conn:
+                await conn.execute("DELETE FROM memory_units WHERE id = $1 AND bank_id = $2", unit_ids[1], bank_id)
+            async with backend.transaction() as conn:
+                await _bulk_insert_links(conn, [link], bank_id=bank_id, ops=backend.ops)
+                await _bulk_insert_links(
+                    conn,
+                    [(unit_ids[0], unit_ids[1], "temporal", 1.0, None)],
+                    bank_id=bank_id,
+                    skip_exists_check=True,
+                    ops=backend.ops,
+                )
+            async with backend.acquire() as conn:
+                assert await conn.fetchval("SELECT COUNT(*) FROM memory_links WHERE bank_id = $1", bank_id) == 0
+        finally:
+            await _safe_cleanup(oracle_memory, bank_id, request_context)
+
+    @pytest.mark.asyncio
     async def test_semantic_ann_links_delete_chunks(self, oracle_memory: MemoryEngine, request_context: RequestContext):
         from hindsight_api.engine.memories.pg.links import compute_semantic_links_ann
         from hindsight_api.engine.retain.chunk_storage import delete_chunks_by_ids

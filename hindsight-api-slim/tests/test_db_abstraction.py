@@ -1571,3 +1571,76 @@ class TestOracleSessionAndClobBinding:
         assert params["4"].lob_type == oracledb.DB_TYPE_CLOB and params["4"].data == text
         assert params["1"] == "doc-id" and params["3"] == bytes(16)  # a UUID stays RAW(16)
         assert params["5"] == "x" * 5000  # 4 000-32 767 bytes stay a string with a CLOB input size
+
+
+# ---------------------------------------------------------------------------
+# OracleOps._links_with_live_units: the WHERE EXISTS stand-in must lock the
+# referenced units, or a concurrent delete still trips ORA-02291 on the insert.
+# ---------------------------------------------------------------------------
+
+
+class TestOracleLinksWithLiveUnits:
+    @pytest.mark.asyncio
+    async def test_locks_the_referenced_units_for_update_in_stable_order(self):
+        """A plain SELECT only shrinks the ORA-02291 window; FOR UPDATE (Oracle's
+        FOR KEY SHARE) closes it by holding the parents until the insert commits."""
+        from hindsight_api.engine.db.ops_oracle import OracleOps
+
+        unit_a = "00000000-0000-0000-0000-00000000000a"
+        unit_b = "00000000-0000-0000-0000-00000000000b"
+        conn = AsyncMock(spec=DatabaseConnection)
+        conn.fetch = AsyncMock(return_value=[{"id": unit_a}])  # unit B is already gone
+
+        # Links arrive in reverse id order: the bound ids only come out sorted
+        # if the helper sorts them before locking.
+        links = [(unit_b, unit_a, "semantic", 0.9, None)]
+        assert await OracleOps()._links_with_live_units(conn, links) == []
+
+        sql, bound = conn.fetch.await_args.args
+        assert "FOR UPDATE" in sql and "ORDER BY id" in sql
+        assert [str(i) for i in bound] == [unit_a, unit_b]
+
+    @pytest.mark.asyncio
+    async def test_delete_unit_links_locks_the_parent_units_first(self):
+        """The delete path takes the same parents-before-children lock order as
+        the retain check; otherwise a retain holding a unit lock can deadlock a
+        delete that holds link locks (ORA-00060)."""
+        from hindsight_api.engine.db.ops_oracle import OracleOps
+
+        unit_a = "00000000-0000-0000-0000-00000000000a"
+        unit_b = "00000000-0000-0000-0000-00000000000b"
+        conn = AsyncMock(spec=DatabaseConnection)
+        conn.fetch = AsyncMock(return_value=[])
+
+        await OracleOps().delete_unit_links(conn, "memory_links", "bank-1", [unit_b, unit_a])
+
+        # The FOR UPDATE on the parents runs before the links DELETE.
+        assert conn.mock_calls[0][0] == "fetch"
+        sql, bound = conn.fetch.await_args.args
+        assert "FOR UPDATE" in sql and "ORDER BY id" in sql
+        assert [str(i) for i in bound] == [unit_a, unit_b]
+        assert "DELETE" in conn.execute.await_args.args[0].upper()
+
+    @pytest.mark.asyncio
+    async def test_bulk_insert_links_filters_vanished_units_even_without_exists_clause(self):
+        """Temporal link inserts pass skip_exists_check=True (exists_clause=''),
+        yet still reference pre-existing neighbour units that can vanish before
+        the insert; bulk_insert_links must lock and filter on every call."""
+        from hindsight_api.engine.db.ops_oracle import OracleOps
+
+        unit_a = "00000000-0000-0000-0000-00000000000a"
+        unit_b = "00000000-0000-0000-0000-00000000000b"
+        conn = AsyncMock(spec=DatabaseConnection)
+        conn.fetch = AsyncMock(return_value=[{"id": unit_a}])  # neighbour unit_b vanished
+
+        await OracleOps().bulk_insert_links(
+            conn,
+            "memory_links",
+            [(unit_a, unit_b, "temporal", 1.0, None)],
+            "bank-1",
+            "00000000-0000-0000-0000-000000000000",
+            "",
+        )
+
+        conn.fetch.assert_awaited_once()
+        conn.executemany.assert_not_awaited()
