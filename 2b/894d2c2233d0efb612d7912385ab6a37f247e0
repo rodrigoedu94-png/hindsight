@@ -1,0 +1,21 @@
+hindsight-api-slim/tests/test_oracle_embedding_dimension.py
+  s_6da841a5a36be2::t_7708712feab7f0 600-601,604
+hindsight-api-slim/tests/conftest.py
+  s_6da841a5a36be2::t_7708712feab7f0 549,552-559
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2b894d2c2233d0efb612d7912385ab6a37f247e0",
+  "prompts": {},
+  "sessions": {
+    "s_6da841a5a36be2": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1793330449",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
