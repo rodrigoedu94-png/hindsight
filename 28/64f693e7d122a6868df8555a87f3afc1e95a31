@@ -1,0 +1,25 @@
+hindsight-api-slim/tests/test_oracle_integration.py
+  s_9a80a95ed94fd2::t_7b07cead4f5029 681-721
+hindsight-api-slim/tests/test_db_abstraction.py
+  s_9a80a95ed94fd2::t_7b07cead4f5029 1574-1646
+hindsight-api-slim/hindsight_api/engine/db/ops_postgresql.py
+  s_9a80a95ed94fd2::t_7b07cead4f5029 338-339
+hindsight-api-slim/hindsight_api/engine/db/ops_oracle.py
+  s_9a80a95ed94fd2::t_7b07cead4f5029 208-214,235-244,263-296
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2864f693e7d122a6868df8555a87f3afc1e95a31",
+  "prompts": {},
+  "sessions": {
+    "s_9a80a95ed94fd2": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794085761",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
