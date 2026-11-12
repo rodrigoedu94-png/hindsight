@@ -56,15 +56,23 @@ def _indexed_table(oracle_db_url, index_clause: str):
         f"fact_type VARCHAR2(64) NOT NULL, embedding VECTOR({DIMENSION}, FLOAT32)) "
         "PARTITION BY LIST (bank_id) AUTOMATIC (PARTITION p_default VALUES ('__default__'))"
     )
-    rng = random.Random(42)
-    vectors = {i: [rng.uniform(-1.0, 1.0) for _ in range(DIMENSION)] for i in range(1, 2001)}
-    cursor.executemany(
-        f"INSERT INTO {name} VALUES (:1, :2, 'world', :3)",
-        [(i, f"bank-{i % 2}", array.array("f", v)) for i, v in vectors.items()],
-    )
-    cursor.execute(f"CREATE VECTOR INDEX {name}_VI ON {name} (embedding) {index_clause}")
-    query = [rng.uniform(-1.0, 1.0) for _ in range(DIMENSION)]
-    return _IndexedTable(conn, cursor, name, vectors, query)
+    try:
+        rng = random.Random(42)
+        vectors = {i: [rng.uniform(-1.0, 1.0) for _ in range(DIMENSION)] for i in range(1, 2001)}
+        cursor.executemany(
+            f"INSERT INTO {name} VALUES (:1, :2, 'world', :3)",
+            [(i, f"bank-{i % 2}", array.array("f", v)) for i, v in vectors.items()],
+        )
+        cursor.execute(f"CREATE VECTOR INDEX {name}_VI ON {name} (embedding) {index_clause}")
+        query = [rng.uniform(-1.0, 1.0) for _ in range(DIMENSION)]
+        return _IndexedTable(conn, cursor, name, vectors, query)
+    except Exception:
+        try:
+            cursor.execute(f"DROP TABLE {name} PURGE")
+        except Exception:
+            pass
+        conn.close()
+        raise
 
 
 @pytest.fixture(params=[pytest.param(IVF_GLOBAL, id="ivf-global"), pytest.param(HNSW_LOCAL, id="hnsw-local")])
@@ -73,8 +81,10 @@ def indexed_table(request, oracle_db_url):
     try:
         yield table
     finally:
-        table.cursor.execute(f"DROP TABLE {table.name} PURGE")
-        table.conn.close()
+        try:
+            table.cursor.execute(f"DROP TABLE {table.name} PURGE")
+        finally:
+            table.conn.close()
 
 
 @pytest.fixture()
@@ -83,8 +93,10 @@ def ivf_table(oracle_db_url):
     try:
         yield table
     finally:
-        table.cursor.execute(f"DROP TABLE {table.name} PURGE")
-        table.conn.close()
+        try:
+            table.cursor.execute(f"DROP TABLE {table.name} PURGE")
+        finally:
+            table.conn.close()
 
 
 def _arm(table: str, mode: str, monkeypatch) -> str:

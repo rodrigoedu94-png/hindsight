@@ -1783,6 +1783,7 @@ class TestOracleSessionAndClobBinding:
     async def test_long_embedding_binds_as_vector_not_clob(self):
         # A 1536-dimension embedding at full float precision is ~33 KB of text: it must be
         # bound as a native VECTOR before the temporary-LOB pass, or it becomes a CLOB.
+        pytest.importorskip("oracledb")
         import array
         import json
 

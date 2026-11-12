@@ -649,3 +649,33 @@ def test_admin_migration_of_an_oracle_url_skips_the_postgresql_steps(monkeypatch
         "migrate oracle+oracledb://app@/?dsn=x schema=TENANT_B as=oracle+oracledb://owner@/?dsn=x",
         "dimension oracle+oracledb://owner@/?dsn=x 1536 schema=TENANT_B",
     ]
+
+
+def test_admin_migration_of_an_oracle_url_aggregates_per_schema_errors(monkeypatch):
+    """One failing tenant schema on Oracle does not abort the remaining schemas."""
+    from hindsight_api import migrations
+
+    calls: list[str] = []
+    monkeypatch.setattr(migrations, "_should_isolate_migrations", lambda: False)
+
+    def _run_migrations(url, *, schema=None, **_):
+        calls.append(f"migrate:{schema}")
+        if schema == "TENANT_A":
+            raise ValueError("bad tenant A")
+
+    monkeypatch.setattr(migrations, "run_migrations", _run_migrations)
+    monkeypatch.setattr(
+        migrations,
+        "ensure_embedding_dimension",
+        lambda url, dim, *, schema=None, **_: calls.append(f"dimension:{schema}"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"Database migrations failed for 1 of 2 schema\(s\): TENANT_A") as exc_info:
+        migrations.run_migrations_for_schemas(
+            "oracle+oracledb://app@/?dsn=x",
+            ["TENANT_A", "TENANT_B"],
+            embedding_dimension=1536,
+        )
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert calls == ["migrate:TENANT_A", "migrate:TENANT_B", "dimension:TENANT_B"]
