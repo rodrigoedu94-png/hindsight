@@ -1,0 +1,33 @@
+.env.example
+  s_f73b02302125dd::t_9e19f16995bbf4 357-358
+skills/hindsight-docs/references/developer/oracle.md
+  s_f73b02302125dd::t_9e19f16995bbf4 286
+hindsight-api-slim/hindsight_api/config.py
+  s_f73b02302125dd::t_9e19f16995bbf4 1778-1779
+hindsight-api-slim/tests/conftest.py
+  s_f73b02302125dd::t_9e19f16995bbf4 584-587
+hindsight-embed/hindsight_embed/env.example
+  s_f73b02302125dd::t_9e19f16995bbf4 357-358
+hindsight-api-slim/hindsight_api/engine/db/oracle.py
+  s_f73b02302125dd::t_9e19f16995bbf4 1555-1561
+hindsight-docs/docs/developer/oracle.md
+  s_f73b02302125dd::t_9e19f16995bbf4 286
+hindsight-docs/docs/developer/configuration.mdx
+  s_f73b02302125dd::t_9e19f16995bbf4 38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a754344d2b3f81b0acabb19da73d85c6c5f165e4",
+  "prompts": {},
+  "sessions": {
+    "s_f73b02302125dd": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794523345",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
