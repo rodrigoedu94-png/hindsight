@@ -788,6 +788,7 @@ ENV_ANN_ITERATIVE_SCAN = "HINDSIGHT_API_ANN_ITERATIVE_SCAN"
 ENV_ANN_MAX_SCAN_TUPLES = "HINDSIGHT_API_ANN_MAX_SCAN_TUPLES"
 ENV_ORACLE_VECTOR_SEARCH = "HINDSIGHT_API_ORACLE_VECTOR_SEARCH"
 ENV_ORACLE_VECTOR_TARGET_ACCURACY = "HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY"
+ENV_ORACLE_STATEMENT_CACHE_SIZE = "HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE"
 ENV_TEXT_SEARCH_EXTENSION = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION"
 ENV_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE"
 ENV_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER"
@@ -1774,6 +1775,7 @@ DEFAULT_ANN_MAX_SCAN_TUPLES = 4000
 VALID_ORACLE_VECTOR_SEARCH = ("exact", "approx")
 DEFAULT_ORACLE_VECTOR_SEARCH = "exact"
 DEFAULT_ORACLE_VECTOR_TARGET_ACCURACY = 95
+DEFAULT_ORACLE_STATEMENT_CACHE_SIZE = 50
 
 # Text search extension (native PostgreSQL, vchord BM25, Timescale pg_textsearch,
 # pgroonga, or ParadeDB pg_search). Unused by banks with enable_text_search off.
@@ -4221,6 +4223,7 @@ class HindsightConfig:
     bm25_selective_terms: bool = DEFAULT_BM25_SELECTIVE_TERMS
     oracle_vector_search: str = DEFAULT_ORACLE_VECTOR_SEARCH  # "exact" or "approx"
     oracle_vector_target_accuracy: int = DEFAULT_ORACLE_VECTOR_TARGET_ACCURACY
+    oracle_statement_cache_size: int = DEFAULT_ORACLE_STATEMENT_CACHE_SIZE
 
     # Webhook SSRF hardening (static, server-level only — deliberately NOT
     # per-bank configurable: a tenant must not be able to re-open the private
@@ -4742,6 +4745,10 @@ class HindsightConfig:
         if type(self.oracle_vector_target_accuracy) is not int or not 1 <= self.oracle_vector_target_accuracy <= 100:
             raise ValueError(
                 f"Invalid oracle_vector_target_accuracy: {self.oracle_vector_target_accuracy}. Must be an integer between 1 and 100"
+            )
+        if type(self.oracle_statement_cache_size) is not int or self.oracle_statement_cache_size < 0:
+            raise ValueError(
+                f"Invalid oracle_statement_cache_size: {self.oracle_statement_cache_size}. Must be an integer >= 0"
             )
 
         # Validate bedrock_service_tier
@@ -5428,6 +5435,11 @@ class HindsightConfig:
                 ENV_ORACLE_VECTOR_TARGET_ACCURACY,
                 os.getenv(ENV_ORACLE_VECTOR_TARGET_ACCURACY),
                 DEFAULT_ORACLE_VECTOR_TARGET_ACCURACY,
+            ),
+            oracle_statement_cache_size=_parse_non_negative_int(
+                ENV_ORACLE_STATEMENT_CACHE_SIZE,
+                os.getenv(ENV_ORACLE_STATEMENT_CACHE_SIZE),
+                DEFAULT_ORACLE_STATEMENT_CACHE_SIZE,
             ),
             recall_max_candidates_per_source=int(
                 os.getenv(ENV_RECALL_MAX_CANDIDATES_PER_SOURCE, str(DEFAULT_RECALL_MAX_CANDIDATES_PER_SOURCE))
