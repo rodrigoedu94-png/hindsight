@@ -35,7 +35,7 @@ The API service handles all memory operations (retain, recall, reflect).
 | `HINDSIGHT_API_DATABASE_BACKEND` | Database engine backend: `postgresql` or `oracle` (Oracle Database 23ai / Oracle AI Database 26ai) | `postgresql` |
 | `HINDSIGHT_API_ORACLE_VECTOR_SEARCH` | Oracle only. `exact` ranks every candidate of the bank with `FETCH EXACT FIRST`; `approx` uses `FETCH APPROX FIRST … WITH TARGET ACCURACY`, which lets Oracle answer semantic recall from the `memory_units.embedding` vector index. See [Oracle → vector search](./oracle#vector-search). | `exact` |
 | `HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY` | Oracle only. Target accuracy (1–100) of approximate semantic recall when `HINDSIGHT_API_ORACLE_VECTOR_SEARCH=approx`. | `95` |
-| `HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE` | Oracle only. Per-session cursor/statement cache size passed to `python-oracledb` (`0` disables). Avoids soft-parsing repeated SQL statements across pooled checkouts. | `50` |
+| `HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE` | Oracle only. Per-session cursor/statement cache size passed to `python-oracledb` (`0` disables; set e.g. `50` on single-schema deployments to avoid soft-parsing repeated SQL statements across pooled checkouts). | `0` |
 
 If not provided, the server uses embedded `pg0` — convenient for development but not recommended for production.
 

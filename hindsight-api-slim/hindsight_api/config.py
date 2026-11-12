@@ -1717,6 +1717,8 @@ DEFAULT_ANN_MAX_SCAN_TUPLES = 4000
 VALID_ORACLE_VECTOR_SEARCH = ("exact", "approx")
 DEFAULT_ORACLE_VECTOR_SEARCH = "exact"
 DEFAULT_ORACLE_VECTOR_TARGET_ACCURACY = 95
+# Off (0) by default so multi-tenant pools that switch CURRENT_SCHEMA do not retain
+# unqualified cursors across schemas unless explicitly enabled.
 DEFAULT_ORACLE_STATEMENT_CACHE_SIZE = 0
 
 # Text search extension (native PostgreSQL, vchord BM25, Timescale pg_textsearch,
