@@ -1,0 +1,33 @@
+hindsight-docs/docs/developer/configuration.mdx
+  s_d92a53fb6e2fb3::t_09ac4ae9146564 38
+hindsight-docs/docs/developer/oracle.md
+  s_d92a53fb6e2fb3::t_09ac4ae9146564 286,334-337,341-342
+.env.example
+  s_d92a53fb6e2fb3::t_09ac4ae9146564 357-358
+skills/hindsight-docs/references/developer/oracle.md
+  s_d92a53fb6e2fb3::t_09ac4ae9146564 286,334-337,341-342
+hindsight-api-slim/hindsight_api/config.py
+  s_d92a53fb6e2fb3::t_09ac4ae9146564 791,1778,4226,4749-4752,5439-5443
+hindsight-api-slim/hindsight_api/engine/db/oracle.py
+  s_d92a53fb6e2fb3::t_09ac4ae9146564 1587-1594,1599,1616-1620,1623-1624,1626-1627,1635-1643,1647-1651
+hindsight-api-slim/tests/test_db_abstraction.py
+  s_d92a53fb6e2fb3::t_09ac4ae9146564 1727-1822
+hindsight-embed/hindsight_embed/env.example
+  s_d92a53fb6e2fb3::t_09ac4ae9146564 357-358
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ba45f26c4fbf088f9efbfae1e642ed66fa578ad2",
+  "prompts": {},
+  "sessions": {
+    "s_d92a53fb6e2fb3": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794520365",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
