@@ -1,0 +1,19 @@
+hindsight-api-slim/hindsight_api/engine/db/oracle.py
+  s_323efd004f24f5::t_2052908b703d92 1555-1559
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "36fb71990585c52a5bd56395b4d29b7342ba0409",
+  "prompts": {},
+  "sessions": {
+    "s_323efd004f24f5": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794523651",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
