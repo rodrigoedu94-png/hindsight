@@ -1,0 +1,19 @@
+hindsight-docs/docs/developer/configuration.mdx
+  s_e5ef724ecced2f::t_786c1aea89863c 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a1fae3adc5918dbb755ae99e57f88ef8b705c1fa",
+  "prompts": {},
+  "sessions": {
+    "s_e5ef724ecced2f": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794514240",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
