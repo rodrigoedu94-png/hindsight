@@ -283,7 +283,7 @@ Oracle-relevant settings, all documented in full on the
 | `HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP` | Auto-apply migrations when the API boots (default `true`). |
 | `HINDSIGHT_API_ORACLE_VECTOR_SEARCH` | `exact` (default) or `approx` — see [Vector search](#vector-search). |
 | `HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY` | Target accuracy (1–100) of `approx` semantic recall (default `95`). |
-| `HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE` | Per-session cursor/statement cache size for `python-oracledb` (default `50`; `0` disables). |
+| `HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE` | Per-session cursor/statement cache size for `python-oracledb` (default `0`, disabled; set e.g. `50` on single-schema deployments). |
 | `HINDSIGHT_API_DB_POOL_MAX_SIZE` | Upper bound of the connection pool (default `100`); lower it to fit the service's session limit — see [Autonomous AI Database](#autonomous-ai-database). |
 
 ## Autonomous AI Database

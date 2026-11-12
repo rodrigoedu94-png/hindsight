@@ -1552,10 +1552,13 @@ class OracleBackend(DatabaseBackend):
         cfg = get_config()
         effective_schema = self.normalize_schema(schema) or self.normalize_schema(cfg.database_schema)
         if effective_schema is None and cfg.migration_database_url:
-            dsn_user = (_oracle_connect_params(dsn).get("user") or "").upper()
-            mig_user = (_oracle_connect_params(cfg.migration_database_url).get("user") or "").upper()
-            if dsn_user and mig_user and dsn_user != mig_user:
-                effective_schema = dsn_user
+            dsn_user = _oracle_connect_params(dsn).get("user") or ""
+            mig_user = _oracle_connect_params(cfg.migration_database_url).get("user") or ""
+            if dsn_user != mig_user:
+                raise ValueError(
+                    "HINDSIGHT_API_DATABASE_SCHEMA must be set explicitly on Oracle when "
+                    "HINDSIGHT_API_MIGRATION_DATABASE_URL uses a different user than HINDSIGHT_API_DATABASE_URL"
+                )
         # Forward the migration URL like the PostgreSQL backend does: it lets the DDL run as
         # the schema owner while the API itself connects as a runtime user without DDL rights.
         run_migrations(dsn, schema=effective_schema, migration_database_url=cfg.migration_database_url)
