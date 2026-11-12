@@ -51,12 +51,12 @@ def _indexed_table(oracle_db_url, index_clause: str):
     conn.autocommit = True
     cursor = conn.cursor()
     name = f"HS_VS_{uuid.uuid4().hex[:8].upper()}"
-    cursor.execute(
-        f"CREATE TABLE {name} (id NUMBER PRIMARY KEY, bank_id VARCHAR2(256) NOT NULL, "
-        f"fact_type VARCHAR2(64) NOT NULL, embedding VECTOR({DIMENSION}, FLOAT32)) "
-        "PARTITION BY LIST (bank_id) AUTOMATIC (PARTITION p_default VALUES ('__default__'))"
-    )
     try:
+        cursor.execute(
+            f"CREATE TABLE {name} (id NUMBER PRIMARY KEY, bank_id VARCHAR2(256) NOT NULL, "
+            f"fact_type VARCHAR2(64) NOT NULL, embedding VECTOR({DIMENSION}, FLOAT32)) "
+            "PARTITION BY LIST (bank_id) AUTOMATIC (PARTITION p_default VALUES ('__default__'))"
+        )
         rng = random.Random(42)
         vectors = {i: [rng.uniform(-1.0, 1.0) for _ in range(DIMENSION)] for i in range(1, 2001)}
         cursor.executemany(
