@@ -2077,16 +2077,28 @@ def run_migrations_for_schemas(
         # Oracle has none of the PG extension/index reconcile steps below, which used to run
         # anyway and failed on Oracle, and Alembic runs sequentially as on API startup.
         # "public" is PG's default schema; on Oracle it means the connecting user's own schema.
+        oracle_errors: dict[str, BaseException] = {}
         for schema in schemas:
             oracle_schema = None if schema == "public" else schema
-            run_migrations(database_url, schema=oracle_schema, migration_database_url=migration_database_url)
-            if embedding_dimension is not None:
-                ensure_embedding_dimension(
-                    migration_database_url or database_url,
-                    embedding_dimension,
-                    schema=oracle_schema,
-                    store_owned_memories=store_owned_memories,
-                )
+            try:
+                run_migrations(database_url, schema=oracle_schema, migration_database_url=migration_database_url)
+                if embedding_dimension is not None:
+                    ensure_embedding_dimension(
+                        migration_database_url or database_url,
+                        embedding_dimension,
+                        schema=oracle_schema,
+                        store_owned_memories=store_owned_memories,
+                    )
+            except Exception as exc:  # noqa: BLE001 — aggregate per-schema when migrating multiple tenants
+                if len(schemas) == 1:
+                    raise
+                oracle_errors[schema] = exc
+                logger.error("Migration failed for schema '%s': %s", schema, exc)
+        if oracle_errors:
+            failed = ", ".join(sorted(oracle_errors))
+            raise RuntimeError(
+                f"Database migrations failed for {len(oracle_errors)} of {len(schemas)} schema(s): {failed}"
+            ) from next(iter(oracle_errors.values()))
         return
 
     # A kwargs BAG, assembled conditionally below. Inferred, its value type is the union of
