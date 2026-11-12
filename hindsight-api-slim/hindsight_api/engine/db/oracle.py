@@ -1584,14 +1584,19 @@ class OracleBackend(DatabaseBackend):
 
         from ...config import get_config
 
-        self._acquire_warn_threshold_s = get_config().db_acquire_warn_threshold_ms / 1000.0
+        cfg = get_config()
+        self._acquire_warn_threshold_s = cfg.db_acquire_warn_threshold_ms / 1000.0
+        # MemoryEngine passes statement_cache_size=0 so PostgreSQL stays compatible with
+        # transaction-mode PgBouncer. On Oracle that disables python-oracledb's per-session
+        # cursor cache and forces a parse on every statement (including per-row link inserts).
+        effective_stmt_cache = statement_cache_size if statement_cache_size > 0 else cfg.oracle_statement_cache_size
 
-        pool_kwargs: dict[str, Any] = {"min": min_size, "max": max_size, "stmtcachesize": statement_cache_size}
+        pool_kwargs: dict[str, Any] = {"min": min_size, "max": max_size, "stmtcachesize": effective_stmt_cache}
         pool_kwargs.update(_oracle_connect_params(dsn))
 
         self._pool = oracledb.create_pool_async(**pool_kwargs, session_callback=_disable_parallel_dml)
 
-        logger.info(f"Oracle pool created (min={min_size}, max={max_size})")
+        logger.info(f"Oracle pool created (min={min_size}, max={max_size}, stmtcachesize={effective_stmt_cache})")
 
     async def shutdown(self) -> None:
         # Drop the reference before awaiting close() so is_ready flips False for
@@ -1608,15 +1613,18 @@ class OracleBackend(DatabaseBackend):
     async def _set_session_schema(self, conn: Any) -> None:
         """Set the session schema on an Oracle connection.
 
-        Uses ALTER SESSION SET CURRENT_SCHEMA so that all unqualified table
-        references resolve to the tenant's schema. This is Oracle's equivalent
-        of PostgreSQL's SET search_path — fq_table() returns bare table names
-        for Oracle, relying on this session-level setting for isolation.
+        Uses ``conn.current_schema`` when available (python-oracledb piggybacks a
+        changed ``CURRENT_SCHEMA`` onto the next SQL execution with zero extra
+        round-trips, and skips work completely when the pooled session already uses
+        ``target_schema``). Falls back to ``ALTER SESSION SET CURRENT_SCHEMA`` for
+        minimal connection stubs that do not expose ``current_schema``.
         """
         schema = get_current_schema()
-        cursor = conn.cursor()
+        has_native_current_schema = hasattr(conn, "current_schema")
+        cursor = None
         try:
-            if self._default_schema is None:
+            if self._default_schema is None and (not schema or schema == "public" or has_native_current_schema):
+                cursor = conn.cursor()
                 await cursor.execute("SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') FROM DUAL")
                 row = await cursor.fetchone()
                 if not row or not row[0]:
@@ -1624,13 +1632,23 @@ class OracleBackend(DatabaseBackend):
                 self._default_schema = str(row[0])
 
             target_schema = self._default_schema if not schema or schema == "public" else schema
+            assert target_schema is not None
+            if has_native_current_schema:
+                active_schema = conn.current_schema or self._default_schema
+                if active_schema != target_schema:
+                    conn.current_schema = target_schema
+                return
+
+            if cursor is None:
+                cursor = conn.cursor()
             safe_schema = target_schema.replace('"', '""')
             await cursor.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{safe_schema}"')
         finally:
-            # oracledb's AsyncCursor.close() is synchronous (not a coroutine);
-            # awaiting it raises "object NoneType can't be used in 'await'
-            # expression" and aborts every acquire().
-            cursor.close()
+            if cursor is not None:
+                # oracledb's AsyncCursor.close() is synchronous (not a coroutine);
+                # awaiting it raises "object NoneType can't be used in 'await'
+                # expression" and aborts every acquire().
+                cursor.close()
 
     def _pool_stats(self) -> PoolStats | None:
         """Snapshot for slow-acquire logs, from oracledb pool attributes."""

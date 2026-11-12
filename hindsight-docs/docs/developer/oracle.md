@@ -283,6 +283,7 @@ Oracle-relevant settings, all documented in full on the
 | `HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP` | Auto-apply migrations when the API boots (default `true`). |
 | `HINDSIGHT_API_ORACLE_VECTOR_SEARCH` | `exact` (default) or `approx` — see [Vector search](#vector-search). |
 | `HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY` | Target accuracy (1–100) of `approx` semantic recall (default `95`). |
+| `HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE` | Per-session cursor/statement cache size for `python-oracledb` (default `50`; `0` disables). |
 | `HINDSIGHT_API_DB_POOL_MAX_SIZE` | Upper bound of the connection pool (default `100`); lower it to fit the service's session limit — see [Autonomous AI Database](#autonomous-ai-database). |
 
 ## Autonomous AI Database
@@ -330,14 +331,15 @@ exact or approximate:
   thousand memories takes tens of milliseconds.
 
 The baseline creates a global IVF index (`idx_mu_embedding_hnsw`, organization
-`NEIGHBOR PARTITIONS`, despite its name). Oracle also offers local HNSW indexes on
-partitioned tables (Oracle AI Database 26ai), which search only the bank's
-partition:
+`NEIGHBOR PARTITIONS`, despite its name). On Oracle AI Database 26ai, replace it
+with a **local** partitioned index (`NEIGHBOR PARTITIONS … LOCAL` for buffer-cached
+IVF with zero vector-pool memory, or `INMEMORY NEIGHBOR GRAPH … LOCAL` for HNSW)
+so `FETCH APPROX` searches only the queried bank's partition:
 
 ```sql
 DROP INDEX idx_mu_embedding_hnsw;
-CREATE VECTOR INDEX idx_mu_embedding_hnsw ON memory_units (embedding)
-    ORGANIZATION INMEMORY NEIGHBOR GRAPH DISTANCE COSINE
+CREATE VECTOR INDEX idx_mu_embedding_ivf ON memory_units (embedding)
+    ORGANIZATION NEIGHBOR PARTITIONS DISTANCE COSINE
     WITH TARGET ACCURACY 95 LOCAL;
 ```
 

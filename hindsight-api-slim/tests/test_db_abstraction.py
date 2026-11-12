@@ -1724,6 +1724,102 @@ class TestOracleSetSessionSchema:
         assert closed["count"] == 1
         assert any('ALTER SESSION SET CURRENT_SCHEMA = "APP_USER"' in s for s in executed)
 
+    @pytest.mark.asyncio
+    async def test_native_current_schema_piggybacks_and_skips_noop(self):
+        """oracledb's ``conn.current_schema`` avoids ALTER SESSION round-trips."""
+        from hindsight_api import schema_context
+        from hindsight_api.engine.db.oracle import OracleBackend
+
+        executed: list[str] = []
+
+        class _FakeAsyncCursor:
+            async def execute(self, sql: str) -> None:
+                executed.append(sql)
+
+            async def fetchone(self):
+                return ("APP_USER",)
+
+            def close(self) -> None:
+                pass
+
+        class _FakeOracleConn:
+            def __init__(self) -> None:
+                self.current_schema: str | None = None
+                self.assignments: list[str] = []
+
+            def __setattr__(self, name: str, value) -> None:
+                if name == "current_schema" and hasattr(self, "assignments"):
+                    self.assignments.append(value)
+                super().__setattr__(name, value)
+
+            def cursor(self) -> "_FakeAsyncCursor":
+                return _FakeAsyncCursor()
+
+        backend = OracleBackend()
+        conn = _FakeOracleConn()
+
+        # Default schema on fresh session: caches SESSION_USER once, zero assignments.
+        token = schema_context._current_schema.set("public")
+        try:
+            await backend._set_session_schema(conn)
+            await backend._set_session_schema(conn)
+        finally:
+            schema_context._current_schema.reset(token)
+        assert executed == ["SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') FROM DUAL"]
+        assert conn.assignments == []
+
+        # Tenant schema: piggybacks once, second checkout on same tenant is a no-op.
+        token = schema_context._current_schema.set("TENANT_X")
+        try:
+            await backend._set_session_schema(conn)
+            await backend._set_session_schema(conn)
+        finally:
+            schema_context._current_schema.reset(token)
+        assert conn.assignments == ["TENANT_X"]
+        assert conn.current_schema == "TENANT_X"
+
+        # Returning to public resets current_schema back to APP_USER with zero SQL.
+        token = schema_context._current_schema.set("public")
+        try:
+            await backend._set_session_schema(conn)
+        finally:
+            schema_context._current_schema.reset(token)
+        assert conn.assignments == ["TENANT_X", "APP_USER"]
+        assert conn.current_schema == "APP_USER"
+        assert len(executed) == 1
+
+    @pytest.mark.asyncio
+    async def test_initialize_uses_oracle_statement_cache_size_when_zero_passed(self, monkeypatch):
+        """MemoryEngine's statement_cache_size=0 falls back to oracle_statement_cache_size."""
+        from hindsight_api.config import clear_config_cache
+        from hindsight_api.engine.db import oracle as oracle_mod
+
+        captured: dict = {}
+
+        class _FakeOracledb:
+            class defaults:
+                fetch_lobs = True
+
+            @staticmethod
+            def create_pool_async(**kwargs):
+                captured.update(kwargs)
+                return object()
+
+        monkeypatch.setattr(oracle_mod, "_import_oracledb", lambda: _FakeOracledb)
+        monkeypatch.delenv("HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE", raising=False)
+        clear_config_cache()
+        try:
+            backend = oracle_mod.OracleBackend()
+            await backend.initialize("oracle+oracledb://u:p@h:1521/svc", statement_cache_size=0)
+            assert captured["stmtcachesize"] == 50
+
+            monkeypatch.setenv("HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE", "0")
+            clear_config_cache()
+            await backend.initialize("oracle+oracledb://u:p@h:1521/svc", statement_cache_size=0)
+            assert captured["stmtcachesize"] == 0
+        finally:
+            clear_config_cache()
+
 
 # ---------------------------------------------------------------------------
 # Oracle session setup and CLOB binding (#4630, #4632)
