@@ -578,7 +578,8 @@ def oracle_db_url(_oracle_admin_dsn):
     migration_url = os.getenv("HINDSIGHT_API_MIGRATION_DATABASE_URL")
     if migration_url and not is_oracle_url(migration_url):
         migration_url = None
-    run_migrations(url, migration_database_url=migration_url)
+    migration_schema = os.getenv("HINDSIGHT_API_DATABASE_SCHEMA") or (test_user if test_user != admin_user else None)
+    run_migrations(url, schema=migration_schema, migration_database_url=migration_url)
 
     return url
 

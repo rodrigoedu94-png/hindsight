@@ -1549,9 +1549,16 @@ class OracleBackend(DatabaseBackend):
         from ...config import get_config
         from ...migrations import run_migrations
 
+        cfg = get_config()
+        effective_schema = self.normalize_schema(schema) or self.normalize_schema(cfg.database_schema)
+        if effective_schema is None and cfg.migration_database_url:
+            dsn_user = (_oracle_connect_params(dsn).get("user") or "").upper()
+            mig_user = (_oracle_connect_params(cfg.migration_database_url).get("user") or "").upper()
+            if dsn_user and mig_user and dsn_user != mig_user:
+                effective_schema = dsn_user
         # Forward the migration URL like the PostgreSQL backend does: it lets the DDL run as
         # the schema owner while the API itself connects as a runtime user without DDL rights.
-        run_migrations(dsn, schema=schema, migration_database_url=get_config().migration_database_url)
+        run_migrations(dsn, schema=effective_schema, migration_database_url=cfg.migration_database_url)
 
     def create_task_backend(self, *, pool_getter: Any = None, schema_getter: Any = None) -> Any:
         """Oracle now uses BrokerTaskBackend — worker/poller is backend-agnostic."""
@@ -1636,13 +1643,29 @@ class OracleBackend(DatabaseBackend):
             if has_native_current_schema:
                 active_schema = conn.current_schema or self._default_schema
                 if active_schema != target_schema:
+                    # Flush any per-session statement cache before switching schemas so
+                    # unqualified SQL parsed under the previous schema cannot be reused.
+                    cache_size = getattr(conn, "stmtcachesize", 0)
+                    if isinstance(cache_size, int) and cache_size > 0:
+                        conn.stmtcachesize = 0
+                        conn.stmtcachesize = cache_size
                     conn.current_schema = target_schema
                 return
 
+            prev_schema = getattr(conn, "_hindsight_current_schema", self._default_schema)
+            if prev_schema != target_schema:
+                cache_size = getattr(conn, "stmtcachesize", 0)
+                if isinstance(cache_size, int) and cache_size > 0:
+                    conn.stmtcachesize = 0
+                    conn.stmtcachesize = cache_size
             if cursor is None:
                 cursor = conn.cursor()
             safe_schema = target_schema.replace('"', '""')
             await cursor.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{safe_schema}"')
+            try:
+                conn._hindsight_current_schema = target_schema
+            except Exception:
+                pass
         finally:
             if cursor is not None:
                 # oracledb's AsyncCursor.close() is synchronous (not a coroutine);

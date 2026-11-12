@@ -1811,12 +1811,12 @@ class TestOracleSetSessionSchema:
         try:
             backend = oracle_mod.OracleBackend()
             await backend.initialize("oracle+oracledb://u:p@h:1521/svc", statement_cache_size=0)
-            assert captured["stmtcachesize"] == 50
+            assert captured["stmtcachesize"] == 0
 
-            monkeypatch.setenv("HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE", "0")
+            monkeypatch.setenv("HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE", "50")
             clear_config_cache()
             await backend.initialize("oracle+oracledb://u:p@h:1521/svc", statement_cache_size=0)
-            assert captured["stmtcachesize"] == 0
+            assert captured["stmtcachesize"] == 50
         finally:
             clear_config_cache()
 
