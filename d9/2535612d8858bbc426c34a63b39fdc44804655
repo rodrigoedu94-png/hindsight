@@ -1,0 +1,27 @@
+hindsight-api-slim/tests/test_oracle_vector_search.py
+  s_1021467ce72e7b::t_05c33e53eb1f9a 55-59
+hindsight-api-slim/tests/test_db_abstraction.py
+  s_1021467ce72e7b::t_05c33e53eb1f9a 1814,1816,1819
+hindsight-api-slim/hindsight_api/engine/db/oracle.py
+  s_1021467ce72e7b::t_05c33e53eb1f9a 1552-1558,1561,1646-1651,1655-1660,1665-1668
+hindsight-api-slim/tests/conftest.py
+  s_1021467ce72e7b::t_05c33e53eb1f9a 584-585
+hindsight-api-slim/hindsight_api/config.py
+  s_1021467ce72e7b::t_05c33e53eb1f9a 1778
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d92535612d8858bbc426c34a63b39fdc44804655",
+  "prompts": {},
+  "sessions": {
+    "s_1021467ce72e7b": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794522506",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
