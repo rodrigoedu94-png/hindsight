@@ -627,27 +627,14 @@ async def newest_memory_updated_at(
     staleness check catches it.
     """
     is_oracle = getattr(conn, "backend_type", None) == "oracle"
-    if is_oracle:
-        # The Oracle driver binds naive datetimes as TIMESTAMP without a time zone.
-        # Make their intended UTC zone explicit rather than inheriting SESSIONTIMEZONE.
-        until = until if until.tzinfo is not None else until.replace(tzinfo=timezone.utc)
-        if since is not None:
-            since = since if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
-    scope = _refresh_scope_where(bank_id, until, since, fact_types, tags, tags_match, tag_groups)
+    scope = _refresh_scope_where(
+        bank_id, until, since, fact_types, tags, tags_match, tag_groups, is_oracle=is_oracle
+    )
     if is_oracle:
         # Oracle's DESC index key is SYS_EXTRACT_UTC(updated_at), so MAX(timestamp
         # with time zone) cannot use it while preserving the original zone.
-        scope_sql = scope.sql.replace(
-            "updated_at <= $2",
-            "SYS_EXTRACT_UTC(updated_at) <= SYS_EXTRACT_UTC(CAST($2 AS TIMESTAMP WITH TIME ZONE))",
-        )
-        if since is not None:
-            scope_sql = scope_sql.replace(
-                "updated_at > $3",
-                "SYS_EXTRACT_UTC(updated_at) > SYS_EXTRACT_UTC(CAST($3 AS TIMESTAMP WITH TIME ZONE))",
-            )
         return await conn.fetchval(
-            f"SELECT updated_at FROM {fq_table('memory_units')} WHERE {scope_sql} "
+            f"SELECT updated_at FROM {fq_table('memory_units')} WHERE {scope.sql} "
             "ORDER BY SYS_EXTRACT_UTC(updated_at) DESC FETCH FIRST 1 ROW ONLY",
             *scope.params,
         )
@@ -671,10 +658,14 @@ async def memories_updated_between(
     tag_groups: list | None = None,
 ) -> list[StoredMemory]:
     """The memories :func:`newest_memory_updated_at` takes the max over, oldest first, at most ``limit``."""
-    scope = _refresh_scope_where(bank_id, until, since, fact_types, tags, tags_match, tag_groups)
+    is_oracle = getattr(conn, "backend_type", None) == "oracle"
+    scope = _refresh_scope_where(
+        bank_id, until, since, fact_types, tags, tags_match, tag_groups, is_oracle=is_oracle
+    )
+    order_col = "SYS_EXTRACT_UTC(updated_at)" if is_oracle else "updated_at"
     rows = await conn.fetch(
         f"SELECT {_MEMORY_COLUMNS} FROM {fq_table('memory_units')} WHERE {scope.sql} "
-        f"ORDER BY updated_at, id LIMIT ${len(scope.params) + 1}",
+        f"ORDER BY {order_col}, id LIMIT ${len(scope.params) + 1}",
         *scope.params,
         limit,
     )
@@ -689,13 +680,33 @@ def _refresh_scope_where(
     tags: list[str] | None,
     tags_match: TagsMatch,
     tag_groups: list | None,
+    *,
+    is_oracle: bool = False,
 ) -> _ScopeWhere:
     """A refresh's scope within ``(since, until]`` as a WHERE clause and its params."""
-    params: list[Any] = [bank_id, until]
-    where = ["bank_id = $1", "updated_at <= $2"]
+    until_bound = (
+        until if (not is_oracle or until.tzinfo is not None) else until.replace(tzinfo=timezone.utc)
+    )
+    params: list[Any] = [bank_id, until_bound]
+    if is_oracle:
+        where = [
+            "bank_id = $1",
+            "SYS_EXTRACT_UTC(updated_at) <= SYS_EXTRACT_UTC(CAST($2 AS TIMESTAMP WITH TIME ZONE))",
+        ]
+    else:
+        where = ["bank_id = $1", "updated_at <= $2"]
     if since is not None:
-        params.append(since)
-        where.append(f"updated_at > ${len(params)}")
+        since_bound = (
+            since if (not is_oracle or since.tzinfo is not None) else since.replace(tzinfo=timezone.utc)
+        )
+        params.append(since_bound)
+        idx = len(params)
+        if is_oracle:
+            where.append(
+                f"SYS_EXTRACT_UTC(updated_at) > SYS_EXTRACT_UTC(CAST(${idx} AS TIMESTAMP WITH TIME ZONE))"
+            )
+        else:
+            where.append(f"updated_at > ${idx}")
 
     built = build_tags_where_clause(tags, param_offset=len(params) + 1, match=tags_match)
     if built.sql:
