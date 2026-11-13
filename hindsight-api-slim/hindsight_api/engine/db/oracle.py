@@ -13,6 +13,7 @@ Requires: python-oracledb (thin mode — pure Python, no Oracle client needed).
 Supports multi-tenant schema isolation via ALTER SESSION SET CURRENT_SCHEMA.
 """
 
+import array
 import datetime
 import inspect
 import json
@@ -79,17 +80,31 @@ _RETURNING_RE = re.compile(r"\bRETURNING\s+(?!(?:CLOB|BLOB|VARCHAR2|JSON)\b)(.+)
 _ANY_RE = re.compile(r"=\s*ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 _NOT_ALL_RE = re.compile(r"!=\s*ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 # LIKE ANY / NOT LIKE ALL — capture the column name before the operator
-_LIKE_ANY_RE = re.compile(r"(\w+)\s+LIKE\s+ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
-_NOT_LIKE_ALL_RE = re.compile(r"(\w+)\s+NOT\s+LIKE\s+ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
+_LIKE_ANY_RE = re.compile(r"(\w+(?:\.\w+)?)\s+LIKE\s+ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
+_NOT_LIKE_ALL_RE = re.compile(r"(\w+(?:\.\w+)?)\s+NOT\s+LIKE\s+ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 # array_position(:N, col) — PostgreSQL idiom for "keep the input list order"
 _ARRAY_POSITION_RE = re.compile(r"\barray_position\s*\(\s*:(\d+)\s*,\s*([\w.]+)\s*\)", re.IGNORECASE)
 
-_JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both col and "col"
+_JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?(?:\."?\w+"?)?)\s*->>\s*\'(\w+)\'')  # handles both col and "col"
 # Reserved-word columns ("trigger") are already quoted by the time this runs, so the
 # column group must accept the quoted form too — same shape as the arrow regex above.
-_JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?)\s*\?\s*'(\w+)'")
-_JSONB_CONTAINS_RE = re.compile(r"(\w+)\s*@>\s*:(\d+)")
+_JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?(?:\.\"?\w+\"?)?)\s*\?\s*'(\w+)'")
+_JSONB_CONTAINS_RE = re.compile(r"(\w+(?:\.\w+)?)\s*@>\s*:(\d+)")
 _RESULT_METADATA_CONTAINS_RE = re.compile(r"((?:\w+\.)?result_metadata)\s*@>\s*:(\d+)", re.IGNORECASE)
+# Parameters that carry an embedding: the query-side operand of VECTOR_DISTANCE(<column>, :N, ...),
+# bare or wrapped in TO_VECTOR (which accepts a native VECTOR bind too), values written to an
+# embedding column (SET embedding = :N, INSERT column/value lists), and the source column of an
+# upsert rewritten to MERGE (:N AS embedding in the USING select — the INSERT arm writes s.embedding,
+# bound by that same :N).
+_VECTOR_DISTANCE_PARAM_RE = re.compile(
+    r"\bVECTOR_DISTANCE\s*\(\s*[\w.\"]+\s*,\s*(?:TO_VECTOR\(\s*)?:(\w+)", re.IGNORECASE
+)
+_VECTOR_DISTANCE_CALL_RE = re.compile(r"\bVECTOR_DISTANCE\s*\(", re.IGNORECASE)
+_EMBEDDING_ASSIGN_PARAM_RE = re.compile(r'\b"?embedding"?\s*=\s*:(\w+)', re.IGNORECASE)
+_MERGE_SOURCE_EMBEDDING_RE = re.compile(r":(\w+)\s+AS\s+\"?embedding\"?", re.IGNORECASE)
+_INSERT_COLUMNS_VALUES_RE = re.compile(
+    r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*(\(.*)", re.IGNORECASE | re.DOTALL
+)
 
 # ---------------------------------------------------------------------------
 # Argument conversion helpers
@@ -287,6 +302,28 @@ def _split_respecting_parens(s: str) -> list[str]:
     return parts
 
 
+def _top_level_paren_contents(s: str) -> list[str]:
+    """Inner text of each top-level parenthesized group in ``s``.
+
+    e.g. "(:1, :2), (:3, :4)" → [":1, :2", ":3, :4"] — the row groups of a
+    multi-row VALUES list, which naive splitting mispairs against the columns.
+    """
+    groups: list[str] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(s):
+        if ch == "(":
+            if depth == 0:
+                start = i + 1
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                groups.append(s[start:i])
+                start = -1
+    return groups
+
+
 def _rewrite_upsert_to_merge(query: str) -> str | None:
     """Rewrite INSERT ... ON CONFLICT ... DO UPDATE SET ... to Oracle MERGE INTO.
 
@@ -369,7 +406,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # with NULL ON ERROR, so a merged document over 4000 bytes silently becomes NULL
     # (e.g. ORA-01407 when updating the NOT NULL banks.config column).
     query = re.sub(
-        r"(\w+)\s*\|\|\s*(:\w+)::jsonb", r"JSON_MERGEPATCH(\1, \2 RETURNING CLOB)", query, flags=re.IGNORECASE
+        r"(\w+(?:\.\w+)?)\s*\|\|\s*(:\w+)::jsonb", r"JSON_MERGEPATCH(\1, \2 RETURNING CLOB)", query, flags=re.IGNORECASE
     )
 
     # JSONB merge with complex left-hand expression (e.g. COALESCE(...)):
@@ -404,7 +441,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         return f"JSON_VALUE({col}, '$.{key}') = '{val}'"
 
     query = re.sub(
-        r"""\((\w+)\s*->>\s*'(\w+)'\)::boolean\s*=\s*(true|false)""",
+        r"""\((\w+(?:\.\w+)?)\s*->>\s*'(\w+)'\)::boolean\s*=\s*(true|false)""",
         _rewrite_json_bool,
         query,
         flags=re.IGNORECASE,
@@ -425,7 +462,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         )
 
     query = re.sub(
-        r"""NOT\s*\(\s*(\w+)(?:::jsonb)?\s*@>\s*'\{\s*["']?is_parent["']?\s*:\s*true\s*\}'(?:::jsonb)?\s*\)""",
+        r"""NOT\s*\(\s*(\w+(?:\.\w+)?)(?:::jsonb)?\s*@>\s*'\{\s*["']?is_parent["']?\s*:\s*true\s*\}'(?:::jsonb)?\s*\)""",
         _rewrite_not_jsonb_is_parent,
         query,
         flags=re.IGNORECASE,
@@ -554,25 +591,29 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
                 flags=re.IGNORECASE,
             )
     else:
-        # No FOR UPDATE: use standard FETCH FIRST / OFFSET ROWS syntax
+        # No FOR UPDATE: use standard FETCH FIRST / OFFSET ROWS syntax.
+        # A query ranking by vector distance asks for EXACT: on Autonomous Database a bare
+        # FETCH FIRST is answered from a vector index whenever one exists, which made these
+        # nearest-neighbour lookups (temporal arm, link expansion) silently approximate.
+        fetch_first = "FETCH EXACT FIRST" if _VECTOR_DISTANCE_CALL_RE.search(query) else "FETCH FIRST"
         # First handle "LIMIT N OFFSET M" → "OFFSET M ROWS FETCH FIRST N ROWS ONLY"
         query = re.sub(
             r"\bLIMIT\s+(\d+|:\w+)\s+OFFSET\s+(\d+|:\w+)\b",
-            r"OFFSET \2 ROWS FETCH FIRST \1 ROWS ONLY",
+            rf"OFFSET \2 ROWS {fetch_first} \1 ROWS ONLY",
             query,
             flags=re.IGNORECASE,
         )
         # Handle "OFFSET M LIMIT N" → "OFFSET M ROWS FETCH FIRST N ROWS ONLY"
         query = re.sub(
             r"\bOFFSET\s+(\d+|:\w+)\s+LIMIT\s+(\d+|:\w+)\b",
-            r"OFFSET \1 ROWS FETCH FIRST \2 ROWS ONLY",
+            rf"OFFSET \1 ROWS {fetch_first} \2 ROWS ONLY",
             query,
             flags=re.IGNORECASE,
         )
         # Handle standalone "LIMIT N" (no OFFSET)
         query = re.sub(
             r"\bLIMIT\s+(\d+|:\w+)\b",
-            r"FETCH FIRST \1 ROWS ONLY",
+            rf"{fetch_first} \1 ROWS ONLY",
             query,
             flags=re.IGNORECASE,
         )
@@ -586,7 +627,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
 
     # PG non-empty array check: tags != '{}' → Oracle: NOT (DBMS_LOB empty check)
     query = re.sub(
-        r"(\w+)\s*!=\s*'\{\}'",
+        r"(\w+(?:\.\w+)?)\s*!=\s*'\{\}'",
         r"NOT (DBMS_LOB.GETLENGTH(\1) IS NULL OR DBMS_LOB.GETLENGTH(\1) <= 2)",
         query,
     )
@@ -599,9 +640,9 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         return f"(DBMS_LOB.GETLENGTH({col}) IS NULL OR DBMS_LOB.GETLENGTH({col}) <= 2)"
 
     # Match col = '{}' preceded by OR/AND/WHERE or opening paren (comparison context)
-    query = re.sub(r"(?<=\bOR\s)(\w+)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
-    query = re.sub(r"(?<=\bAND\s)(\w+)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
-    query = re.sub(r"(?<=\bWHERE\s)(\w+)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
+    query = re.sub(r"(?<=\bOR\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
+    query = re.sub(r"(?<=\bAND\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
+    query = re.sub(r"(?<=\bWHERE\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
 
     # PG array overlap: tags && :N → Oracle: JSON array overlap check using JSON_TABLE
     def _rewrite_array_overlap(m):
@@ -609,7 +650,7 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         param = m.group(2)
         return f"EXISTS (SELECT 1 FROM JSON_TABLE({param}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) jt WHERE JSON_EXISTS({col}, '$[*]?(@ == $v)' PASSING jt.val AS \"v\"))"
 
-    query = re.sub(r"(\w+)\s*&&\s*(:\w+)", _rewrite_array_overlap, query)
+    query = re.sub(r"(\w+(?:\.\w+)?)\s*&&\s*(:\w+)", _rewrite_array_overlap, query)
 
     # PG array containment: tags @> :N → Oracle: all elements from param exist in col
     # (Override the JSONB contains regex which doesn't work for array containment)
@@ -626,14 +667,14 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
 
     # Fix the already-rewritten @> pattern if it was handled by _JSONB_CONTAINS_RE
     query = re.sub(
-        r"JSON_EXISTS\((\w+),\s*'\$'\s*PASSING\s*(:\w+)\s*AS\s*cond\)",
+        r"JSON_EXISTS\((\w+(?:\.\w+)?),\s*'\$'\s*PASSING\s*(:\w+)\s*AS\s*cond\)",
         _rewrite_array_contains,
         query,
     )
 
     # ILIKE → UPPER(...) LIKE UPPER(...)
     query = re.sub(
-        r"(\w+)\s+ILIKE\s+(:\w+)",
+        r"(\w+(?:\.\w+)?)\s+ILIKE\s+(:\w+)",
         r"UPPER(\1) LIKE UPPER(\2)",
         query,
         flags=re.IGNORECASE,
@@ -876,6 +917,50 @@ class OracleConnection(DatabaseConnection):
                 params[key] = lob
 
     @staticmethod
+    def _vector_bind_keys(query: str) -> set[str]:
+        """Names of the bind parameters that carry an embedding in ``query`` (see _bind_vectors_natively)."""
+        keys = (
+            set(_VECTOR_DISTANCE_PARAM_RE.findall(query))
+            | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(query))
+            | set(_MERGE_SOURCE_EMBEDDING_RE.findall(query))
+        )
+        # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...) [, (...)]: pair each
+        # row group's column/value lists by position (one list per row on multi-row inserts).
+        insert = _INSERT_COLUMNS_VALUES_RE.search(query)
+        if insert:
+            columns = [c.strip().strip('"').lower() for c in insert.group(1).split(",")]
+            for group in _top_level_paren_contents(insert.group(2)):
+                values = _split_respecting_parens(group)
+                for column, value in zip(columns, values, strict=False):
+                    if column == "embedding" and value.startswith(":"):
+                        keys.add(value[1:])
+        return keys
+
+    @staticmethod
+    def _convert_vector_params(keys: set[str], params: dict[str, Any]) -> None:
+        for key in keys:
+            value = params.get(key)
+            if isinstance(value, str) and value.startswith("["):
+                params[key] = array.array("f", json.loads(value))
+
+    @staticmethod
+    def _bind_vectors_natively(query: str, params: dict[str, Any] | None) -> None:
+        """Bind embedding parameters as native vectors instead of text.
+
+        Callers pass embeddings as their str() — "[0.0123, ...]" — which bind as text. Oracle
+        converts text to VECTOR through a 32,767-byte buffer, and str() of a 1536-dimension
+        embedding with full-precision floats is ~33 KB: recall failed with ORA-01460 and
+        writes (e.g. consolidation inserting an observation) with ORA-01461 for such
+        providers, and always at 3072 dimensions. An array('f') binds as DB_TYPE_VECTOR with
+        no size limit; the columns are FLOAT32, so nothing is lost. Only parameters used as
+        an embedding are converted (VECTOR_DISTANCE operand or a value of the embedding
+        column); other JSON-looking parameters keep their text binding.
+        """
+        if not params:
+            return
+        OracleConnection._convert_vector_params(OracleConnection._vector_bind_keys(query), params)
+
+    @staticmethod
     def _apply_clob_input_sizes(cursor: Any, query: str, params: dict[str, Any] | None) -> None:
         """Tell oracledb to bind typed input sizes for ambiguous parameters.
 
@@ -995,7 +1080,7 @@ class OracleConnection(DatabaseConnection):
         query = expand_re.sub(_replace, query)
 
         # Expand LIKE ANY: col /*LIKE_ANY:N:col*/ → (col LIKE :p0 OR col LIKE :p1 ...)
-        like_any_re = re.compile(r"(\w+)\s*/\*LIKE_ANY:(\d+):(\w+)\*/")
+        like_any_re = re.compile(r"(\w+(?:\.\w+)?)\s*/\*LIKE_ANY:(\d+):(\w+(?:\.\w+)?)\*/")
 
         def _replace_like_any(m):
             _col = m.group(1)  # redundant column ref before marker
@@ -1017,7 +1102,7 @@ class OracleConnection(DatabaseConnection):
         query = like_any_re.sub(_replace_like_any, query)
 
         # Expand NOT LIKE ALL: col /*NOT_LIKE_ALL:N:col*/ → (col NOT LIKE :p0 AND ...)
-        not_like_all_re = re.compile(r"(\w+)\s*/\*NOT_LIKE_ALL:(\d+):(\w+)\*/")
+        not_like_all_re = re.compile(r"(\w+(?:\.\w+)?)\s*/\*NOT_LIKE_ALL:(\d+):(\w+(?:\.\w+)?)\*/")
 
         def _replace_not_like_all(m):
             _col = m.group(1)
@@ -1162,6 +1247,9 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+            # not a temporary CLOB.
+            self._bind_vectors_natively(query, params)
             await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
@@ -1196,12 +1284,18 @@ class OracleConnection(DatabaseConnection):
     async def executemany(self, query: str, args: list[tuple[Any, ...]], *, timeout: float | None = None) -> None:
         query, ignore_dup, _ = _rewrite_pg_to_oracle(query)
         converted = _convert_args_list(args)
+        # Batch writes carry the same str() embeddings as single writes (e.g.
+        # insert_facts_batch), so they need the same native VECTOR binding.
+        vector_keys = self._vector_bind_keys(query)
         cursor = self._conn.cursor()
         try:
             if ignore_dup:
                 # Row-by-row with individual dup suppression
                 for row in converted:
                     params = {str(i + 1): v for i, v in enumerate(row)}
+                    # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+                    # not a temporary CLOB.
+                    self._convert_vector_params(vector_keys, params)
                     await self._bind_large_values_as_lobs(params)
                     self._apply_clob_input_sizes(cursor, query, params)
                     try:
@@ -1214,7 +1308,11 @@ class OracleConnection(DatabaseConnection):
                 # LOBs here: the batched callers are plain INSERT ... VALUES (chunks,
                 # attachments, links), where a CLOB input size binds long text fine —
                 # ORA-01461 only hits a bind in a select list such as MERGE ... USING.
-                converted_dicts = [{str(i + 1): v for i, v in enumerate(row)} for row in converted]
+                converted_dicts = []
+                for row in converted:
+                    params = {str(i + 1): v for i, v in enumerate(row)}
+                    self._convert_vector_params(vector_keys, params)
+                    converted_dicts.append(params)
                 # The driver types each column from the first row, so a column holding
                 # any CLOB-sized value must be declared CLOB for the whole batch.
                 clob_keys = {k for row in converted_dicts for k, v in row.items() if _needs_clob_bind(v)}
@@ -1269,6 +1367,9 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+            # not a temporary CLOB.
+            self._bind_vectors_natively(query, params)
             await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
@@ -1311,6 +1412,9 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+            # not a temporary CLOB.
+            self._bind_vectors_natively(query, params)
             await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
@@ -1353,6 +1457,9 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+            # not a temporary CLOB.
+            self._bind_vectors_natively(query, params)
             await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
@@ -1439,9 +1546,24 @@ class OracleBackend(DatabaseBackend):
 
     def run_migrations(self, dsn: str, *, schema: str | None = None) -> None:
         """Run Oracle DDL migrations through the shared Alembic pipeline."""
+        from ...config import get_config
         from ...migrations import run_migrations
 
-        run_migrations(dsn, schema=schema)
+        cfg = get_config()
+        effective_schema = self.normalize_schema(schema) or self.normalize_schema(cfg.database_schema)
+        if effective_schema is None and cfg.migration_database_url:
+            dsn_raw = _oracle_connect_params(dsn).get("user") or ""
+            mig_raw = _oracle_connect_params(cfg.migration_database_url).get("user") or ""
+            dsn_user = dsn_raw[1:-1] if len(dsn_raw) >= 2 and dsn_raw.startswith('"') and dsn_raw.endswith('"') else dsn_raw.upper()
+            mig_user = mig_raw[1:-1] if len(mig_raw) >= 2 and mig_raw.startswith('"') and mig_raw.endswith('"') else mig_raw.upper()
+            if dsn_user and mig_user and dsn_user != mig_user:
+                raise ValueError(
+                    "HINDSIGHT_API_DATABASE_SCHEMA must be set explicitly on Oracle when "
+                    "HINDSIGHT_API_MIGRATION_DATABASE_URL uses a different user than HINDSIGHT_API_DATABASE_URL"
+                )
+        # Forward the migration URL like the PostgreSQL backend does: it lets the DDL run as
+        # the schema owner while the API itself connects as a runtime user without DDL rights.
+        run_migrations(dsn, schema=effective_schema, migration_database_url=cfg.migration_database_url)
 
     def create_task_backend(self, *, pool_getter: Any = None, schema_getter: Any = None) -> Any:
         """Oracle now uses BrokerTaskBackend — worker/poller is backend-agnostic."""
@@ -1474,14 +1596,19 @@ class OracleBackend(DatabaseBackend):
 
         from ...config import get_config
 
-        self._acquire_warn_threshold_s = get_config().db_acquire_warn_threshold_ms / 1000.0
+        cfg = get_config()
+        self._acquire_warn_threshold_s = cfg.db_acquire_warn_threshold_ms / 1000.0
+        # MemoryEngine passes statement_cache_size=0 so PostgreSQL stays compatible with
+        # transaction-mode PgBouncer. On Oracle that disables python-oracledb's per-session
+        # cursor cache and forces a parse on every statement (including per-row link inserts).
+        effective_stmt_cache = statement_cache_size if statement_cache_size > 0 else cfg.oracle_statement_cache_size
 
-        pool_kwargs: dict[str, Any] = {"min": min_size, "max": max_size, "stmtcachesize": statement_cache_size}
+        pool_kwargs: dict[str, Any] = {"min": min_size, "max": max_size, "stmtcachesize": effective_stmt_cache}
         pool_kwargs.update(_oracle_connect_params(dsn))
 
         self._pool = oracledb.create_pool_async(**pool_kwargs, session_callback=_disable_parallel_dml)
 
-        logger.info(f"Oracle pool created (min={min_size}, max={max_size})")
+        logger.info(f"Oracle pool created (min={min_size}, max={max_size}, stmtcachesize={effective_stmt_cache})")
 
     async def shutdown(self) -> None:
         # Drop the reference before awaiting close() so is_ready flips False for
@@ -1498,15 +1625,18 @@ class OracleBackend(DatabaseBackend):
     async def _set_session_schema(self, conn: Any) -> None:
         """Set the session schema on an Oracle connection.
 
-        Uses ALTER SESSION SET CURRENT_SCHEMA so that all unqualified table
-        references resolve to the tenant's schema. This is Oracle's equivalent
-        of PostgreSQL's SET search_path — fq_table() returns bare table names
-        for Oracle, relying on this session-level setting for isolation.
+        Uses ``conn.current_schema`` when available (python-oracledb piggybacks a
+        changed ``CURRENT_SCHEMA`` onto the next SQL execution with zero extra
+        round-trips, and skips work completely when the pooled session already uses
+        ``target_schema``). Falls back to ``ALTER SESSION SET CURRENT_SCHEMA`` for
+        minimal connection stubs that do not expose ``current_schema``.
         """
         schema = get_current_schema()
-        cursor = conn.cursor()
+        has_native_current_schema = hasattr(conn, "current_schema")
+        cursor = None
         try:
-            if self._default_schema is None:
+            if self._default_schema is None and (not schema or schema == "public" or has_native_current_schema):
+                cursor = conn.cursor()
                 await cursor.execute("SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') FROM DUAL")
                 row = await cursor.fetchone()
                 if not row or not row[0]:
@@ -1514,13 +1644,39 @@ class OracleBackend(DatabaseBackend):
                 self._default_schema = str(row[0])
 
             target_schema = self._default_schema if not schema or schema == "public" else schema
+            assert target_schema is not None
+            if has_native_current_schema:
+                active_schema = conn.current_schema or self._default_schema
+                if active_schema != target_schema:
+                    # Flush any per-session statement cache before switching schemas so
+                    # unqualified SQL parsed under the previous schema cannot be reused.
+                    cache_size = getattr(conn, "stmtcachesize", 0)
+                    if isinstance(cache_size, int) and cache_size > 0:
+                        conn.stmtcachesize = 0
+                        conn.stmtcachesize = cache_size
+                    conn.current_schema = target_schema
+                return
+
+            prev_schema = getattr(conn, "_hindsight_current_schema", self._default_schema)
+            if prev_schema != target_schema:
+                cache_size = getattr(conn, "stmtcachesize", 0)
+                if isinstance(cache_size, int) and cache_size > 0:
+                    conn.stmtcachesize = 0
+                    conn.stmtcachesize = cache_size
+            if cursor is None:
+                cursor = conn.cursor()
             safe_schema = target_schema.replace('"', '""')
             await cursor.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{safe_schema}"')
+            try:
+                conn._hindsight_current_schema = target_schema
+            except Exception:
+                pass
         finally:
-            # oracledb's AsyncCursor.close() is synchronous (not a coroutine);
-            # awaiting it raises "object NoneType can't be used in 'await'
-            # expression" and aborts every acquire().
-            cursor.close()
+            if cursor is not None:
+                # oracledb's AsyncCursor.close() is synchronous (not a coroutine);
+                # awaiting it raises "object NoneType can't be used in 'await'
+                # expression" and aborts every acquire().
+                cursor.close()
 
     def _pool_stats(self) -> PoolStats | None:
         """Snapshot for slow-acquire logs, from oracledb pool attributes."""
