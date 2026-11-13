@@ -626,7 +626,31 @@ async def newest_memory_updated_at(
     commits it is still newer than the watermark the refresh persists and the next
     staleness check catches it.
     """
+    is_oracle = getattr(conn, "backend_type", None) == "oracle"
+    if is_oracle:
+        # The Oracle driver binds naive datetimes as TIMESTAMP without a time zone.
+        # Make their intended UTC zone explicit rather than inheriting SESSIONTIMEZONE.
+        until = until if until.tzinfo is not None else until.replace(tzinfo=timezone.utc)
+        if since is not None:
+            since = since if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
     scope = _refresh_scope_where(bank_id, until, since, fact_types, tags, tags_match, tag_groups)
+    if is_oracle:
+        # Oracle's DESC index key is SYS_EXTRACT_UTC(updated_at), so MAX(timestamp
+        # with time zone) cannot use it while preserving the original zone.
+        scope_sql = scope.sql.replace(
+            "updated_at <= $2",
+            "SYS_EXTRACT_UTC(updated_at) <= SYS_EXTRACT_UTC(CAST($2 AS TIMESTAMP WITH TIME ZONE))",
+        )
+        if since is not None:
+            scope_sql = scope_sql.replace(
+                "updated_at > $3",
+                "SYS_EXTRACT_UTC(updated_at) > SYS_EXTRACT_UTC(CAST($3 AS TIMESTAMP WITH TIME ZONE))",
+            )
+        return await conn.fetchval(
+            f"SELECT updated_at FROM {fq_table('memory_units')} WHERE {scope_sql} "
+            "ORDER BY SYS_EXTRACT_UTC(updated_at) DESC FETCH FIRST 1 ROW ONLY",
+            *scope.params,
+        )
     return await conn.fetchval(
         f"SELECT MAX(updated_at) FROM {fq_table('memory_units')} WHERE {scope.sql}",
         *scope.params,
@@ -705,6 +729,14 @@ async def latest_memory_write_at(
     what lets the staleness surfaces skip the scoped scan entirely on a bank whose
     writes have not moved since.
     """
+    if getattr(conn, "backend_type", None) == "oracle":
+        # Selecting the row, rather than MAX(timestamp with time zone), lets Oracle
+        # walk its SYS_EXTRACT_UTC-based index and still return the original timestamp.
+        return await conn.fetchval(
+            f"SELECT updated_at FROM {fq_table('memory_units')} WHERE bank_id = $1 "
+            "ORDER BY SYS_EXTRACT_UTC(updated_at) DESC FETCH FIRST 1 ROW ONLY",
+            bank_id,
+        )
     return await conn.fetchval(
         f"SELECT MAX(updated_at) FROM {fq_table('memory_units')} WHERE bank_id = $1",
         bank_id,
