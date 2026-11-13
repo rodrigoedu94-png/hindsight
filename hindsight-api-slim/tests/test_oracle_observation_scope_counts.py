@@ -14,15 +14,23 @@ class _Connection:
     def __init__(self, tags: list[list[str] | None]):
         self.tags = tags
         self.queries = []
+        self.rewritten_queries = []
         self.args = ()
 
     async def fetch(self, query, *args):
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        rewritten = _rewrite_pg_to_oracle(query).query
         self.queries.append(query)
+        self.rewritten_queries.append(rewritten)
         self.args = args
         tags_to_return = self.tags
         if "tags &&" in query:
             requested = set(args[1])
             tags_to_return = [tags for tags in self.tags if tags and requested.intersection(tags)]
+        elif "<@" in query and "@>" in query:
+            requested = set(args[1])
+            tags_to_return = [tags for tags in self.tags if set(tags or []) == requested]
         if "UNION ALL" in query:
             counts = {}
             for tags in tags_to_return:
@@ -105,6 +113,22 @@ async def test_oracle_counts_applies_tag_groups_predicate():
     assert result["total"] == 1
 
 
+@pytest.mark.asyncio
+async def test_oracle_counts_rewrites_exact_tag_group_operators():
+    from hindsight_api.engine.search.tags import TagGroupLeaf
+
+    result, conn = await _counts(
+        [["wanted"], ["wanted", "extra"], ["other"]],
+        tag_groups=[TagGroupLeaf(tags=["wanted"], match="exact")],
+    )
+    assert result["scopes"] == [{"tags": ["wanted"], "count": 1}]
+    assert result["total"] == 1
+    rewritten = conn.rewritten_queries[0]
+    for forbidden in ("$1", "$2", "::varchar[]", "::text[]", "@>", "<@", "&&"):
+        assert forbidden not in rewritten.lower()
+    assert "JSON_TABLE" in rewritten.upper()
+
+
 def test_tags_list_preserves_duplicate_tags_when_sorting():
     assert _tags_list(["b", "a", "a"]) == ["a", "a", "b"]
 
@@ -136,6 +160,7 @@ async def test_short_and_long_tag_queries_share_one_union_statement():
     assert len(conn.queries) == 1
     query = conn.queries[0].upper()
     assert "WITH FILTERED AS" in query
+    assert "COMPACT_GROUPS AS" in query
     assert "UNION ALL" in query
-    assert "TO_CLOB(DBMS_LOB.SUBSTR(TAGS, 900, 1)) AS TAGS" in query
+    assert "SELECT TO_CLOB(SHORT_TAGS) AS TAGS, CNT" in query
     assert "TAGS AS TAGS, 1 AS CNT" in query

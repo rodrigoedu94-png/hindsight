@@ -51,11 +51,15 @@ async def observation_scope_counts(
             FROM {table}
             WHERE bank_id = $1 AND fact_type = 'observation' {groups.sql}
         ),
-        raw_counts AS (
-            SELECT TO_CLOB(DBMS_LOB.SUBSTR(tags, 900, 1)) AS tags, COUNT(*) AS cnt
+        compact_groups AS (
+            SELECT DBMS_LOB.SUBSTR(tags, 900, 1) AS short_tags, COUNT(*) AS cnt
             FROM filtered
             WHERE tags IS NULL OR DBMS_LOB.GETLENGTH(tags) <= 900
             GROUP BY DBMS_LOB.SUBSTR(tags, 900, 1)
+        ),
+        raw_counts AS (
+            SELECT TO_CLOB(short_tags) AS tags, cnt
+            FROM compact_groups
             UNION ALL
             SELECT tags AS tags, 1 AS cnt
             FROM filtered
