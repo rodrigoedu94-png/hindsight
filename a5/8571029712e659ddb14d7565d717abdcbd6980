@@ -1,0 +1,19 @@
+hindsight-api-slim/tests/test_observation_expansion_single_fetch.py
+  s_16aedf123f5de8::t_20c82816a88eee 520-523
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a58571029712e659ddb14d7565d717abdcbd6980",
+  "prompts": {},
+  "sessions": {
+    "s_16aedf123f5de8": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794858534",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
