@@ -672,6 +672,18 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         query,
     )
 
+    # PG array contained-by: tags <@ :N → Oracle: every element of col exists in param
+    def _rewrite_array_contained_by(m):
+        col = m.group(1)
+        param = m.group(2)
+        return (
+            f"(SELECT COUNT(*) FROM JSON_TABLE({col}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) jt "
+            f"WHERE JSON_EXISTS({param}, '$[*]?(@ == $v)' PASSING jt.val AS \"v\")) = "
+            f"JSON_VALUE({col}, '$.size()' RETURNING NUMBER)"
+        )
+
+    query = re.sub(r"(\w+(?:\.\w+)?)\s*<@\s*(:\w+)", _rewrite_array_contained_by, query)
+
     # ILIKE → UPPER(...) LIKE UPPER(...)
     query = re.sub(
         r"(\w+(?:\.\w+)?)\s+ILIKE\s+(:\w+)",
