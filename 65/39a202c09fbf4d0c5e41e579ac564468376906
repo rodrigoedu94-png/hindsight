@@ -1,0 +1,23 @@
+hindsight-api-slim/hindsight_api/engine/db/oracle.py
+  s_0f8c275da0ff3a::t_7a682e2b35fd08 23,1341-1380
+hindsight-api-slim/hindsight_api/engine/db/ops_oracle.py
+  s_0f8c275da0ff3a::t_7a682e2b35fd08 235-244,253-267
+hindsight-api-slim/tests/test_memory_links_vanished_neighbor_oracle.py
+  s_0f8c275da0ff3a::t_7a682e2b35fd08 54-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6539a202c09fbf4d0c5e41e579ac564468376906",
+  "prompts": {},
+  "sessions": {
+    "s_0f8c275da0ff3a": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794844330",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
