@@ -598,6 +598,17 @@ class PostgresMemories(MemoriesExtension):
         offset: int = 0,
         tag_groups: list[TagGroup] | None = None,
     ) -> dict[str, Any]:
+        if getattr(conn, "backend_type", "postgresql") == "oracle":
+            from .ora import counts as oracle_counts
+
+            return await oracle_counts.observation_scope_counts(
+                conn=conn,
+                fq_table=fq_store_table,
+                bank_id=bank_id,
+                limit=limit,
+                offset=offset,
+                tag_groups=tag_groups,
+            )
         return await counts.observation_scope_counts(
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, limit=limit, offset=offset, tag_groups=tag_groups
         )
