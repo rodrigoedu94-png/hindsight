@@ -1,0 +1,21 @@
+hindsight-api-slim/tests/test_oracle_watermark_reads.py
+  s_378bd500fe57f6::t_4f621bd0eaf291 1-205
+hindsight-api-slim/hindsight_api/engine/memories/pg/reads.py
+  s_378bd500fe57f6::t_4f621bd0eaf291 629-638,659-661,664,679-680,683-691,693-699,733-740
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "964f0ea2d97b7fec45a7c860bc9933f3e2a183cc",
+  "prompts": {},
+  "sessions": {
+    "s_378bd500fe57f6": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794844059",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
