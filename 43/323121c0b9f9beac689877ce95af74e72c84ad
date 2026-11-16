@@ -1,0 +1,21 @@
+hindsight-api-slim/tests/test_observation_expansion_single_fetch.py
+  s_fa3f1ce7ffeb3c::t_93658eaeb4871c 516-522
+hindsight-api-slim/hindsight_api/engine/db/ops_oracle.py
+  s_fa3f1ce7ffeb3c::t_93658eaeb4871c 864,866-872,888-893,895-910,915,917-918,921
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "43323121c0b9f9beac689877ce95af74e72c84ad",
+  "prompts": {},
+  "sessions": {
+    "s_fa3f1ce7ffeb3c": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794850967",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
