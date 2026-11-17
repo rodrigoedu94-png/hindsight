@@ -1,0 +1,21 @@
+hindsight-api-slim/hindsight_api/engine/memories/ora/consolidation.py
+  s_1b152f04599473::t_b129e463f5cbb9 8,16-23,47-48,53,111,126-127,142,180-186,188,219,234-235,250
+hindsight-api-slim/tests/test_oracle_consolidation_fold.py
+  s_1b152f04599473::t_b129e463f5cbb9 4,6,8,13,26-89,93,98-99,107,111,113,115,121,126-128,133-134,140-154,156-162,165,167,177-179,183-189,201,206-211,215,235-240,262-282,284-309,320,324-340,357-364,367-368,373,390-402,424-469,488-596
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bea1c4f2720696e3e390f4a62d0883698a4eeffc",
+  "prompts": {},
+  "sessions": {
+    "s_1b152f04599473": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "DEVIN_SESSION1794917504",
+        "model": "unknown"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
