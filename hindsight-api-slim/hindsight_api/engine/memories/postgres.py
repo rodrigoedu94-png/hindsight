@@ -1603,6 +1603,19 @@ class PostgresMemories(MemoriesExtension):
         bounds: _TemporalBounds,
         embeddings: Embeddings,  # noqa: ARG002 — the fold keeps the stored embedding.
     ) -> bool:
+        if getattr(conn, "backend_type", "postgresql") == "oracle":
+            from .ora import consolidation as oracle_consolidation
+
+            return await oracle_consolidation.fold_sources_into_observation(
+                conn=conn,
+                fq_table=fq_store_table,
+                bank_id=bank_id,
+                observation_id=observation_id,
+                expected_text=expected_text,
+                merged_text=merged_text,
+                source_memory_ids=source_memory_ids,
+                bounds=bounds,
+            )
         return await pg_consolidation.fold_sources_into_observation(
             conn=conn,
             fq_table=fq_store_table,
@@ -1626,6 +1639,19 @@ class PostgresMemories(MemoriesExtension):
         merged_text: str,
         embeddings: Embeddings,  # noqa: ARG002 — the fold keeps the twin's stored embedding.
     ) -> bool:
+        if getattr(conn, "backend_type", "postgresql") == "oracle":
+            from .ora import consolidation as oracle_consolidation
+
+            return await oracle_consolidation.fold_observation_into_twin(
+                conn=conn,
+                fq_table=fq_store_table,
+                bank_id=bank_id,
+                observation_id=observation_id,
+                observation_text=observation_text,
+                twin_id=twin_id,
+                twin_text=twin_text,
+                merged_text=merged_text,
+            )
         return await pg_consolidation.fold_observation_into_twin(
             conn=conn,
             fq_table=fq_store_table,
