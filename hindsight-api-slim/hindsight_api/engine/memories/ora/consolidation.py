@@ -5,13 +5,20 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from ..pg import consolidation as pg_consolidation
-
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ...consolidation.consolidator import _TemporalBounds
+
+
+@dataclass(frozen=True)
+class _MergedSources:
+    """Result of folding incoming source UUIDs onto an observation's existing sources."""
+
+    merged: list[uuid.UUID]
+    new_only: list[uuid.UUID]
 
 
 def _uuid_list(value: Any) -> list[uuid.UUID]:
@@ -37,16 +44,13 @@ def _uuid_list(value: Any) -> list[uuid.UUID]:
     return out
 
 
-def _merge_source_uuids(
-    existing: Any,
-    additions: list[uuid.UUID],
-) -> tuple[list[uuid.UUID], list[uuid.UUID]]:
-    """Merge ``additions`` onto ``existing`` preserving order, returning ``(merged, new_only)``."""
+def _merge_source_uuids(existing: Any, additions: list[uuid.UUID]) -> _MergedSources:
+    """Merge ``additions`` onto ``existing`` preserving order."""
     existing_uuids = _uuid_list(existing)
     existing_set = set(existing_uuids)
     merged = list(dict.fromkeys([*existing_uuids, *additions]))
     new_only = [sid for sid in merged if sid not in existing_set]
-    return merged, new_only
+    return _MergedSources(merged=merged, new_only=new_only)
 
 
 def _utc_dt(value: datetime | None) -> datetime | None:
@@ -104,7 +108,7 @@ async def fold_sources_into_observation(
     if row is None or row["text"] != expected_text:
         return False
 
-    merged_sources, new_sources = _merge_source_uuids(row["source_memory_ids"], source_memory_ids)
+    sources_diff = _merge_source_uuids(row["source_memory_ids"], source_memory_ids)
     updated_rows = await conn.execute_rows_affected(
         f"""
         UPDATE {mu}
@@ -119,8 +123,8 @@ async def fold_sources_into_observation(
         WHERE id = $4 AND bank_id = $5
         """,
         merged_text,
-        merged_sources,
-        len(merged_sources),
+        sources_diff.merged,
+        len(sources_diff.merged),
         obs_uuid,
         bank_id,
         _utc_dt(bounds.event_date),
@@ -135,7 +139,7 @@ async def fold_sources_into_observation(
         conn=conn,
         fq_table=fq_table,
         observation_id=obs_uuid,
-        source_ids=new_sources,
+        source_ids=sources_diff.new_only,
     )
     return True
 
@@ -173,12 +177,15 @@ async def fold_observation_into_twin(
     if not sources:
         return False
 
-    live = await pg_consolidation.lock_live_memory_ids(
-        conn=conn,
-        fq_table=fq_table,
-        bank_id=bank_id,
-        unit_ids=sources,
+    # Oracle maps FOR SHARE to exclusive FOR UPDATE; sort binds and rows by id so
+    # concurrent folds with overlapping sources never invert lock order and deadlock.
+    ordered_sources = sorted(set(sources), key=lambda uid: uid.bytes)
+    live_rows = await conn.fetch(
+        f"SELECT id FROM {mu} WHERE id = ANY($1::uuid[]) AND bank_id = $2 ORDER BY id FOR UPDATE",
+        ordered_sources,
+        bank_id,
     )
+    live = {str(r["id"]) for r in live_rows}
     if not any(str(mid) in live for mid in sources):
         return False
 
@@ -209,7 +216,7 @@ async def fold_observation_into_twin(
     if not live_u_sources:
         return False
 
-    merged_sources, new_sources = _merge_source_uuids(twin_locked["source_memory_ids"], live_u_sources)
+    sources_diff = _merge_source_uuids(twin_locked["source_memory_ids"], live_u_sources)
     updated_rows = await conn.execute_rows_affected(
         f"""
         UPDATE {mu}
@@ -224,8 +231,8 @@ async def fold_observation_into_twin(
         WHERE id = $4 AND bank_id = $5
         """,
         merged_text,
-        merged_sources,
-        len(merged_sources),
+        sources_diff.merged,
+        len(sources_diff.merged),
         twin_uuid,
         bank_id,
         _utc_dt(obs_locked["event_date"]),
@@ -240,6 +247,6 @@ async def fold_observation_into_twin(
         conn=conn,
         fq_table=fq_table,
         observation_id=twin_uuid,
-        source_ids=new_sources,
+        source_ids=sources_diff.new_only,
     )
     return True
