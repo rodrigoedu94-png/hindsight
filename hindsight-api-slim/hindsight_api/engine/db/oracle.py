@@ -1374,7 +1374,7 @@ class OracleConnection(DatabaseConnection):
                         query[:500],
                         getattr(err, "message", err),
                     )
-                    exc = oracledb.DatabaseError(getattr(err, "message", None) or str(err))
+                    exc = oracledb.DatabaseError(err)
                     exc.code = getattr(err, "code", None)
                     exc.offset = getattr(err, "offset", None)
                     raise exc

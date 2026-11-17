@@ -132,16 +132,25 @@ async def test_oracle_connection_batch_links_drops_dups_and_vanished_fks_and_rol
 async def test_executemany_filtered_preserves_ora_message_code_and_offset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unexpected batch error is re-raised as DatabaseError carrying the ORA
-    message plus the original .code/.offset (ai-vm#46), instead of wrapping the
-    raw error object and losing those attributes."""
+    """An unexpected batch error is re-raised as DatabaseError(err) preserving the
+    original args[0] for _is_oracle_deadlock/_is_retryable plus .code/.offset."""
     import sys
     from types import SimpleNamespace
 
     from hindsight_api.engine.db.oracle import OracleConnection
+    from hindsight_api.engine.db_utils import _is_oracle_deadlock, _is_retryable
 
     class _FakeDatabaseError(Exception):
         pass
+
+    class _FakeOraError:
+        def __init__(self, code: int, offset: int, message: str) -> None:
+            self.code = code
+            self.offset = offset
+            self.message = message
+
+        def __str__(self) -> str:
+            return self.message
 
     monkeypatch.setitem(
         sys.modules,
@@ -162,7 +171,7 @@ async def test_executemany_filtered_preserves_ora_message_code_and_offset(
 
         def getbatcherrors(self) -> list[object]:
             return [
-                SimpleNamespace(
+                _FakeOraError(
                     code=60,
                     offset=7,
                     message="ORA-00060: deadlock detected while waiting for resource",
@@ -188,6 +197,8 @@ async def test_executemany_filtered_preserves_ora_message_code_and_offset(
     assert "ORA-00060: deadlock detected while waiting for resource" == str(exc)
     assert exc.code == 60
     assert exc.offset == 7
+    assert _is_oracle_deadlock(exc) is True
+    assert _is_retryable(exc) is True
 
 
 @pytest.fixture
