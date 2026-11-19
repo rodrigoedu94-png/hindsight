@@ -5306,7 +5306,12 @@ class MemoryEngine(MemoryEngineInterface):
                 # to the offending call site, and under production log volume the
                 # stderr copy is unattributed and rotates away first (issue #3218).
                 error_message = format_task_error(e)
-                logger.error(f"Task execution failed: {task_type}, error: {error_message}", exc_info=True)
+                # Retried tasks need an operation id here: RetryTaskAt bypasses
+                # the poller's generic failure log, losing that correlation.
+                logger.error(
+                    f"Task execution failed: {task_type}, operation_id: {operation_id}, error: {error_message}",
+                    exc_info=True,
+                )
                 import traceback
 
                 error_traceback = traceback.format_exc()
