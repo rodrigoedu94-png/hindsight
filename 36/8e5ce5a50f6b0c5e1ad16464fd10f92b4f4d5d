@@ -1,0 +1,30 @@
+hindsight-api-slim/hindsight_api/engine/db/ops_oracle.py
+  s_6bc438a7a3e99e::t_776ad5ce4f39ea 1549-1556,1693
+hindsight-api-slim/hindsight_api/engine/db/oracle.py
+  s_6bc438a7a3e99e::t_9e2fce03c8150c 1281-1283,1323-1325,1385-1387,1450-1452,1497-1499,1544-1546,1648-1657
+  s_6bc438a7a3e99e::t_aa6c18b8c9935e 381,565-568,572-573,580-589,592-600,854,863-870
+hindsight-api-slim/hindsight_api/engine/memory_engine.py
+  s_6bc438a7a3e99e::t_e55e8f581ddba3 5309-5314
+hindsight-api-slim/tests/test_task_error_correlation.py
+  s_6bc438a7a3e99e::t_e55e8f581ddba3 1-8,10-13,16-23,25,27-40
+  s_6bc438a7a3e99e::t_aca2067ba33f93 9,14-15,24,26
+hindsight-api-slim/tests/test_oracle_queue_row_limit.py
+  s_6bc438a7a3e99e::t_f2285b513314a1 1-58,74-186
+  s_6bc438a7a3e99e::t_6915f9a6b474c2 59-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "368e5ce5a50f6b0c5e1ad16464fd10f92b4f4d5d",
+  "prompts": {},
+  "sessions": {
+    "s_6bc438a7a3e99e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1f197-a8fc-7103-bccc-0a2e9560c909",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "rodrigoedu94 <rodrigoedu94@gmail.com>"
+    }
+  }
+}
