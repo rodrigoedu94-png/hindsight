@@ -1546,21 +1546,14 @@ class OracleOps(DataAccessOps):
     async def _claim_shared_tasks(self, conn, table, claimed_ids, limit) -> list:
         """Claim the shared pool oldest-first.
 
-        No bank rotation, unlike PostgreSQL (#3861). Two things rule the
-        rotation query out here rather than it being an oversight:
+        No bank rotation, unlike PostgreSQL (#3861). Before RU 23.26.4,
+        ``db/oracle.py`` must use ROWNUM before ORDER BY, so a rotation ordered
+        by bank_id would select whichever bank is scanned first. That fallback
+        also injects into the first WHERE, making a CTE-based rotation unsafe.
 
-        * Oracle rejects ``FETCH FIRST`` with ``FOR UPDATE`` (ORA-02014), so
-          ``db/oracle.py`` rewrites a limited claim into ``WHERE ROWNUM <= n``.
-          Oracle applies ``ROWNUM`` *before* ``ORDER BY``, so an ordered claim
-          returns an arbitrary n rows — a rotation ordered by ``bank_id`` would
-          land on whichever bank happens to be scanned first, which under bulk
-          ingest is overwhelmingly the bank the rotation exists to rotate away
-          from.
-        * That rewrite injects into the first ``WHERE`` it finds, which in a
-          CTE-based claim is the rotation branch, not the outer query.
-
-        Fixing that means reworking the ROWNUM rewrite, which the existing
-        ``created_at`` claim depends on just as much.
+        RU 23.26.4+ uses native FETCH FIRST with FOR UPDATE for this simple
+        claim. Keep rotation disabled until it has a separately validated query
+        that also works on older servers.
         """
         if claimed_ids:
             return await conn.fetch(
@@ -1697,7 +1690,7 @@ class OracleOps(DataAccessOps):
             return []
         # Same ``LIMIT $n ... FOR UPDATE SKIP LOCKED`` shape the claim queries
         # above use, which the Oracle SQL translation layer rewrites into the
-        # row-limited form Oracle accepts (a bare one raises ORA-02014).
+        # native FETCH FIRST form on RU 23.26.4+, or ROWNUM on older servers.
         return await conn.fetch(
             f"""
             SELECT operation_id, task_payload, retry_count
