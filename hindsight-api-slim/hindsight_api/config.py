@@ -820,6 +820,8 @@ ENV_ANN_MAX_SCAN_TUPLES = "HINDSIGHT_API_ANN_MAX_SCAN_TUPLES"
 ENV_ORACLE_VECTOR_SEARCH = "HINDSIGHT_API_ORACLE_VECTOR_SEARCH"
 ENV_ORACLE_VECTOR_TARGET_ACCURACY = "HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY"
 ENV_ORACLE_STATEMENT_CACHE_SIZE = "HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE"
+ENV_ORACLE_USE_PROPERTY_GRAPH = "HINDSIGHT_API_ORACLE_USE_PROPERTY_GRAPH"
+ENV_ORACLE_PGQ_MAX_HOPS = "HINDSIGHT_API_ORACLE_PGQ_MAX_HOPS"
 ENV_TEXT_SEARCH_EXTENSION = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION"
 ENV_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE"
 ENV_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER"
@@ -1855,6 +1857,8 @@ DEFAULT_ORACLE_VECTOR_TARGET_ACCURACY = 95
 # Off (0) by default so multi-tenant pools that switch CURRENT_SCHEMA do not retain
 # unqualified cursors across schemas unless explicitly enabled.
 DEFAULT_ORACLE_STATEMENT_CACHE_SIZE = 0
+DEFAULT_ORACLE_USE_PROPERTY_GRAPH = True
+DEFAULT_ORACLE_PGQ_MAX_HOPS = 2
 
 # Text search extension (native PostgreSQL, vchord BM25, Timescale pg_textsearch,
 # pgroonga, or ParadeDB pg_search). Unused by banks with enable_text_search off.
@@ -4355,6 +4359,8 @@ class HindsightConfig:
     oracle_vector_search: str = DEFAULT_ORACLE_VECTOR_SEARCH  # "exact" or "approx"
     oracle_vector_target_accuracy: int = DEFAULT_ORACLE_VECTOR_TARGET_ACCURACY
     oracle_statement_cache_size: int = DEFAULT_ORACLE_STATEMENT_CACHE_SIZE
+    oracle_use_property_graph: bool = DEFAULT_ORACLE_USE_PROPERTY_GRAPH
+    oracle_pgq_max_hops: int = DEFAULT_ORACLE_PGQ_MAX_HOPS
 
     # Webhook SSRF hardening (static, server-level only — deliberately NOT
     # per-bank configurable: a tenant must not be able to re-open the private
@@ -4916,6 +4922,8 @@ class HindsightConfig:
             raise ValueError(
                 f"Invalid oracle_statement_cache_size: {self.oracle_statement_cache_size}. Must be an integer >= 0"
             )
+        if type(self.oracle_pgq_max_hops) is not int or not 1 <= self.oracle_pgq_max_hops <= 2:
+            raise ValueError(f"Invalid oracle_pgq_max_hops: {self.oracle_pgq_max_hops}. Must be an integer in [1, 2]")
 
         # Validate bedrock_service_tier
         valid_bedrock_tiers = (None, "flex", "priority", "reserved")
@@ -5614,6 +5622,14 @@ class HindsightConfig:
                 ENV_ORACLE_STATEMENT_CACHE_SIZE,
                 os.getenv(ENV_ORACLE_STATEMENT_CACHE_SIZE),
                 DEFAULT_ORACLE_STATEMENT_CACHE_SIZE,
+            ),
+            oracle_use_property_graph=_parse_boolean_env(
+                ENV_ORACLE_USE_PROPERTY_GRAPH, DEFAULT_ORACLE_USE_PROPERTY_GRAPH
+            ),
+            oracle_pgq_max_hops=_parse_non_negative_int(
+                ENV_ORACLE_PGQ_MAX_HOPS,
+                os.getenv(ENV_ORACLE_PGQ_MAX_HOPS),
+                DEFAULT_ORACLE_PGQ_MAX_HOPS,
             ),
             recall_max_candidates_per_source=int(
                 os.getenv(ENV_RECALL_MAX_CANDIDATES_PER_SOURCE, str(DEFAULT_RECALL_MAX_CANDIDATES_PER_SOURCE))

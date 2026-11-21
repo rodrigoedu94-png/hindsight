@@ -164,24 +164,48 @@ async def retrieve_semantic_bm25_combined_sql(
         updated_range_clause += f" AND updated_at < ${_next_idx}"
         _next_idx += 1
 
-    # --- Semantic UNION ALL arms (one per fact_type) ---
-    # Each arm has its own ORDER BY ... LIMIT, enabling the partial HNSW indexes
-    # per fact_type instead of forcing a full sequential scan.
-    arms = [
-        dialect.build_semantic_arm(
-            table=table,
-            cols=cols,
-            fact_type=ft,
-            embedding_param="$1",
-            bank_id_param="$2",
-            fetch_limit=semantic_fetch,
-            min_similarity=sem_min,
-            tags_clause=tags_clause,
-            groups_clause=groups_clause,
-            extra_where=updated_range_clause,
-        )
-        for ft in fact_types
-    ]
+    # --- Semantic UNION ALL arms (or single-pass exact scan on Oracle) ---
+    # Each arm on PG has its own ORDER BY ... LIMIT so per-fact_type HNSW indexes apply.
+    # On Oracle in exact mode, scanning all requested fact_types in one partition pass
+    # with ROW_NUMBER() OVER (PARTITION BY fact_type ...) avoids N redundant full scans.
+    build_single_pass = getattr(dialect, "build_semantic_single_pass_arm", None)
+    use_oracle_single_pass = (
+        getattr(conn, "backend_type", None) == "oracle"
+        and len(fact_types) > 1
+        and callable(build_single_pass)
+        and getattr(config, "oracle_vector_search", "exact") != "approx"
+    )
+    if use_oracle_single_pass and callable(build_single_pass):
+        arms = [
+            build_single_pass(
+                table=table,
+                cols=cols,
+                fact_types=fact_types,
+                embedding_param="$1",
+                bank_id_param="$2",
+                fetch_limit=semantic_fetch,
+                min_similarity=sem_min,
+                tags_clause=tags_clause,
+                groups_clause=groups_clause,
+                extra_where=updated_range_clause,
+            )
+        ]
+    else:
+        arms = [
+            dialect.build_semantic_arm(
+                table=table,
+                cols=cols,
+                fact_type=ft,
+                embedding_param="$1",
+                bank_id_param="$2",
+                fetch_limit=semantic_fetch,
+                min_similarity=sem_min,
+                tags_clause=tags_clause,
+                groups_clause=groups_clause,
+                extra_where=updated_range_clause,
+            )
+            for ft in fact_types
+        ]
 
     # --- BM25 UNION ALL arms (one per fact_type, only when tokens present) ---
     if _include_bm25:
@@ -255,21 +279,37 @@ async def retrieve_semantic_bm25_combined_sql(
             if created_before is not None:
                 fb_updated_clause += f" AND updated_at < ${fb_next_idx}"
                 fb_next_idx += 1
-            fb_arms = [
-                dialect.build_semantic_arm(
-                    table=table,
-                    cols=cols,
-                    fact_type=ft,
-                    embedding_param="$1",
-                    bank_id_param="$2",
-                    fetch_limit=semantic_fetch,
-                    min_similarity=sem_min,
-                    tags_clause=fb_tags_clause,
-                    groups_clause=fb_groups_clause,
-                    extra_where=fb_updated_clause,
-                )
-                for ft in fact_types
-            ]
+            if use_oracle_single_pass and callable(build_single_pass):
+                fb_arms = [
+                    build_single_pass(
+                        table=table,
+                        cols=cols,
+                        fact_types=fact_types,
+                        embedding_param="$1",
+                        bank_id_param="$2",
+                        fetch_limit=semantic_fetch,
+                        min_similarity=sem_min,
+                        tags_clause=fb_tags_clause,
+                        groups_clause=fb_groups_clause,
+                        extra_where=fb_updated_clause,
+                    )
+                ]
+            else:
+                fb_arms = [
+                    dialect.build_semantic_arm(
+                        table=table,
+                        cols=cols,
+                        fact_type=ft,
+                        embedding_param="$1",
+                        bank_id_param="$2",
+                        fetch_limit=semantic_fetch,
+                        min_similarity=sem_min,
+                        tags_clause=fb_tags_clause,
+                        groups_clause=fb_groups_clause,
+                        extra_where=fb_updated_clause,
+                    )
+                    for ft in fact_types
+                ]
             fb_query = "\nUNION ALL\n".join(fb_arms)
             fb_params: list = [query_emb_str, bank_id]
             if tags:

@@ -627,15 +627,14 @@ async def newest_memory_updated_at(
     staleness check catches it.
     """
     is_oracle = getattr(conn, "backend_type", None) == "oracle"
-    scope = _refresh_scope_where(
-        bank_id, until, since, fact_types, tags, tags_match, tag_groups, is_oracle=is_oracle
-    )
+    scope = _refresh_scope_where(bank_id, until, since, fact_types, tags, tags_match, tag_groups, is_oracle=is_oracle)
     if is_oracle:
         # Oracle's DESC index key is SYS_EXTRACT_UTC(updated_at), so MAX(timestamp
-        # with time zone) cannot use it while preserving the original zone.
+        # with time zone) cannot use it while preserving the original zone. The
+        # INDEX hint prevents bind-peeking from sticking to IDX_MU_BANK_ID + SORT.
         return await conn.fetchval(
-            f"SELECT updated_at FROM {fq_table('memory_units')} WHERE {scope.sql} "
-            "ORDER BY SYS_EXTRACT_UTC(updated_at) DESC FETCH FIRST 1 ROW ONLY",
+            f"SELECT /*+ INDEX(m idx_mu_bank_updated_at) */ m.updated_at FROM {fq_table('memory_units')} m "
+            f"WHERE {scope.sql} ORDER BY SYS_EXTRACT_UTC(m.updated_at) DESC FETCH FIRST 1 ROW ONLY",
             *scope.params,
         )
     return await conn.fetchval(
@@ -659,9 +658,7 @@ async def memories_updated_between(
 ) -> list[StoredMemory]:
     """The memories :func:`newest_memory_updated_at` takes the max over, oldest first, at most ``limit``."""
     is_oracle = getattr(conn, "backend_type", None) == "oracle"
-    scope = _refresh_scope_where(
-        bank_id, until, since, fact_types, tags, tags_match, tag_groups, is_oracle=is_oracle
-    )
+    scope = _refresh_scope_where(bank_id, until, since, fact_types, tags, tags_match, tag_groups, is_oracle=is_oracle)
     order_col = "SYS_EXTRACT_UTC(updated_at)" if is_oracle else "updated_at"
     rows = await conn.fetch(
         f"SELECT {_MEMORY_COLUMNS} FROM {fq_table('memory_units')} WHERE {scope.sql} "
@@ -684,9 +681,7 @@ def _refresh_scope_where(
     is_oracle: bool = False,
 ) -> _ScopeWhere:
     """A refresh's scope within ``(since, until]`` as a WHERE clause and its params."""
-    until_bound = (
-        until if (not is_oracle or until.tzinfo is not None) else until.replace(tzinfo=timezone.utc)
-    )
+    until_bound = until if (not is_oracle or until.tzinfo is not None) else until.replace(tzinfo=timezone.utc)
     params: list[Any] = [bank_id, until_bound]
     if is_oracle:
         where = [
@@ -696,15 +691,11 @@ def _refresh_scope_where(
     else:
         where = ["bank_id = $1", "updated_at <= $2"]
     if since is not None:
-        since_bound = (
-            since if (not is_oracle or since.tzinfo is not None) else since.replace(tzinfo=timezone.utc)
-        )
+        since_bound = since if (not is_oracle or since.tzinfo is not None) else since.replace(tzinfo=timezone.utc)
         params.append(since_bound)
         idx = len(params)
         if is_oracle:
-            where.append(
-                f"SYS_EXTRACT_UTC(updated_at) > SYS_EXTRACT_UTC(CAST(${idx} AS TIMESTAMP WITH TIME ZONE))"
-            )
+            where.append(f"SYS_EXTRACT_UTC(updated_at) > SYS_EXTRACT_UTC(CAST(${idx} AS TIMESTAMP WITH TIME ZONE))")
         else:
             where.append(f"updated_at > ${idx}")
 
@@ -742,10 +733,11 @@ async def latest_memory_write_at(
     """
     if getattr(conn, "backend_type", None) == "oracle":
         # Selecting the row, rather than MAX(timestamp with time zone), lets Oracle
-        # walk its SYS_EXTRACT_UTC-based index and still return the original timestamp.
+        # walk its SYS_EXTRACT_UTC-based index; the hint prevents bind-peeking from
+        # latching onto IDX_MU_BANK_ID + SORT for large banks.
         return await conn.fetchval(
-            f"SELECT updated_at FROM {fq_table('memory_units')} WHERE bank_id = $1 "
-            "ORDER BY SYS_EXTRACT_UTC(updated_at) DESC FETCH FIRST 1 ROW ONLY",
+            f"SELECT /*+ INDEX(m idx_mu_bank_updated_at) */ m.updated_at FROM {fq_table('memory_units')} m "
+            "WHERE m.bank_id = $1 ORDER BY SYS_EXTRACT_UTC(m.updated_at) DESC FETCH FIRST 1 ROW ONLY",
             bank_id,
         )
     return await conn.fetchval(

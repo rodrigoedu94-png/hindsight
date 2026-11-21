@@ -1245,62 +1245,56 @@ class TestConfig:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("ops_module", "ops_class", "limit_clause"),
-    [
-        ("hindsight_api.engine.db.ops_postgresql", "PostgreSQLOps", "LIMIT 7"),
-        ("hindsight_api.engine.db.ops_oracle", "OracleOps", "FETCH FIRST 7 ROWS ONLY"),
-    ],
-)
-def test_entity_expansion_filters_fact_type_before_per_entity_cap(
-    ops_module: str, ops_class: str, limit_clause: str
-) -> None:
+def test_entity_expansion_filters_fact_type_before_per_entity_cap() -> None:
     """The cap is per entity *and target fact type*, preventing mixed types from
     exhausting a target type's candidate budget before the outer query sees it.
     """
-    from importlib import import_module
+    from hindsight_api.engine.db.ops_oracle import OracleOps
+    from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
 
-    ops = getattr(import_module(ops_module), ops_class)()
-    cte = ops.build_entity_expansion_cte("memory_units", "unit_entities", 7, _UNBOUNDED_WINDOW)
-
-    lateral_start = cte.index("CROSS JOIN LATERAL")
-    lateral_end = cte.index(") t", lateral_start)
-    lateral_query = cte[lateral_start:lateral_end]
-
+    pg_cte = PostgreSQLOps().build_entity_expansion_cte("memory_units", "unit_entities", 7, _UNBOUNDED_WINDOW)
+    lateral_start = pg_cte.index("CROSS JOIN LATERAL")
+    lateral_query = pg_cte[lateral_start : pg_cte.index(") t", lateral_start)]
     assert "mu_target.fact_type = $2" in lateral_query
-    assert lateral_query.index("mu_target.fact_type = $2") < lateral_query.index(limit_clause)
+    assert lateral_query.index("mu_target.fact_type = $2") < lateral_query.index("LIMIT 7")
+
+    oracle_cte = OracleOps().build_entity_expansion_cte("memory_units", "unit_entities", 7, _UNBOUNDED_WINDOW)
+    assert "CROSS JOIN LATERAL" not in oracle_cte
+    ranked_start = oracle_cte.index("entity_units_ranked AS (")
+    scores_start = oracle_cte.index("entity_scores AS (")
+    ranked_query = oracle_cte[ranked_start:scores_start]
+    assert "ROW_NUMBER() OVER (" in ranked_query
+    assert "mu_target.fact_type = $2" in ranked_query
+    assert "eur.rn <= 7" in oracle_cte[scores_start:]
 
 
-@pytest.mark.parametrize(
-    "ops_module,ops_class,limit_clause",
-    [
-        ("hindsight_api.engine.db.ops_postgresql", "PostgreSQLOps", "LIMIT 7"),
-        ("hindsight_api.engine.db.ops_oracle", "OracleOps", "FETCH FIRST 7 ROWS ONLY"),
-    ],
-)
-def test_entity_expansion_applies_updated_window_before_per_entity_cap(
-    ops_module: str, ops_class: str, limit_clause: str
-) -> None:
+def test_entity_expansion_applies_updated_window_before_per_entity_cap() -> None:
     """Recall's time window bounds the entity fan-out, not just the graph seeds.
 
     Placement matters as much as presence: filtering after the cap would let
     out-of-window neighbours eat an entity's bounded budget and starve the
     in-window ones.
     """
-    from importlib import import_module
-
     from hindsight_api.engine.db.ops import UpdatedWindow
+    from hindsight_api.engine.db.ops_oracle import OracleOps
+    from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
 
-    ops = getattr(import_module(ops_module), ops_class)()
     window = UpdatedWindow(after=datetime(2026, 1, 1), before=datetime(2026, 2, 1), first_param_index=4)
-    cte = ops.build_entity_expansion_cte("memory_units", "unit_entities", 7, window)
 
-    lateral_start = cte.index("CROSS JOIN LATERAL")
-    lateral_query = cte[lateral_start : cte.index(") t", lateral_start)]
-
+    pg_cte = PostgreSQLOps().build_entity_expansion_cte("memory_units", "unit_entities", 7, window)
+    lateral_start = pg_cte.index("CROSS JOIN LATERAL")
+    lateral_query = pg_cte[lateral_start : pg_cte.index(") t", lateral_start)]
     assert "mu_target.updated_at > $4" in lateral_query
     assert "mu_target.updated_at < $5" in lateral_query
-    assert lateral_query.index("mu_target.updated_at > $4") < lateral_query.index(limit_clause)
+    assert lateral_query.index("mu_target.updated_at > $4") < lateral_query.index("LIMIT 7")
+
+    oracle_cte = OracleOps().build_entity_expansion_cte("memory_units", "unit_entities", 7, window)
+    ranked_start = oracle_cte.index("entity_units_ranked AS (")
+    scores_start = oracle_cte.index("entity_scores AS (")
+    ranked_query = oracle_cte[ranked_start:scores_start]
+    assert "mu_target.updated_at > $4" in ranked_query
+    assert "mu_target.updated_at < $5" in ranked_query
+    assert "eur.rn <= 7" in oracle_cte[scores_start:]
 
 
 @pytest.mark.parametrize(

@@ -36,6 +36,13 @@ async def list_bank_rows(*, conn, fq_table: Callable[[str], str], where_clause: 
     banks_table = fq_table("banks")
     docs_table = fq_table("documents")
     mu_table = fq_table("memory_units")
+    is_oracle = getattr(conn, "backend_type", None) == "oracle"
+    last_fact_expr = (
+        f"(SELECT /*+ INDEX(m idx_mu_bank_updated_at) */ m.updated_at FROM {mu_table} m "
+        f"WHERE m.bank_id = b.bank_id ORDER BY SYS_EXTRACT_UTC(m.updated_at) DESC FETCH FIRST 1 ROW ONLY)"
+        if is_oracle
+        else f"(SELECT MAX(m.updated_at) FROM {mu_table} m WHERE m.bank_id = b.bank_id)"
+    )
     return await conn.fetch(
         f"""
             SELECT
@@ -51,7 +58,7 @@ async def list_bank_rows(*, conn, fq_table: Callable[[str], str], where_clause: 
                 -- means. The documents half stays a GROUP BY: correlating it would be random reads
                 -- over the same rows, since this query lists every bank before paging, and
                 -- `last_document_at` must stay ingestion time (frozen when a document is rewritten).
-                (SELECT MAX(m.updated_at) FROM {mu_table} m WHERE m.bank_id = b.bank_id) AS last_fact_at
+                {last_fact_expr} AS last_fact_at
             FROM {banks_table} b
             LEFT JOIN (
                 SELECT bank_id,
@@ -76,8 +83,17 @@ async def bank_page_rows(*, conn, fq_table: Callable[[str], str], bank_ids: list
     docs_table = fq_table("documents")
     if sql_owned:
         mu_table = fq_table("memory_units")
-        fact_select = "f.last_fact_at"
-        fact_join = f"""
+        if getattr(conn, "backend_type", None) == "oracle":
+            fact_select = (
+                f"CASE WHEN b.bank_id = ANY($2::text[]) THEN "
+                f"(SELECT /*+ INDEX(m idx_mu_bank_updated_at) */ m.updated_at FROM {mu_table} m "
+                f"WHERE m.bank_id = b.bank_id ORDER BY SYS_EXTRACT_UTC(m.updated_at) DESC FETCH FIRST 1 ROW ONLY) "
+                f"END AS last_fact_at"
+            )
+            fact_join = ""
+        else:
+            fact_select = "f.last_fact_at"
+            fact_join = f"""
             LEFT JOIN (
                 SELECT bank_id, MAX(updated_at) AS last_fact_at
                 FROM {mu_table}

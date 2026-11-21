@@ -230,6 +230,42 @@ class OracleDialect(SQLDialect):
             f" {fetch}) t"
         )
 
+    def build_semantic_single_pass_arm(
+        self,
+        *,
+        table: str,
+        cols: str,
+        fact_types: list[str],
+        embedding_param: str,
+        bank_id_param: str,
+        fetch_limit: int,
+        min_similarity: float,
+        tags_clause: str = "",
+        groups_clause: str = "",
+        extra_where: str = "",
+    ) -> str:
+        """Scan a bank's partition once for all requested fact_types in exact mode."""
+        ft_list = ", ".join(f"'{ft}'" for ft in fact_types)
+        return (
+            f"SELECT * FROM (SELECT {cols}, similarity, NULL AS bm25_score, 'semantic' AS source"
+            f" FROM (SELECT {cols},"
+            f"        1 - VECTOR_DISTANCE(embedding, {embedding_param}, COSINE) AS similarity,"
+            f"        ROW_NUMBER() OVER ("
+            f"            PARTITION BY fact_type"
+            f"            ORDER BY VECTOR_DISTANCE(embedding, {embedding_param}, COSINE)"
+            f"        ) AS rn_"
+            f" FROM {table}"
+            f" WHERE bank_id = {bank_id_param}"
+            f"   AND fact_type IN ({ft_list})"
+            f"   AND embedding IS NOT NULL"
+            f"   AND (1 - VECTOR_DISTANCE(embedding, {embedding_param}, COSINE)) >= {min_similarity}"
+            f"   {tags_clause}"
+            f"   {groups_clause}"
+            f"   {extra_where})"
+            f" WHERE rn_ <= {fetch_limit}"
+            f" ORDER BY fact_type, rn_) t_sem"
+        )
+
     def build_bm25_arm(
         self,
         *,
@@ -252,20 +288,21 @@ class OracleDialect(SQLDialect):
     ) -> str:
         # Oracle Text: CONTAINS() / SCORE() with the CTXSYS.CONTEXT index.
         # Each arm gets a unique SCORE label (10 + arm_index) to avoid
-        # conflicts within the UNION ALL.
+        # conflicts within the UNION ALL. Explicit DOMAIN INDEX hint avoids
+        # full partition scans when COMBINED UNION ALL arms execute together.
         label = 10 + arm_index
         return (
-            f"SELECT * FROM (SELECT {cols},"
+            f"SELECT * FROM (SELECT /*+ INDEX(m idx_mu_content_text) */ {cols},"
             f"        NULL AS similarity,"
             f"        SCORE({label}) AS bm25_score,"
             f"        'bm25' AS source"
-            f" FROM {table}"
-            f" WHERE bank_id = {bank_id_param}"
-            f"   AND fact_type = '{fact_type}'"
+            f" FROM {table} m"
+            f" WHERE m.bank_id = {bank_id_param}"
+            f"   AND m.fact_type = '{fact_type}'"
             # CONTAINS already gates to genuine matches, so at the 0.0 default the
             # gate is the structural `> 0`; a caller's `min_scores.keyword` floor
             # replaces it with an inclusive `>=`, uniform across backends.
-            f"   AND CONTAINS(text, {text_param}, {label}) {bm25_score_gate(bm25_min_score)}"
+            f"   AND CONTAINS(m.text, {text_param}, {label}) {bm25_score_gate(bm25_min_score)}"
             f"   {tags_clause}"
             f"   {groups_clause}"
             f"   {extra_where}"

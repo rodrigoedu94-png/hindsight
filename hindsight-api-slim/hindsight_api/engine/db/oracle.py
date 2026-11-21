@@ -15,7 +15,9 @@ Supports multi-tenant schema isolation via ALTER SESSION SET CURRENT_SCHEMA.
 
 import array
 import datetime
+import functools
 import inspect
+import itertools
 import json
 import logging
 import re
@@ -51,6 +53,14 @@ class RewriteResult(NamedTuple):
     query: str
     ignore_dup: bool
     returning_cols: list[str] | None
+
+
+class _CachedRewriteResult(NamedTuple):
+    """Immutable internal cache entry for rewritten SQL."""
+
+    query: str
+    ignore_dup: bool
+    returning_cols: tuple[str, ...] | None
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +115,77 @@ _MERGE_SOURCE_EMBEDDING_RE = re.compile(r":(\w+)\s+AS\s+\"?embedding\"?", re.IGN
 _INSERT_COLUMNS_VALUES_RE = re.compile(
     r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*(\(.*)", re.IGNORECASE | re.DOTALL
 )
+
+# Pre-compiled patterns used inside _rewrite_pg_to_oracle and _expand_any_lists
+_LEFT_RE = re.compile(r"\bLEFT\s*\(\s*([\w.]+)\s*,\s*(\d+|:\w+)\s*\)", re.IGNORECASE)
+_JSONB_MERGE_RE = re.compile(r"(\w+(?:\.\w+)?)\s*\|\|\s*(:\w+)::jsonb", re.IGNORECASE)
+_COALESCE_MERGE_RE = re.compile(r"(COALESCE\([^)]+\))\s*\|\|\s*(:\w+)::jsonb", re.IGNORECASE)
+_COALESCE_INNER_CAST_RE = re.compile(r"'([^']*)'::(jsonb|json)", re.IGNORECASE)
+_JSON_BOOL_RE = re.compile(
+    r"""\((\w+(?:\.\w+)?)\s*->>\s*'(\w+)'\)::boolean\s*=\s*(true|false)""",
+    re.IGNORECASE,
+)
+_NOT_JSONB_IS_PARENT_RE = re.compile(
+    r"""NOT\s*\(\s*(\w+(?:\.\w+)?)(?:::jsonb)?\s*@>\s*'\{\s*["']?is_parent["']?\s*:\s*true\s*\}'(?:::jsonb)?\s*\)""",
+    re.IGNORECASE,
+)
+_SET_SESSION_RE = re.compile(r"\s*SET\s+SESSION\s+CHARACTERISTICS\b", re.IGNORECASE)
+_NOW_UTC_RE = re.compile(r"\bNOW\(\)\s+AT\s+TIME\s+ZONE\s+'UTC'", re.IGNORECASE)
+_NOW_RE = re.compile(r"\bNOW\(\)", re.IGNORECASE)
+_GEN_UUID_RE = re.compile(r"\bgen_random_uuid\(\)", re.IGNORECASE)
+_EQ_TRUE_RE = re.compile(r"\b=\s*TRUE\b", re.IGNORECASE)
+_EQ_FALSE_RE = re.compile(r"\b=\s*FALSE\b", re.IGNORECASE)
+_FOR_NO_KEY_UPDATE_RE = re.compile(r"\bFOR\s+NO\s+KEY\s+UPDATE\b", re.IGNORECASE)
+_FOR_SHARE_RE = re.compile(r"\bFOR\s+SHARE\b", re.IGNORECASE)
+_TRIGGER_COL_RE = re.compile(r'(?<!")\btrigger\b(?!")')
+_DATE_TRUNC_RE = re.compile(r"date_trunc\(\s*'(\w+)'\s*,\s*(.+?)\s*\)", re.IGNORECASE)
+_AT_TIME_ZONE_RE = re.compile(r"\s+AT\s+TIME\s+ZONE\s+'[^']*'", re.IGNORECASE)
+_INTERVAL_RE = re.compile(r"interval\s+'(\d+)\s+(\w+)'", re.IGNORECASE)
+_VECTOR_OP_RE = re.compile(r"([\w.]+)\s*<=>\s*(:\w+)")
+_FOR_UPDATE_RE = re.compile(r"\bFOR\s+UPDATE\b", re.IGNORECASE)
+_LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+|:\w+)\b", re.IGNORECASE)
+_OFFSET_KW_RE = re.compile(r"\bOFFSET\b", re.IGNORECASE)
+_SELECT_START_RE = re.compile(r"\s*SELECT\b", re.IGNORECASE)
+_FOR_UPDATE_DISALLOWED_RE = re.compile(r"\b(?:DISTINCT|GROUP\s+BY|HAVING|UNION|INTERSECT|MINUS)\b", re.IGNORECASE)
+_STANDALONE_OFFSET_RE = re.compile(r"\bOFFSET\s+(\d+|:\w+)\b(?!\s+ROWS)", re.IGNORECASE)
+_LIMIT_OFFSET_RE = re.compile(r"\bLIMIT\s+(\d+|:\w+)\s+OFFSET\s+(\d+|:\w+)\b", re.IGNORECASE)
+_OFFSET_LIMIT_RE = re.compile(r"\bOFFSET\s+(\d+|:\w+)\s+LIMIT\s+(\d+|:\w+)\b", re.IGNORECASE)
+_WHERE_KW_RE = re.compile(r"\bWHERE\b", re.IGNORECASE)
+_NON_EMPTY_ARR_RE = re.compile(r"(\w+(?:\.\w+)?)\s*!=\s*'\{\}'")
+_EMPTY_ARR_OR_RE = re.compile(r"(?<=\bOR\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", re.IGNORECASE)
+_EMPTY_ARR_AND_RE = re.compile(r"(?<=\bAND\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", re.IGNORECASE)
+_EMPTY_ARR_WHERE_RE = re.compile(r"(?<=\bWHERE\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", re.IGNORECASE)
+_ARRAY_OVERLAP_RE = re.compile(r"(\w+(?:\.\w+)?)\s*&&\s*(:\w+)")
+_ARRAY_CONTAINED_BY_RE = re.compile(r"(\w+(?:\.\w+)?)\s*<@\s*(:\w+)")
+_ARRAY_CONTAINS_FIX_RE = re.compile(r"JSON_EXISTS\((\w+(?:\.\w+)?),\s*'\$'\s*PASSING\s*(:\w+)\s*AS\s*cond\)")
+_ILIKE_RE = re.compile(r"(\w+(?:\.\w+)?)\s+ILIKE\s+(:\w+)", re.IGNORECASE)
+_MATERIALIZED_CTE_RE = re.compile(r"\bAS\s+MATERIALIZED\s*\(", re.IGNORECASE)
+_COALESCE_NUM_RE = re.compile(r"COALESCE\(\s*(:\w+)\s*,\s*(\d+(?:\.\d+)?)\s*\)", re.IGNORECASE)
+_LATERAL_RE = re.compile(r"\bCROSS\s+JOIN\s+LATERAL\b", re.IGNORECASE)
+_DML_START_RE = re.compile(r"\s*(INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
+
+_EXPAND_MARKER_RE = re.compile(r"(?:(\w+(?:\.\w+)?)\s+(NOT\s+)?IN\s*\(\s*)?/\*EXPAND:(\d+)\*/(\s*\))?", re.IGNORECASE)
+_LIKE_ANY_MARKER_RE = re.compile(r"(\w+(?:\.\w+)?)\s*/\*LIKE_ANY:(\d+):(\w+(?:\.\w+)?)\*/")
+_NOT_LIKE_ALL_MARKER_RE = re.compile(r"(\w+(?:\.\w+)?)\s*/\*NOT_LIKE_ALL:(\d+):(\w+(?:\.\w+)?)\*/")
+_ARRAY_POSITION_MARKER_RE = re.compile(r"/\*ARRAY_POSITION:(\d+):([\w.]+)\*/")
+
+_DATE_TRUNC_MAP = {"day": "DD", "hour": "HH24", "month": "MM", "week": "IW", "year": "YYYY", "minute": "MI"}
+_INTERVAL_MAP = {
+    "second": "SECOND",
+    "seconds": "SECOND",
+    "minute": "MINUTE",
+    "minutes": "MINUTE",
+    "hour": "HOUR",
+    "hours": "HOUR",
+    "day": "DAY",
+    "days": "DAY",
+}
+
+_ORACLE_IN_LIMIT = 1000
+# Power-of-two bind-list bucketing collapses arbitrary list lengths into at most 11
+# deterministic SQL shapes (curbing Oracle shared-pool hard-parse thrashing) while
+# keeping native INLIST ITERATOR index plans intact.
+_ORACLE_IN_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, _ORACLE_IN_LIMIT)
 
 # ---------------------------------------------------------------------------
 # Argument conversion helpers
@@ -378,380 +459,209 @@ def _rewrite_upsert_to_merge(query: str) -> str | None:
     return merge_query
 
 
-def _rewrite_pg_to_oracle(query: str, *, supports_for_update_row_limit: bool = False) -> RewriteResult:
-    """Rewrite PostgreSQL-style SQL to Oracle-compatible SQL.
+def _rewrite_coalesce_merge(m: re.Match) -> str:
+    coalesce_expr = _COALESCE_INNER_CAST_RE.sub(r"TO_CLOB('\1')", m.group(1))
+    return f"JSON_MERGEPATCH({coalesce_expr}, {m.group(2)} RETURNING CLOB)"
 
-    Returns (rewritten_query, ignore_dup, returning_cols).
-    - ignore_dup: True if ON CONFLICT DO NOTHING was stripped (caller should catch ORA-00001)
-    - returning_cols: column names from RETURNING clause (None if no RETURNING)
-    """
+
+def _rewrite_json_bool(m: re.Match) -> str:
+    col = m.group(1)
+    if col.lower() in ("trigger", "comment", "order", "group", "index"):
+        col = f'"{col}"'
+    return f"JSON_VALUE({col}, '$.{m.group(2)}') = '{m.group(3).lower()}'"
+
+
+def _rewrite_not_jsonb_is_parent(m: re.Match) -> str:
+    col = m.group(1)
+    return (
+        f"({col} IS NOT NULL AND ("
+        f"CASE WHEN JSON_VALUE({col}, '$.type()') = 'object' "
+        f"AND JSON_VALUE({col}, '$.is_parent.type()') = 'boolean' "
+        f"AND JSON_VALUE({col}, '$.is_parent') = 'true' "
+        f"THEN 1 ELSE 0 END = 0))"
+    )
+
+
+def _rewrite_date_trunc(m: re.Match) -> str:
+    interval = m.group(1).lower()
+    expr = _AT_TIME_ZONE_RE.sub("", m.group(2).strip())
+    fmt = _DATE_TRUNC_MAP.get(interval, "DD")
+    return f"TRUNC(CAST({expr} AS DATE), '{fmt}')"
+
+
+def _rewrite_interval(m: re.Match) -> str:
+    ora_unit = _INTERVAL_MAP.get(m.group(2).lower())
+    if ora_unit:
+        return f"NUMTODSINTERVAL({m.group(1)}, '{ora_unit}')"
+    return m.group(0)
+
+
+def _rewrite_empty_eq(m: re.Match) -> str:
+    col = m.group(1)
+    return f"(DBMS_LOB.GETLENGTH({col}) IS NULL OR DBMS_LOB.GETLENGTH({col}) <= 2)"
+
+
+def _rewrite_array_overlap(m: re.Match) -> str:
+    col, param = m.group(1), m.group(2)
+    return (
+        f"EXISTS (SELECT 1 FROM JSON_TABLE({param}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) jt "
+        f"WHERE JSON_EXISTS({col}, '$[*]?(@ == $v)' PASSING jt.val AS \"v\"))"
+    )
+
+
+def _rewrite_array_contained_by(m: re.Match) -> str:
+    col, param = m.group(1), m.group(2)
+    return (
+        f"NOT EXISTS (SELECT 1 FROM JSON_TABLE({col}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) c "
+        f"WHERE NOT EXISTS (SELECT 1 FROM JSON_TABLE({param}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) p "
+        f"WHERE p.val = c.val))"
+    )
+
+
+def _rewrite_array_contains(m: re.Match) -> str:
+    col, param = m.group(1), m.group(2)
+    return (
+        f"(SELECT COUNT(*) FROM JSON_TABLE({param}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) jt "
+        f"WHERE JSON_EXISTS({col}, '$[*]?(@ == $v)' PASSING jt.val AS \"v\")) = "
+        f"JSON_VALUE({param}, '$.size()' RETURNING NUMBER)"
+    )
+
+
+@functools.lru_cache(maxsize=512)
+def _rewrite_pg_to_oracle_cached(query: str, supports_for_update_row_limit: bool) -> _CachedRewriteResult:
+    """Cached immutable PostgreSQL → Oracle SQL rewriter."""
     ignore_dup = False
-    returning_cols: list[str] | None = None
+    returning_cols: tuple[str, ...] | None = None
 
     # $N → :N
     query = _PG_PARAM_RE.sub(r":\1", query)
 
     # LEFT(expr, n) does not exist in Oracle (ORA-00904). DBMS_LOB.SUBSTR takes
     # VARCHAR2 and CLOB alike and returns VARCHAR2, so snippets stay plain strings.
-    query = re.sub(
-        r"\bLEFT\s*\(\s*([\w.]+)\s*,\s*(\d+|:\w+)\s*\)",
-        r"DBMS_LOB.SUBSTR(\1, \2, 1)",
-        query,
-        flags=re.IGNORECASE,
-    )
+    query = _LEFT_RE.sub(r"DBMS_LOB.SUBSTR(\1, \2, 1)", query)
 
     # JSONB merge operator: col || :N::jsonb → JSON_MERGEPATCH(col, :N RETURNING CLOB)
     # Must happen BEFORE cast strip so we can detect ::jsonb
     # RETURNING CLOB is required: without it JSON_MERGEPATCH returns VARCHAR2(4000)
     # with NULL ON ERROR, so a merged document over 4000 bytes silently becomes NULL
     # (e.g. ORA-01407 when updating the NOT NULL banks.config column).
-    query = re.sub(
-        r"(\w+(?:\.\w+)?)\s*\|\|\s*(:\w+)::jsonb", r"JSON_MERGEPATCH(\1, \2 RETURNING CLOB)", query, flags=re.IGNORECASE
-    )
+    query = _JSONB_MERGE_RE.sub(r"JSON_MERGEPATCH(\1, \2 RETURNING CLOB)", query)
 
     # JSONB merge with complex left-hand expression (e.g. COALESCE(...)):
     #   COALESCE(col, '[]'::jsonb) || :N::jsonb
     #   → JSON_MERGEPATCH(COALESCE(col, TO_CLOB('[]')), :N RETURNING CLOB)
-    # The simple \w+ regex above won't match a closing paren.  We also
-    # wrap any JSON string literals inside the COALESCE with TO_CLOB to
-    # prevent ORA-00932 (CHAR vs CLOB type mismatch with CLOB columns).
-    def _rewrite_coalesce_merge(m: re.Match) -> str:
-        coalesce_expr = m.group(1)
-        bind_param = m.group(2)
-        # Wrap any 'literal'::jsonb inside COALESCE with TO_CLOB
-        coalesce_expr = re.sub(r"'([^']*)'::(jsonb|json)", r"TO_CLOB('\1')", coalesce_expr, flags=re.IGNORECASE)
-        return f"JSON_MERGEPATCH({coalesce_expr}, {bind_param} RETURNING CLOB)"
-
-    query = re.sub(
-        r"(COALESCE\([^)]+\))\s*\|\|\s*(:\w+)::jsonb",
-        _rewrite_coalesce_merge,
-        query,
-        flags=re.IGNORECASE,
-    )
+    query = _COALESCE_MERGE_RE.sub(_rewrite_coalesce_merge, query)
 
     # JSONB text extract + boolean cast + comparison (must run BEFORE cast strip)
-    # (trigger->>'refresh_after_consolidation')::boolean = true → JSON_VALUE("trigger", '$.key') = 'true'
-    def _rewrite_json_bool(m: re.Match) -> str:
-        col = m.group(1)
-        key = m.group(2)
-        val = m.group(3).lower()
-        # Quote Oracle reserved words
-        if col.lower() in ("trigger", "comment", "order", "group", "index"):
-            col = f'"{col}"'
-        return f"JSON_VALUE({col}, '$.{key}') = '{val}'"
+    query = _JSON_BOOL_RE.sub(_rewrite_json_bool, query)
 
-    query = re.sub(
-        r"""\((\w+(?:\.\w+)?)\s*->>\s*'(\w+)'\)::boolean\s*=\s*(true|false)""",
-        _rewrite_json_bool,
-        query,
-        flags=re.IGNORECASE,
-    )
-
-    # NOT (col::jsonb @> '{"is_parent": true}'::jsonb) — used by list_operations
-    # (exclude_parents). _JSONB_CONTAINS_RE only handles bind params, so the literal
-    # form would reach Oracle verbatim. Must run BEFORE the cast strip. Keeps PG's
-    # three-valued logic: a NULL column makes NOT (NULL @> ...) NULL, i.e. excluded.
-    def _rewrite_not_jsonb_is_parent(m: re.Match) -> str:
-        col = m.group(1)
-        return (
-            f"({col} IS NOT NULL AND ("
-            f"CASE WHEN JSON_VALUE({col}, '$.type()') = 'object' "
-            f"AND JSON_VALUE({col}, '$.is_parent.type()') = 'boolean' "
-            f"AND JSON_VALUE({col}, '$.is_parent') = 'true' "
-            f"THEN 1 ELSE 0 END = 0))"
-        )
-
-    query = re.sub(
-        r"""NOT\s*\(\s*(\w+(?:\.\w+)?)(?:::jsonb)?\s*@>\s*'\{\s*["']?is_parent["']?\s*:\s*true\s*\}'(?:::jsonb)?\s*\)""",
-        _rewrite_not_jsonb_is_parent,
-        query,
-        flags=re.IGNORECASE,
-    )
+    # NOT (col::jsonb @> '{"is_parent": true}'::jsonb) — used by list_operations (exclude_parents).
+    query = _NOT_JSONB_IS_PARENT_RE.sub(_rewrite_not_jsonb_is_parent, query)
 
     # Strip ::type casts (including bare ::jsonb on literals in generic contexts)
     query = _PG_CAST_RE.sub("", query)
 
     # PG-specific SET SESSION commands → skip (Oracle doesn't need these)
-    if re.match(r"\s*SET\s+SESSION\s+CHARACTERISTICS\b", query, re.IGNORECASE):
-        return RewriteResult("SELECT 1 FROM DUAL", False, None)
+    if _SET_SESSION_RE.match(query):
+        return _CachedRewriteResult("SELECT 1 FROM DUAL", False, None)
 
-    # NOW() AT TIME ZONE 'UTC' → SYS_EXTRACT_UTC(SYSTIMESTAMP): the literal translation is a
-    # named-region TIMESTAMP WITH TIME ZONE, which the thin driver cannot decode (DPY-3022).
-    query = re.sub(r"\bNOW\(\)\s+AT\s+TIME\s+ZONE\s+'UTC'", "SYS_EXTRACT_UTC(SYSTIMESTAMP)", query, flags=re.IGNORECASE)
+    # NOW() AT TIME ZONE 'UTC' → SYS_EXTRACT_UTC(SYSTIMESTAMP)
+    query = _NOW_UTC_RE.sub("SYS_EXTRACT_UTC(SYSTIMESTAMP)", query)
     # NOW() → SYSTIMESTAMP
-    query = re.sub(r"\bNOW\(\)", "SYSTIMESTAMP", query, flags=re.IGNORECASE)
+    query = _NOW_RE.sub("SYSTIMESTAMP", query)
     # gen_random_uuid() → SYS_GUID()
-    query = re.sub(r"\bgen_random_uuid\(\)", "SYS_GUID()", query, flags=re.IGNORECASE)
+    query = _GEN_UUID_RE.sub("SYS_GUID()", query)
     # Boolean literals: Oracle uses NUMBER(1) for booleans
-    query = re.sub(r"\b=\s*TRUE\b", "= 1", query, flags=re.IGNORECASE)
-    query = re.sub(r"\b=\s*FALSE\b", "= 0", query, flags=re.IGNORECASE)
-    # FOR NO KEY UPDATE → FOR UPDATE (Oracle has only FOR UPDATE; it does not block
-    # indexed-FK child inserts the way PG's FOR UPDATE would, so plain FOR UPDATE is
-    # the correct equivalent). Must run before the FOR SHARE rule below.
-    query = re.sub(r"\bFOR\s+NO\s+KEY\s+UPDATE\b", "FOR UPDATE", query, flags=re.IGNORECASE)
-    # FOR SHARE → FOR UPDATE (Oracle doesn't support FOR SHARE)
-    query = re.sub(r"\bFOR\s+SHARE\b", "FOR UPDATE", query, flags=re.IGNORECASE)
+    query = _EQ_TRUE_RE.sub("= 1", query)
+    query = _EQ_FALSE_RE.sub("= 0", query)
+    # FOR NO KEY UPDATE / FOR SHARE → FOR UPDATE
+    query = _FOR_NO_KEY_UPDATE_RE.sub("FOR UPDATE", query)
+    query = _FOR_SHARE_RE.sub("FOR UPDATE", query)
 
     # Oracle reserved word: quote "trigger" column name.
-    # Use negative lookbehind/lookahead to skip already-quoted occurrences.
-    query = re.sub(r'(?<!")\btrigger\b(?!")', '"trigger"', query)
+    query = _TRIGGER_COL_RE.sub('"trigger"', query)
 
-    # date_trunc('interval', expr) → TRUNC(expr, 'fmt')
-    # The second capture group is a balanced expression (not just a column name)
-    # to handle e.g. date_trunc('hour', created_at AT TIME ZONE 'UTC').
-    _DATE_TRUNC_MAP = {"day": "DD", "hour": "HH24", "month": "MM", "week": "IW", "year": "YYYY", "minute": "MI"}
-
-    def _rewrite_date_trunc(m):
-        interval = m.group(1).lower()
-        expr = m.group(2).strip()
-        # Strip AT TIME ZONE — Oracle timestamps are already in the session timezone.
-        expr = re.sub(r"\s+AT\s+TIME\s+ZONE\s+'[^']*'", "", expr, flags=re.IGNORECASE)
-        fmt = _DATE_TRUNC_MAP.get(interval, "DD")
-        return f"TRUNC(CAST({expr} AS DATE), '{fmt}')"
-
-    query = re.sub(r"date_trunc\(\s*'(\w+)'\s*,\s*(.+?)\s*\)", _rewrite_date_trunc, query, flags=re.IGNORECASE)
+    # date_trunc('interval', expr) → TRUNC(CAST(expr AS DATE), 'fmt')
+    query = _DATE_TRUNC_RE.sub(_rewrite_date_trunc, query)
 
     # interval 'N units' → NUMTODSINTERVAL(N, 'UNIT')
-    # Handles PG interval literals like interval '7 days', interval '1 hour', etc.
-    _INTERVAL_MAP = {
-        "second": "SECOND",
-        "seconds": "SECOND",
-        "minute": "MINUTE",
-        "minutes": "MINUTE",
-        "hour": "HOUR",
-        "hours": "HOUR",
-        "day": "DAY",
-        "days": "DAY",
-    }
-
-    def _rewrite_interval(m):
-        num = m.group(1)
-        unit = m.group(2).lower()
-        ora_unit = _INTERVAL_MAP.get(unit)
-        if ora_unit:
-            return f"NUMTODSINTERVAL({num}, '{ora_unit}')"
-        return m.group(0)  # leave as-is if unknown unit
-
-    query = re.sub(r"interval\s+'(\d+)\s+(\w+)'", _rewrite_interval, query, flags=re.IGNORECASE)
+    query = _INTERVAL_RE.sub(_rewrite_interval, query)
 
     # JSON operators
     query = _JSON_ARROW_TEXT_RE.sub(r"JSON_VALUE(\1, '$.\2')", query)
     query = _JSON_HAS_KEY_RE.sub(r"JSON_EXISTS(\1, '$.\2')", query)
-    # result_metadata::jsonb @> :N — every call site binds a single-key
-    # {"parent_operation_id": <uuid>} document to find an operation's
-    # siblings/children (poller rollup, orphan reconciliation, operation
-    # detail and retry). Oracle has no bound-document containment, so
-    # single-key containment becomes a JSON_VALUE comparison on both sides.
-    # Runs BEFORE the generic rewrite below: that one emits
-    # JSON_EXISTS(col, '$' PASSING :N AS cond), which declares a bind variable
-    # the '$' path never references — Oracle evaluates it to false for every
-    # row, so a batch_retain parent never found its children and stayed pending.
     query = _RESULT_METADATA_CONTAINS_RE.sub(
         r"JSON_VALUE(\1, '$.parent_operation_id') = JSON_VALUE(:\2, '$.parent_operation_id')", query
     )
     query = _JSONB_CONTAINS_RE.sub(r"JSON_EXISTS(\1, '$' PASSING :\2 AS cond)", query)
 
     # pgvector distance operator: col <=> :N → VECTOR_DISTANCE(col, :N, COSINE)
-    # Use [\w.]+ to capture table-qualified columns like mu.embedding
-    query = re.sub(
-        r"([\w.]+)\s*<=>\s*(:\w+)",
-        r"VECTOR_DISTANCE(\1, \2, COSINE)",
-        query,
-    )
+    query = _VECTOR_OP_RE.sub(r"VECTOR_DISTANCE(\1, \2, COSINE)", query)
 
-    # LIMIT/OFFSET rewriting: PG uses "LIMIT N OFFSET M" or "LIMIT N" or "OFFSET M LIMIT N"
-    # Oracle uses "OFFSET M ROWS FETCH FIRST N ROWS ONLY" (OFFSET before FETCH FIRST)
-    #
-    # Before RU 23.26.4, FETCH FIRST with FOR UPDATE raises ORA-02014. Preserve
-    # the ROWNUM workaround for those servers. Newer servers can limit the ordered
-    # claim after skipping locked rows, avoiding partial batches and the old
-    # pre-ORDER BY ROWNUM selection. OFFSET remains unsupported with FOR UPDATE.
-    has_for_update = bool(re.search(r"\bFOR\s+UPDATE\b", query, re.IGNORECASE))
-
-    if has_for_update:
-        # Extract LIMIT before moving it ahead of FOR UPDATE or applying the
-        # legacy ROWNUM predicate. PostgreSQL allows LIMIT on either side.
+    # LIMIT/OFFSET rewriting
+    if _FOR_UPDATE_RE.search(query):
         limit_val = None
-        limit_match = re.search(r"\bLIMIT\s+(\d+|:\w+)\b", query, re.IGNORECASE)
+        limit_match = _LIMIT_RE.search(query)
         if limit_match:
             limit_val = limit_match.group(1)
-            query = re.sub(r"\bLIMIT\s+(\d+|:\w+)\b", "", query, flags=re.IGNORECASE)
+            query = _LIMIT_RE.sub("", query)
 
-        has_offset = bool(re.search(r"\bOFFSET\b", query, re.IGNORECASE))
+        has_offset = bool(_OFFSET_KW_RE.search(query))
         use_native_limit = (
             supports_for_update_row_limit
             and not has_offset
-            and bool(re.match(r"\s*SELECT\b", query, re.IGNORECASE))
-            and not re.search(r"\b(?:DISTINCT|GROUP\s+BY|HAVING|UNION|INTERSECT|MINUS)\b", query, re.IGNORECASE)
+            and bool(_SELECT_START_RE.match(query))
+            and not _FOR_UPDATE_DISALLOWED_RE.search(query)
             and not _VECTOR_DISTANCE_CALL_RE.search(query)
         )
 
-        # Preserve the legacy OFFSET handling (claim queries never use OFFSET).
-        query = re.sub(r"\bOFFSET\s+(\d+|:\w+)\b(?!\s+ROWS)", "", query, flags=re.IGNORECASE)
+        query = _STANDALONE_OFFSET_RE.sub("", query)
 
         if limit_val is not None and use_native_limit:
-            query = re.sub(
-                r"\bFOR\s+UPDATE\b",
-                f"FETCH FIRST {limit_val} ROWS ONLY FOR UPDATE",
-                query,
-                count=1,
-                flags=re.IGNORECASE,
-            )
+            query = _FOR_UPDATE_RE.sub(f"FETCH FIRST {limit_val} ROWS ONLY FOR UPDATE", query, count=1)
         elif limit_val is not None:
-            # Insert ROWNUM <= N right after WHERE
-            query = re.sub(
-                r"\bWHERE\b",
-                f"WHERE ROWNUM <= {limit_val} AND",
-                query,
-                count=1,
-                flags=re.IGNORECASE,
-            )
+            query = _WHERE_KW_RE.sub(f"WHERE ROWNUM <= {limit_val} AND", query, count=1)
     else:
-        # No FOR UPDATE: use standard FETCH FIRST / OFFSET ROWS syntax.
-        # A query ranking by vector distance asks for EXACT: on Autonomous Database a bare
-        # FETCH FIRST is answered from a vector index whenever one exists, which made these
-        # nearest-neighbour lookups (temporal arm, link expansion) silently approximate.
         fetch_first = "FETCH EXACT FIRST" if _VECTOR_DISTANCE_CALL_RE.search(query) else "FETCH FIRST"
-        # First handle "LIMIT N OFFSET M" → "OFFSET M ROWS FETCH FIRST N ROWS ONLY"
-        query = re.sub(
-            r"\bLIMIT\s+(\d+|:\w+)\s+OFFSET\s+(\d+|:\w+)\b",
-            rf"OFFSET \2 ROWS {fetch_first} \1 ROWS ONLY",
-            query,
-            flags=re.IGNORECASE,
-        )
-        # Handle "OFFSET M LIMIT N" → "OFFSET M ROWS FETCH FIRST N ROWS ONLY"
-        query = re.sub(
-            r"\bOFFSET\s+(\d+|:\w+)\s+LIMIT\s+(\d+|:\w+)\b",
-            rf"OFFSET \1 ROWS {fetch_first} \2 ROWS ONLY",
-            query,
-            flags=re.IGNORECASE,
-        )
-        # Handle standalone "LIMIT N" (no OFFSET)
-        query = re.sub(
-            r"\bLIMIT\s+(\d+|:\w+)\b",
-            rf"{fetch_first} \1 ROWS ONLY",
-            query,
-            flags=re.IGNORECASE,
-        )
-        # Handle standalone "OFFSET N" (no LIMIT, less common)
-        query = re.sub(
-            r"\bOFFSET\s+(\d+|:\w+)\b(?!\s+ROWS)",
-            r"OFFSET \1 ROWS",
-            query,
-            flags=re.IGNORECASE,
-        )
+        query = _LIMIT_OFFSET_RE.sub(rf"OFFSET \2 ROWS {fetch_first} \1 ROWS ONLY", query)
+        query = _OFFSET_LIMIT_RE.sub(rf"OFFSET \1 ROWS {fetch_first} \2 ROWS ONLY", query)
+        query = _LIMIT_RE.sub(rf"{fetch_first} \1 ROWS ONLY", query)
+        query = _STANDALONE_OFFSET_RE.sub(r"OFFSET \1 ROWS", query)
 
-    # PG non-empty array check: tags != '{}' → Oracle: NOT (DBMS_LOB empty check)
-    query = re.sub(
-        r"(\w+(?:\.\w+)?)\s*!=\s*'\{\}'",
-        r"NOT (DBMS_LOB.GETLENGTH(\1) IS NULL OR DBMS_LOB.GETLENGTH(\1) <= 2)",
-        query,
-    )
+    # PG non-empty / empty array checks
+    query = _NON_EMPTY_ARR_RE.sub(r"NOT (DBMS_LOB.GETLENGTH(\1) IS NULL OR DBMS_LOB.GETLENGTH(\1) <= 2)", query)
+    query = _EMPTY_ARR_OR_RE.sub(_rewrite_empty_eq, query)
+    query = _EMPTY_ARR_AND_RE.sub(_rewrite_empty_eq, query)
+    query = _EMPTY_ARR_WHERE_RE.sub(_rewrite_empty_eq, query)
 
-    # PG empty array check: tags = '{}' in comparisons → Oracle: DBMS_LOB empty check
-    # Avoid matching SET assignments (preceded by SET keyword or comma in SET list)
-    # Use a function to check context
-    def _rewrite_empty_eq(m):
-        col = m.group(1)
-        return f"(DBMS_LOB.GETLENGTH({col}) IS NULL OR DBMS_LOB.GETLENGTH({col}) <= 2)"
-
-    # Match col = '{}' preceded by OR/AND/WHERE or opening paren (comparison context)
-    query = re.sub(r"(?<=\bOR\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
-    query = re.sub(r"(?<=\bAND\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
-    query = re.sub(r"(?<=\bWHERE\s)(\w+(?:\.\w+)?)\s*=\s*'\{\}'", _rewrite_empty_eq, query, flags=re.IGNORECASE)
-
-    # PG array overlap: tags && :N → Oracle: JSON array overlap check using JSON_TABLE
-    def _rewrite_array_overlap(m):
-        col = m.group(1)
-        param = m.group(2)
-        return f"EXISTS (SELECT 1 FROM JSON_TABLE({param}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) jt WHERE JSON_EXISTS({col}, '$[*]?(@ == $v)' PASSING jt.val AS \"v\"))"
-
-    query = re.sub(r"(\w+(?:\.\w+)?)\s*&&\s*(:\w+)", _rewrite_array_overlap, query)
-
-    # PG array contained-by: tags <@ :N → Oracle: no element of col is missing from param.
-    # The exact tag match emits it as `tags @> :N AND tags <@ :N` (#6585).
-    def _rewrite_array_contained_by(m):
-        col = m.group(1)
-        param = m.group(2)
-        return (
-            f"NOT EXISTS (SELECT 1 FROM JSON_TABLE({col}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) c "
-            f"WHERE NOT EXISTS (SELECT 1 FROM JSON_TABLE({param}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) p "
-            f"WHERE p.val = c.val))"
-        )
-
-    query = re.sub(r"(\w+(?:\.\w+)?)\s*<@\s*(:\w+)", _rewrite_array_contained_by, query)
-
-    # PG array containment: tags @> :N → Oracle: all elements from param exist in col
-    # (Override the JSONB contains regex which doesn't work for array containment)
-    # Already handled by _JSONB_CONTAINS_RE above, but that generates wrong SQL for arrays.
-    # Re-detect and fix: JSON_EXISTS(col, '$' PASSING :N AS cond) → proper array containment
-    def _rewrite_array_contains(m):
-        col = m.group(1)
-        param = m.group(2)
-        return (
-            f"(SELECT COUNT(*) FROM JSON_TABLE({param}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) jt "
-            f"WHERE JSON_EXISTS({col}, '$[*]?(@ == $v)' PASSING jt.val AS \"v\")) = "
-            f"JSON_VALUE({param}, '$.size()' RETURNING NUMBER)"
-        )
-
-    # Fix the already-rewritten @> pattern if it was handled by _JSONB_CONTAINS_RE
-    query = re.sub(
-        r"JSON_EXISTS\((\w+(?:\.\w+)?),\s*'\$'\s*PASSING\s*(:\w+)\s*AS\s*cond\)",
-        _rewrite_array_contains,
-        query,
-    )
+    # PG array overlap / contained-by / containment
+    query = _ARRAY_OVERLAP_RE.sub(_rewrite_array_overlap, query)
+    query = _ARRAY_CONTAINED_BY_RE.sub(_rewrite_array_contained_by, query)
+    query = _ARRAY_CONTAINS_FIX_RE.sub(_rewrite_array_contains, query)
 
     # ILIKE → UPPER(...) LIKE UPPER(...)
-    query = re.sub(
-        r"(\w+(?:\.\w+)?)\s+ILIKE\s+(:\w+)",
-        r"UPPER(\1) LIKE UPPER(\2)",
-        query,
-        flags=re.IGNORECASE,
-    )
+    query = _ILIKE_RE.sub(r"UPPER(\1) LIKE UPPER(\2)", query)
 
-    # = ANY(:N) → placeholder that _make_bind_params will expand
-    # Mark these for expansion: the bind var is a list that needs to be expanded
-    # into multiple individual bind vars.
+    # Markers expanded per-execution in OracleConnection._expand_any_lists
     query = _ANY_RE.sub(r"IN (/*EXPAND:\1*/)", query)
-
-    # != ALL(:N) → NOT IN (expanded list) — the negative counterpart of = ANY
     query = _NOT_ALL_RE.sub(r"NOT IN (/*EXPAND:\1*/)", query)
-
-    # col LIKE ANY(:N) → (col LIKE :p0 OR col LIKE :p1 OR ...)
     query = _LIKE_ANY_RE.sub(r"\1 /*LIKE_ANY:\2:\1*/", query)
-
-    # col NOT LIKE ALL(:N) → (col NOT LIKE :p0 AND col NOT LIKE :p1 AND ...)
     query = _NOT_LIKE_ALL_RE.sub(r"\1 /*NOT_LIKE_ALL:\2:\1*/", query)
-
-    # array_position(:N, col) → CASE col WHEN :v0 THEN 1 ... END (expanded with the list).
-    # Oracle has no array_position; left as is, the list bind arrives as a JSON string and
-    # fails with ORA-00932 (CHAR vs JSON).
     query = _ARRAY_POSITION_RE.sub(r"/*ARRAY_POSITION:\1:\2*/", query)
 
-    # CTE AS MATERIALIZED (...) → AS (...) — Oracle doesn't support MATERIALIZED CTE hint
-    query = re.sub(r"\bAS\s+MATERIALIZED\s*\(", "AS (", query, flags=re.IGNORECASE)
+    # CTE AS MATERIALIZED (...) → AS (...)
+    query = _MATERIALIZED_CTE_RE.sub("AS (", query)
 
-    # COALESCE(:N, <numeric_literal>) — Oracle defaults None bind vars to VARCHAR2,
-    # causing type mismatch.  Wrap the bind var in TO_NUMBER so types align.
-    query = re.sub(
-        r"COALESCE\(\s*(:\w+)\s*,\s*(\d+(?:\.\d+)?)\s*\)",
-        r"COALESCE(TO_NUMBER(\1), \2)",
-        query,
-        flags=re.IGNORECASE,
-    )
+    # COALESCE(:N, <numeric_literal>) → COALESCE(TO_NUMBER(:N), <numeric_literal>)
+    query = _COALESCE_NUM_RE.sub(r"COALESCE(TO_NUMBER(\1), \2)", query)
 
     # CROSS JOIN LATERAL → CROSS APPLY (Oracle 12c+)
-    query = re.sub(r"\bCROSS\s+JOIN\s+LATERAL\b", "CROSS APPLY", query, flags=re.IGNORECASE)
-
-    # Note: DISTINCT ON is PG-specific and NOT handled here — it's too complex
-    # to rewrite transparently in a multi-CTE query. Consumers that use DISTINCT ON
-    # must provide Oracle-specific alternatives.
+    query = _LATERAL_RE.sub("CROSS APPLY", query)
 
     # ON CONFLICT DO NOTHING → strip it, suppress ORA-00001
     if _ON_CONFLICT_DO_NOTHING_RE.search(query):
         query = _ON_CONFLICT_DO_NOTHING_RE.sub("", query)
         ignore_dup = True
-        # Also strip any RETURNING clause (can't return from a dup-suppressed insert)
         query = _RETURNING_RE.sub("", query)
         query = query.strip()
 
@@ -764,18 +674,32 @@ def _rewrite_pg_to_oracle(query: str, *, supports_for_update_row_limit: bool = F
             logger.warning("ON CONFLICT DO UPDATE rewrite failed — query may not work: %s", query[:200])
 
     # RETURNING clause → rewrite to RETURNING ... INTO :ret_0, :ret_1, ...
-    # Only applies to DML (INSERT/UPDATE/DELETE) — SELECT queries should never
-    # have RETURNING rewritten, even if they contain the word in a string literal
-    # or CTE alias.
-    if not ignore_dup and re.match(r"\s*(INSERT|UPDATE|DELETE)\b", query, re.IGNORECASE):
+    if not ignore_dup and _DML_START_RE.match(query):
         m = _RETURNING_RE.search(query)
         if m:
             ret_cols_str = m.group(1).strip()
-            returning_cols = [c.strip() for c in ret_cols_str.split(",") if c.strip()]
-            into_vars = ", ".join(f":ret_{i}" for i in range(len(returning_cols)))
+            cols = tuple(c.strip() for c in ret_cols_str.split(",") if c.strip())
+            returning_cols = cols
+            into_vars = ", ".join(f":ret_{i}" for i in range(len(cols)))
             query = query[: m.start()] + f"RETURNING {ret_cols_str} INTO {into_vars}" + query[m.end() :]
 
-    return RewriteResult(query, ignore_dup, returning_cols)
+    return _CachedRewriteResult(query, ignore_dup, returning_cols)
+
+
+def _rewrite_pg_to_oracle(query: str, *, supports_for_update_row_limit: bool = False) -> RewriteResult:
+    """Rewrite PostgreSQL-style SQL to Oracle-compatible SQL.
+
+    Returns (rewritten_query, ignore_dup, returning_cols).
+    - ignore_dup: True if ON CONFLICT DO NOTHING was stripped (caller should catch ORA-00001)
+    - returning_cols: column names from RETURNING clause (None if no RETURNING)
+    """
+    cached = _rewrite_pg_to_oracle_cached(query, supports_for_update_row_limit)
+    returning_cols = list(cached.returning_cols) if cached.returning_cols is not None else None
+    return RewriteResult(cached.query, cached.ignore_dup, returning_cols)
+
+
+_rewrite_pg_to_oracle.cache_info = _rewrite_pg_to_oracle_cached.cache_info  # type: ignore[attr-defined]
+_rewrite_pg_to_oracle.cache_clear = _rewrite_pg_to_oracle_cached.cache_clear  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -1042,8 +966,6 @@ class OracleConnection(DatabaseConnection):
         if sizes:
             cursor.setinputsizes(**sizes)
 
-    _expand_counter = 0
-
     @staticmethod
     def _resolve_list_param(params: dict[str, Any], key: str) -> list | None:
         """Resolve a parameter that may be a list or a JSON-encoded list string."""
@@ -1061,25 +983,25 @@ class OracleConnection(DatabaseConnection):
 
     @staticmethod
     def _expand_any_lists(query: str, params: dict[str, Any] | None) -> tuple[str, dict[str, Any] | None]:
-        """Expand /*EXPAND:N*/, /*LIKE_ANY:N:col*/, /*NOT_LIKE_ALL:N:col*/ markers.
+        """Expand /*EXPAND:N*/, /*LIKE_ANY:N:col*/, /*NOT_LIKE_ALL:N:col*/, /*ARRAY_POSITION:N:col*/ markers.
 
-        Converts: IN (/*EXPAND:1*/) with params["1"] = [a, b, c]
-        Into:     IN (:any_0, :any_1, :any_2) with params["any_0"]=a, etc.
-
-        Converts: col /*LIKE_ANY:1:col*/ with params["1"] = [a, b]
-        Into:     (col LIKE :lk_0 OR col LIKE :lk_1)
-
-        Converts: col /*NOT_LIKE_ALL:1:col*/ with params["1"] = [a, b]
-        Into:     (col NOT LIKE :nlk_0 AND col NOT LIKE :nlk_1)
-
-        Uses a unique prefix to avoid name collisions with other bind vars.
-        The original param is kept (for other references to :N in the query).
+        Uses per-query deterministic slot counters (not a global monotonic counter) and
+        power-of-two bind-list bucketing on bounded IN / NOT IN lists (<= 1000 items)
+        so identical queries reuse shared Oracle SQL_IDs and session cursor caches.
         """
-        if params is None or "/*" not in query:
+        if params is None or (
+            "/*EXPAND:" not in query
+            and "/*LIKE_ANY:" not in query
+            and "/*NOT_LIKE_ALL:" not in query
+            and "/*ARRAY_POSITION:" not in query
+        ):
             return query, params
 
-        expand_re = re.compile(r"(?:(\w+(?:\.\w+)?)\s+(NOT\s+)?IN\s*\(\s*)?/\*EXPAND:(\d+)\*/(\s*\))?", re.IGNORECASE)
         keys_to_remove: set[str] = set()
+        expand_slots = itertools.count(0)
+        like_slots = itertools.count(0)
+        not_like_slots = itertools.count(0)
+        ap_slots = itertools.count(0)
 
         def _replace(m):
             col = m.group(1)
@@ -1093,54 +1015,53 @@ class OracleConnection(DatabaseConnection):
                 try:
                     parsed = json.loads(val)
                     if isinstance(parsed, list):
-                        val = parsed
-                        # Convert UUID strings back to bytes for RAW(16) columns
-                        converted = []
-                        for item in val:
-                            if isinstance(item, str) and _UUID_STR_RE.match(item):
-                                converted.append(_uuid_mod.UUID(item).bytes)
-                            else:
-                                converted.append(item)
-                        val = converted
+                        val = [
+                            _uuid_mod.UUID(item).bytes if isinstance(item, str) and _UUID_STR_RE.match(item) else item
+                            for item in parsed
+                        ]
                 except (json.JSONDecodeError, TypeError):
                     return f"{head}:{param_key}{close_paren}"
             if val is None or not isinstance(val, (list, tuple)):
                 return f"{head}:{param_key}{close_paren}"
             if len(val) == 0:
                 return f"{head}NULL{close_paren}"
-            OracleConnection._expand_counter += 1
-            prefix = f"any{OracleConnection._expand_counter}"
+
+            # Power-of-two bucketing keeps up to 11 shared SQL_IDs per query shape
+            # while leaving >1000-element chunking exact for ORA-01795 prevention.
+            if col and close_paren and len(val) <= _ORACLE_IN_LIMIT and all(v is not None for v in val):
+                bucket = next(b for b in _ORACLE_IN_BUCKETS if b >= len(val))
+                bind_items = list(val) + [val[-1]] * (bucket - len(val))
+            else:
+                bind_items = list(val)
+
+            slot = next(expand_slots)
+            prefix = f"any{slot}"
             expanded_keys = []
-            for i, item in enumerate(val):
+            for i, item in enumerate(bind_items):
                 k = f"{prefix}_{i}"
                 params[k] = item
                 expanded_keys.append(f":{k}")
             keys_to_remove.add(param_key)
             # Oracle caps a scalar IN (...) list at 1000 expressions (ORA-01795).
-            if col and close_paren and len(expanded_keys) > 1000:
+            if col and close_paren and len(expanded_keys) > _ORACLE_IN_LIMIT:
                 op = f"{col} NOT IN" if not_kw else f"{col} IN"
                 joiner = " AND " if not_kw else " OR "
                 chunks = [
-                    f"{op} ({', '.join(expanded_keys[start : start + 1000])})"
-                    for start in range(0, len(expanded_keys), 1000)
+                    f"{op} ({', '.join(expanded_keys[start : start + _ORACLE_IN_LIMIT])})"
+                    for start in range(0, len(expanded_keys), _ORACLE_IN_LIMIT)
                 ]
                 return f"({joiner.join(chunks)})"
             return f"{head}{', '.join(expanded_keys)}{close_paren}"
 
-        query = expand_re.sub(_replace, query)
-
-        # Expand LIKE ANY: col /*LIKE_ANY:N:col*/ → (col LIKE :p0 OR col LIKE :p1 ...)
-        like_any_re = re.compile(r"(\w+(?:\.\w+)?)\s*/\*LIKE_ANY:(\d+):(\w+(?:\.\w+)?)\*/")
+        query = _EXPAND_MARKER_RE.sub(_replace, query)
 
         def _replace_like_any(m):
-            _col = m.group(1)  # redundant column ref before marker
             param_key = m.group(2)
             col = m.group(3)
             val = OracleConnection._resolve_list_param(params, param_key)
             if val is None or len(val) == 0:
-                return "1=0"  # no patterns → no match
-            OracleConnection._expand_counter += 1
-            prefix = f"lk{OracleConnection._expand_counter}"
+                return "1=0"
+            prefix = f"lk{next(like_slots)}"
             clauses = []
             for i, item in enumerate(val):
                 k = f"{prefix}_{i}"
@@ -1149,20 +1070,15 @@ class OracleConnection(DatabaseConnection):
             keys_to_remove.add(param_key)
             return f"({' OR '.join(clauses)})"
 
-        query = like_any_re.sub(_replace_like_any, query)
-
-        # Expand NOT LIKE ALL: col /*NOT_LIKE_ALL:N:col*/ → (col NOT LIKE :p0 AND ...)
-        not_like_all_re = re.compile(r"(\w+(?:\.\w+)?)\s*/\*NOT_LIKE_ALL:(\d+):(\w+(?:\.\w+)?)\*/")
+        query = _LIKE_ANY_MARKER_RE.sub(_replace_like_any, query)
 
         def _replace_not_like_all(m):
-            _col = m.group(1)
             param_key = m.group(2)
             col = m.group(3)
             val = OracleConnection._resolve_list_param(params, param_key)
             if val is None or len(val) == 0:
-                return "1=1"  # no patterns → everything matches
-            OracleConnection._expand_counter += 1
-            prefix = f"nlk{OracleConnection._expand_counter}"
+                return "1=1"
+            prefix = f"nlk{next(not_like_slots)}"
             clauses = []
             for i, item in enumerate(val):
                 k = f"{prefix}_{i}"
@@ -1171,11 +1087,7 @@ class OracleConnection(DatabaseConnection):
             keys_to_remove.add(param_key)
             return f"({' AND '.join(clauses)})"
 
-        query = not_like_all_re.sub(_replace_not_like_all, query)
-
-        # Expand ARRAY_POSITION: /*ARRAY_POSITION:N:col*/ → CASE col WHEN :ap_0 THEN 1 ... END
-        # (1-based like PostgreSQL; rows not in the list get NULL, which sorts last in ASC).
-        array_position_re = re.compile(r"/\*ARRAY_POSITION:(\d+):([\w.]+)\*/")
+        query = _NOT_LIKE_ALL_MARKER_RE.sub(_replace_not_like_all, query)
 
         def _replace_array_position(m):
             param_key = m.group(1)
@@ -1184,11 +1096,9 @@ class OracleConnection(DatabaseConnection):
             val = OracleConnection._resolve_list_param(params, param_key)
             if not val:
                 return "NULL"
-            OracleConnection._expand_counter += 1
-            prefix = f"ap{OracleConnection._expand_counter}"
+            prefix = f"ap{next(ap_slots)}"
             whens = []
             for i, item in enumerate(val):
-                # Same UUID handling as /*EXPAND*/: JSON-serialized UUIDs bind as RAW(16).
                 if from_json and isinstance(item, str) and _UUID_STR_RE.match(item):
                     item = _uuid_mod.UUID(item).bytes
                 k = f"{prefix}_{i}"
@@ -1197,11 +1107,9 @@ class OracleConnection(DatabaseConnection):
             keys_to_remove.add(param_key)
             return f"CASE {col} {' '.join(whens)} END"
 
-        query = array_position_re.sub(_replace_array_position, query)
+        query = _ARRAY_POSITION_MARKER_RE.sub(_replace_array_position, query)
 
-        # Remove original list params that were expanded — their placeholder
-        # (:N) no longer exists in the query, and leaving them causes DPY-4008.
-        # Only remove if the key's placeholder is truly gone from the query.
+        # Remove original list params that were expanded — leaving unreferenced binds causes DPY-4008.
         for key in keys_to_remove:
             if not re.search(rf":{key}\b", query):
                 del params[key]

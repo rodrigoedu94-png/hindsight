@@ -20485,23 +20485,45 @@ class MemoryEngine(MemoryEngineInterface):
                 if is_failure
                 else f"(content->>'kind' IS NULL OR content->>'kind' <> '{_MM_HISTORY_KIND_FAILURE}')"
             )
-            await conn.execute(
-                f"""
-                DELETE FROM {fq_table("mental_model_history")}
-                WHERE mental_model_id = $1 AND bank_id = $2
-                  AND {kind_predicate}
-                  AND id NOT IN (
-                      SELECT id FROM {fq_table("mental_model_history")}
-                      WHERE mental_model_id = $1 AND bank_id = $2
-                        AND {kind_predicate}
-                      ORDER BY changed_at DESC, id DESC
-                      LIMIT $3
-                  )
-                """,
-                mental_model_id,
-                bank_id,
-                max_entries,
-            )
+            if getattr(conn, "backend_type", None) == "oracle":
+                # Oracle: avoid O(N^2) correlated NOT IN CLOB re-evaluation and order by
+                # SYS_EXTRACT_UTC(changed_at) DESC to hit IDX_MM_HISTORY_MODEL directly.
+                await conn.execute(
+                    f"""
+                    DELETE FROM {fq_table("mental_model_history")}
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id,
+                                   ROW_NUMBER() OVER (ORDER BY SYS_EXTRACT_UTC(changed_at) DESC, id DESC) AS rn
+                            FROM {fq_table("mental_model_history")}
+                            WHERE mental_model_id = $1 AND bank_id = $2
+                              AND {kind_predicate}
+                        )
+                        WHERE rn > $3
+                    )
+                    """,
+                    mental_model_id,
+                    bank_id,
+                    max_entries,
+                )
+            else:
+                await conn.execute(
+                    f"""
+                    DELETE FROM {fq_table("mental_model_history")}
+                    WHERE mental_model_id = $1 AND bank_id = $2
+                      AND {kind_predicate}
+                      AND id NOT IN (
+                          SELECT id FROM {fq_table("mental_model_history")}
+                          WHERE mental_model_id = $1 AND bank_id = $2
+                            AND {kind_predicate}
+                          ORDER BY changed_at DESC, id DESC
+                          LIMIT $3
+                      )
+                    """,
+                    mental_model_id,
+                    bank_id,
+                    max_entries,
+                )
 
     async def _record_mental_model_refresh_failure(
         self,
@@ -22727,13 +22749,20 @@ class MemoryEngine(MemoryEngineInterface):
             total = total_row["total"] if total_row else 0
 
             # Get operations with pagination (include result_metadata to check for parent operations)
+            is_oracle = getattr(conn, "backend_type", None) == "oracle"
+            op_hint = (
+                "/*+ INDEX(ao idx_async_operations_bank_created_desc) */ "
+                if is_oracle and len(where_conditions) == 1
+                else ""
+            )
+            op_order = "SYS_EXTRACT_UTC(ao.created_at) DESC" if is_oracle else "ao.created_at DESC"
             operations = await conn.fetch(
                 f"""
-                SELECT operation_id, operation_type, created_at, updated_at, status, error_message,
-                       result_metadata, retry_count, next_retry_at
-                FROM {fq_table("async_operations")}
+                SELECT {op_hint}ao.operation_id, ao.operation_type, ao.created_at, ao.updated_at, ao.status,
+                       ao.error_message, ao.result_metadata, ao.retry_count, ao.next_retry_at
+                FROM {fq_table("async_operations")} ao
                 WHERE {where_clause}
-                ORDER BY created_at DESC
+                ORDER BY {op_order}
                 LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
                 """,
                 *params,
