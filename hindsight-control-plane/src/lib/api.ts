@@ -8,6 +8,21 @@ import { bankApi, bankStatsApi, chunkApi, documentApi, memoryApi } from "./bank-
 import { SESSION_REQUIRED_HEADER } from "./auth/session";
 import { stripBasePath, withBasePath } from "./base-path";
 import { appendTagFilter, type TagFilter, type TagsMatch } from "./tag-filter-params";
+import {
+  knowledgeApi,
+  type ActivityBucket,
+  type ActivityPeriod,
+  type MediaType,
+  type DocumentStatus,
+  type KnowledgeBank,
+  type KnowledgeDocument,
+  type KnowledgeDocumentDetail,
+  type KnowledgeSearchRequest,
+  type KnowledgeSearchResponse,
+  type KnowledgeIngestResponse,
+  type KnowledgeBankConfig,
+  type KnowledgeBankConfigUpdates,
+} from "./knowledge-banks";
 
 /**
  * Reduce an API error `details` value to a string safe to render in a toast.
@@ -59,6 +74,39 @@ export interface WebhookHttpConfig {
   timeout_seconds: number;
   headers: Record<string, string>;
   params: Record<string, string>;
+}
+
+export interface ObservationTreeObservation {
+  id: string;
+  text: string;
+  proof_count: number;
+  occurred_start?: string | null;
+  occurred_end?: string | null;
+  mentioned_at?: string | null;
+  updated_at?: string | null;
+  tags: string[];
+}
+
+export interface ObservationTreeFile {
+  path: string;
+  name: string;
+  /** `index`: a folder's overview (OKF's index.md). `topic`: every observation in one topic. */
+  kind: "index" | "topic";
+  title: string;
+  observation_count: number;
+  about: string[];
+  related: string[];
+  observations: ObservationTreeObservation[];
+  content: string;
+}
+
+export interface ObservationTreeFolder {
+  path: string;
+  name: string;
+  title: string;
+  observation_count: number;
+  folders: ObservationTreeFolder[];
+  files: ObservationTreeFile[];
 }
 
 export interface PageNode {
@@ -475,7 +523,18 @@ export class ControlPlaneClient {
     options?: RequestInit,
     // Bulk callers loop over many requests and report the failures themselves; one
     // toast per failed item would bury the screen.
-    { suppressErrorToast = false }: { suppressErrorToast?: boolean } = {}
+    {
+      suppressErrorToast = false,
+      exposeUnavailable = false,
+    }: {
+      suppressErrorToast?: boolean;
+      /**
+       * Also read the reason off a 503. 5xx bodies stay hidden by default (they can
+       * carry internals); a caller opts in where a 503 is a deliberate, user-facing
+       * state, like the knowledge embedder being unreachable.
+       */
+      exposeUnavailable?: boolean;
+    } = {}
   ): Promise<T> {
     try {
       const response = await fetch(withBasePath(path), {
@@ -487,7 +546,9 @@ export class ControlPlaneClient {
       });
 
       if (!response.ok) {
-        const isClientError = response.status >= 400 && response.status < 500;
+        const isClientError =
+          (response.status >= 400 && response.status < 500) ||
+          (exposeUnavailable && response.status === 503);
         // Redirect to login only when the UI session itself was refused. A 401 the
         // dataplane returned is shown as an error: a new UI key can't fix it.
         const currentPath = stripBasePath(`${window.location.pathname}${window.location.search}`);
@@ -918,6 +979,13 @@ export class ControlPlaneClient {
       limit: number;
       offset: number;
     }>(`/api/entities?${queryParams}`);
+  }
+
+  /** The bank's observations as a tree of topic folders (experimental, no LLM). */
+  async getObservationTree(bankId: string, filter?: TagFilter) {
+    const params = new URLSearchParams({ bank_id: bankId });
+    if (filter) appendTagFilter(params, filter);
+    return this.fetchApi<ObservationTreeFolder>(`/api/observations/tree?${params}`);
   }
 
   /**
@@ -2398,6 +2466,162 @@ export class ControlPlaneClient {
     }>(bankApi(bankId, "/config"), {
       method: "PATCH",
       body: JSON.stringify({ updates }),
+    });
+  }
+
+  // ── Knowledge banks (/api/knowledge-banks proxy) ──────────────────────────
+
+  /** One page, newest first; `q` matches part of the bank id. */
+  async listKnowledgeBanks(params: { limit?: number; offset?: number; q?: string } = {}) {
+    const query = new URLSearchParams();
+    if (params.limit !== undefined) query.set("limit", String(params.limit));
+    if (params.offset !== undefined) query.set("offset", String(params.offset));
+    if (params.q) query.set("q", params.q);
+    const qs = query.toString();
+    return this.fetchApi<{ banks: KnowledgeBank[]; total: number; limit: number; offset: number }>(
+      knowledgeApi() + (qs ? `?${qs}` : ""),
+      { cache: "no-store" as RequestCache }
+    );
+  }
+
+  /** Every knowledge bank, page by page: for views that show them all (the banks page, the
+   *  link picker). The bank picker searches server-side with `listKnowledgeBanks({ q })`. */
+  async listAllKnowledgeBanks(): Promise<KnowledgeBank[]> {
+    const banks: KnowledgeBank[] = [];
+    for (;;) {
+      const page = await this.listKnowledgeBanks({ limit: 100, offset: banks.length });
+      banks.push(...page.banks);
+      if (!page.banks.length || banks.length >= page.total) return banks;
+    }
+  }
+
+  async getKnowledgeBank(bankId: string) {
+    return this.fetchApi<KnowledgeBank>(knowledgeApi(bankId), {
+      cache: "no-store" as RequestCache,
+    });
+  }
+
+  async createKnowledgeBank(bankId: string) {
+    return this.fetchApi<KnowledgeBank>(knowledgeApi(), {
+      method: "POST",
+      body: JSON.stringify({ bank_id: bankId }),
+    });
+  }
+
+  async deleteKnowledgeBank(bankId: string) {
+    return this.fetchApi<{ deleted: boolean }>(knowledgeApi(bankId), { method: "DELETE" });
+  }
+
+  async getKnowledgeBankConfig(bankId: string) {
+    return this.fetchApi<KnowledgeBankConfig>(knowledgeApi(bankId, "config"), {
+      cache: "no-store" as RequestCache,
+    });
+  }
+
+  /** Throws with the server's reason (it names the bad field); the settings section shows it, so no toast. */
+  async updateKnowledgeBankConfig(bankId: string, updates: KnowledgeBankConfigUpdates) {
+    return this.fetchApi<KnowledgeBankConfig>(
+      knowledgeApi(bankId, "config"),
+      { method: "PATCH", body: JSON.stringify({ updates }) },
+      { suppressErrorToast: true }
+    );
+  }
+
+  async resetKnowledgeBankConfig(bankId: string) {
+    return this.fetchApi<KnowledgeBankConfig>(knowledgeApi(bankId, "config"), {
+      method: "DELETE",
+    });
+  }
+
+  async listKnowledgeDocuments(
+    bankId: string,
+    params: {
+      limit: number;
+      offset: number;
+      q?: string;
+      status?: DocumentStatus;
+      media_type?: MediaType;
+    },
+    /** A background poll: its failures stay quiet instead of toasting every few seconds. */
+    { quiet = false }: { quiet?: boolean } = {}
+  ) {
+    const search = new URLSearchParams({
+      limit: String(params.limit),
+      offset: String(params.offset),
+    });
+    if (params.q) search.set("q", params.q);
+    if (params.status) search.set("status", params.status);
+    if (params.media_type) search.set("media_type", params.media_type);
+    return this.fetchApi<{ documents: KnowledgeDocument[]; total: number }>(
+      `${knowledgeApi(bankId, "documents")}?${search}`,
+      { cache: "no-store" as RequestCache },
+      { suppressErrorToast: quiet }
+    );
+  }
+
+  async getKnowledgeDocument(bankId: string, documentId: string) {
+    return this.fetchApi<KnowledgeDocumentDetail>(knowledgeApi(bankId, "documents", documentId), {
+      cache: "no-store" as RequestCache,
+    });
+  }
+
+  async deleteKnowledgeDocument(bankId: string, documentId: string) {
+    return this.fetchApi<{ deleted: boolean }>(knowledgeApi(bankId, "documents", documentId), {
+      method: "DELETE",
+    });
+  }
+
+  async writeKnowledgeTextDocument(
+    bankId: string,
+    doc: {
+      text: string;
+      /** Defaults to `<document_id>.md`. */
+      filename?: string;
+      document_id?: string;
+      tags: string[];
+    }
+  ) {
+    // Text ingest is POST /ingest with `items`, processed in the request by default (no /documents POST).
+    return this.fetchApi<KnowledgeIngestResponse>(knowledgeApi(bankId, "ingest"), {
+      method: "POST",
+      body: JSON.stringify({ items: [doc] }),
+    });
+  }
+
+  /** Throws with the server's reason; the search panel shows it, so no toast here. */
+  async searchKnowledgeBank(bankId: string, body: KnowledgeSearchRequest) {
+    return this.fetchApi<KnowledgeSearchResponse>(
+      knowledgeApi(bankId, "search"),
+      { method: "POST", body: JSON.stringify(body) },
+      { suppressErrorToast: true, exposeUnavailable: true }
+    );
+  }
+
+  /** The bank's document tags, most used first; `q` is a `*` wildcard pattern, as `listTags`. */
+  async listKnowledgeBankTags(bankId: string, q?: string, limit?: number) {
+    const search = new URLSearchParams();
+    if (q) search.set("q", q);
+    if (limit != null) search.set("limit", String(limit));
+    const query = search.toString();
+    return this.fetchApi<{
+      items: Array<{ tag: string; count: number }>;
+      total: number;
+      limit: number;
+      offset: number;
+    }>(`${knowledgeApi(bankId, "tags")}${query ? `?${query}` : ""}`);
+  }
+
+  /** `mediaType` counts only documents of that kind. */
+  async getKnowledgeTimeseries(bankId: string, period: ActivityPeriod, mediaType?: MediaType) {
+    const search = new URLSearchParams({ period });
+    if (mediaType) search.set("media_type", mediaType);
+    return this.fetchApi<{
+      bank_id: string;
+      period: string;
+      trunc: "hour" | "day";
+      buckets: ActivityBucket[];
+    }>(`${knowledgeApi(bankId, "stats", "timeseries")}?${search}`, {
+      cache: "no-store" as RequestCache,
     });
   }
 

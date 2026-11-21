@@ -378,7 +378,7 @@ def _rewrite_upsert_to_merge(query: str) -> str | None:
     return merge_query
 
 
-def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
+def _rewrite_pg_to_oracle(query: str, *, supports_for_update_row_limit: bool = False) -> RewriteResult:
     """Rewrite PostgreSQL-style SQL to Oracle-compatible SQL.
 
     Returns (rewritten_query, ignore_dup, returning_cols).
@@ -562,26 +562,42 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # LIMIT/OFFSET rewriting: PG uses "LIMIT N OFFSET M" or "LIMIT N" or "OFFSET M LIMIT N"
     # Oracle uses "OFFSET M ROWS FETCH FIRST N ROWS ONLY" (OFFSET before FETCH FIRST)
     #
-    # IMPORTANT: Oracle does NOT allow FETCH FIRST with FOR UPDATE (ORA-02014 — treats
-    # the row-limiting clause as an inline view). When FOR UPDATE is present, we must use
-    # ROWNUM in the WHERE clause instead. This is safe because FOR UPDATE + LIMIT queries
-    # in the poller are simple single-table SELECTs with no OFFSET.
+    # Before RU 23.26.4, FETCH FIRST with FOR UPDATE raises ORA-02014. Preserve
+    # the ROWNUM workaround for those servers. Newer servers can limit the ordered
+    # claim after skipping locked rows, avoiding partial batches and the old
+    # pre-ORDER BY ROWNUM selection. OFFSET remains unsupported with FOR UPDATE.
     has_for_update = bool(re.search(r"\bFOR\s+UPDATE\b", query, re.IGNORECASE))
 
     if has_for_update:
-        # FOR UPDATE path: use ROWNUM instead of FETCH FIRST.
-        # Extract and remove LIMIT clause, inject ROWNUM into WHERE.
+        # Extract LIMIT before moving it ahead of FOR UPDATE or applying the
+        # legacy ROWNUM predicate. PostgreSQL allows LIMIT on either side.
         limit_val = None
         limit_match = re.search(r"\bLIMIT\s+(\d+|:\w+)\b", query, re.IGNORECASE)
         if limit_match:
             limit_val = limit_match.group(1)
             query = re.sub(r"\bLIMIT\s+(\d+|:\w+)\b", "", query, flags=re.IGNORECASE)
 
-        # Remove OFFSET if present (not expected with FOR UPDATE, but be safe)
+        has_offset = bool(re.search(r"\bOFFSET\b", query, re.IGNORECASE))
+        use_native_limit = (
+            supports_for_update_row_limit
+            and not has_offset
+            and bool(re.match(r"\s*SELECT\b", query, re.IGNORECASE))
+            and not re.search(r"\b(?:DISTINCT|GROUP\s+BY|HAVING|UNION|INTERSECT|MINUS)\b", query, re.IGNORECASE)
+            and not _VECTOR_DISTANCE_CALL_RE.search(query)
+        )
+
+        # Preserve the legacy OFFSET handling (claim queries never use OFFSET).
         query = re.sub(r"\bOFFSET\s+(\d+|:\w+)\b(?!\s+ROWS)", "", query, flags=re.IGNORECASE)
 
-        # Inject ROWNUM constraint into WHERE clause
-        if limit_val is not None:
+        if limit_val is not None and use_native_limit:
+            query = re.sub(
+                r"\bFOR\s+UPDATE\b",
+                f"FETCH FIRST {limit_val} ROWS ONLY FOR UPDATE",
+                query,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        elif limit_val is not None:
             # Insert ROWNUM <= N right after WHERE
             query = re.sub(
                 r"\bWHERE\b",
@@ -652,6 +668,19 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
 
     query = re.sub(r"(\w+(?:\.\w+)?)\s*&&\s*(:\w+)", _rewrite_array_overlap, query)
 
+    # PG array contained-by: tags <@ :N → Oracle: no element of col is missing from param.
+    # The exact tag match emits it as `tags @> :N AND tags <@ :N` (#6585).
+    def _rewrite_array_contained_by(m):
+        col = m.group(1)
+        param = m.group(2)
+        return (
+            f"NOT EXISTS (SELECT 1 FROM JSON_TABLE({col}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) c "
+            f"WHERE NOT EXISTS (SELECT 1 FROM JSON_TABLE({param}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) p "
+            f"WHERE p.val = c.val))"
+        )
+
+    query = re.sub(r"(\w+(?:\.\w+)?)\s*<@\s*(:\w+)", _rewrite_array_contained_by, query)
+
     # PG array containment: tags @> :N → Oracle: all elements from param exist in col
     # (Override the JSONB contains regex which doesn't work for array containment)
     # Already handled by _JSONB_CONTAINS_RE above, but that generates wrong SQL for arrays.
@@ -671,18 +700,6 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
         _rewrite_array_contains,
         query,
     )
-
-    # PG array contained-by: tags <@ :N → Oracle: every element of col exists in param
-    def _rewrite_array_contained_by(m):
-        col = m.group(1)
-        param = m.group(2)
-        return (
-            f"(SELECT COUNT(*) FROM JSON_TABLE({col}, '$[*]' COLUMNS (val VARCHAR2(256) PATH '$')) jt "
-            f"WHERE JSON_EXISTS({param}, '$[*]?(@ == $v)' PASSING jt.val AS \"v\")) = "
-            f"JSON_VALUE({col}, '$.size()' RETURNING NUMBER)"
-        )
-
-    query = re.sub(r"(\w+(?:\.\w+)?)\s*<@\s*(:\w+)", _rewrite_array_contained_by, query)
 
     # ILIKE → UPPER(...) LIKE UPPER(...)
     query = re.sub(
@@ -835,7 +852,7 @@ class OracleConnection(DatabaseConnection):
     to Oracle syntax so that existing consumer code works without modification.
     """
 
-    __slots__ = ("_conn",)
+    __slots__ = ("_conn", "_supports_for_update_row_limit")
 
     @property
     def backend_type(self) -> str:
@@ -844,6 +861,14 @@ class OracleConnection(DatabaseConnection):
     def __init__(self, conn: Any) -> None:
         super().__init__()
         self._conn = conn
+        # Thin-mode connection.version includes the RU (e.g. 23.26.4.1.0).
+        # Unknown/incomplete versions keep the old syntax rather than assuming
+        # support from the marketed "26ai" name, which also covers earlier RUs.
+        version = getattr(conn, "version", None)
+        version_match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\.\d+)*", version) if isinstance(version, str) else None
+        self._supports_for_update_row_limit = bool(
+            version_match and tuple(int(part) for part in version_match.groups()) >= (23, 26, 4)
+        )
 
     def _commit_is_ahead(self) -> bool:
         # oracledb runs every statement in a transaction the backend commits when
@@ -1053,11 +1078,15 @@ class OracleConnection(DatabaseConnection):
         if params is None or "/*" not in query:
             return query, params
 
-        expand_re = re.compile(r"/\*EXPAND:(\d+)\*/")
+        expand_re = re.compile(r"(?:(\w+(?:\.\w+)?)\s+(NOT\s+)?IN\s*\(\s*)?/\*EXPAND:(\d+)\*/(\s*\))?", re.IGNORECASE)
         keys_to_remove: set[str] = set()
 
         def _replace(m):
-            param_key = m.group(1)
+            col = m.group(1)
+            not_kw = m.group(2)
+            param_key = m.group(3)
+            close_paren = m.group(4) or ""
+            head = f"{col} {'NOT ' if not_kw else ''}IN (" if col else ""
             val = params.get(param_key)
             # Handle JSON string lists (from _convert_arg serialization)
             if isinstance(val, str):
@@ -1074,11 +1103,11 @@ class OracleConnection(DatabaseConnection):
                                 converted.append(item)
                         val = converted
                 except (json.JSONDecodeError, TypeError):
-                    return f":{param_key}"
+                    return f"{head}:{param_key}{close_paren}"
             if val is None or not isinstance(val, (list, tuple)):
-                return f":{param_key}"
+                return f"{head}:{param_key}{close_paren}"
             if len(val) == 0:
-                return "NULL"
+                return f"{head}NULL{close_paren}"
             OracleConnection._expand_counter += 1
             prefix = f"any{OracleConnection._expand_counter}"
             expanded_keys = []
@@ -1087,7 +1116,16 @@ class OracleConnection(DatabaseConnection):
                 params[k] = item
                 expanded_keys.append(f":{k}")
             keys_to_remove.add(param_key)
-            return ", ".join(expanded_keys)
+            # Oracle caps a scalar IN (...) list at 1000 expressions (ORA-01795).
+            if col and close_paren and len(expanded_keys) > 1000:
+                op = f"{col} NOT IN" if not_kw else f"{col} IN"
+                joiner = " AND " if not_kw else " OR "
+                chunks = [
+                    f"{op} ({', '.join(expanded_keys[start : start + 1000])})"
+                    for start in range(0, len(expanded_keys), 1000)
+                ]
+                return f"({joiner.join(chunks)})"
+            return f"{head}{', '.join(expanded_keys)}{close_paren}"
 
         query = expand_re.sub(_replace, query)
 
@@ -1254,7 +1292,9 @@ class OracleConnection(DatabaseConnection):
         if query.lstrip().upper().startswith("SET LOCAL "):
             return "SET"
         orig_query = query
-        query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(query)
+        query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
+        )
         cursor = self._conn.cursor()
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
@@ -1294,7 +1334,9 @@ class OracleConnection(DatabaseConnection):
             cursor.close()
 
     async def executemany(self, query: str, args: list[tuple[Any, ...]], *, timeout: float | None = None) -> None:
-        query, ignore_dup, _ = _rewrite_pg_to_oracle(query)
+        query, ignore_dup, _ = _rewrite_pg_to_oracle(
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
+        )
         converted = _convert_args_list(args)
         # Batch writes carry the same str() embeddings as single writes (e.g.
         # insert_facts_batch), so they need the same native VECTOR binding.
@@ -1354,7 +1396,9 @@ class OracleConnection(DatabaseConnection):
         """
         if not args:
             return
-        query, ignore_dup, _ = _rewrite_pg_to_oracle(query)
+        query, ignore_dup, _ = _rewrite_pg_to_oracle(
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
+        )
         converted = _convert_args_list(args)
         converted_dicts = [{str(i + 1): v for i, v in enumerate(row)} for row in converted]
         oracledb = _import_oracledb()
@@ -1417,7 +1461,9 @@ class OracleConnection(DatabaseConnection):
         return f"INSERT 0 {n_rows}"
 
     async def fetch(self, query: str, *args: Any, timeout: float | None = None) -> list[ResultRow]:
-        query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(query)
+        query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
+        )
         cursor = self._conn.cursor()
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
@@ -1462,7 +1508,9 @@ class OracleConnection(DatabaseConnection):
             cursor.close()
 
     async def fetchrow(self, query: str, *args: Any, timeout: float | None = None) -> ResultRow | None:
-        query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(query)
+        query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
+        )
         cursor = self._conn.cursor()
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
@@ -1507,7 +1555,9 @@ class OracleConnection(DatabaseConnection):
             cursor.close()
 
     async def fetchval(self, query: str, *args: Any, column: int = 0, timeout: float | None = None) -> Any:
-        query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(query)
+        query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
+        )
         cursor = self._conn.cursor()
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
@@ -1609,8 +1659,16 @@ class OracleBackend(DatabaseBackend):
         if effective_schema is None and cfg.migration_database_url:
             dsn_raw = _oracle_connect_params(dsn).get("user") or ""
             mig_raw = _oracle_connect_params(cfg.migration_database_url).get("user") or ""
-            dsn_user = dsn_raw[1:-1] if len(dsn_raw) >= 2 and dsn_raw.startswith('"') and dsn_raw.endswith('"') else dsn_raw.upper()
-            mig_user = mig_raw[1:-1] if len(mig_raw) >= 2 and mig_raw.startswith('"') and mig_raw.endswith('"') else mig_raw.upper()
+            dsn_user = (
+                dsn_raw[1:-1]
+                if len(dsn_raw) >= 2 and dsn_raw.startswith('"') and dsn_raw.endswith('"')
+                else dsn_raw.upper()
+            )
+            mig_user = (
+                mig_raw[1:-1]
+                if len(mig_raw) >= 2 and mig_raw.startswith('"') and mig_raw.endswith('"')
+                else mig_raw.upper()
+            )
             if dsn_user and mig_user and dsn_user != mig_user:
                 raise ValueError(
                     "HINDSIGHT_API_DATABASE_SCHEMA must be set explicitly on Oracle when "

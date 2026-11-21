@@ -212,6 +212,11 @@ ENV_LLM_STRUCTURED_OUTPUT_IN_PROMPT = "HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_IN_PR
 # identify — and the off switch for an endpoint that rejects images despite its
 # model name.
 ENV_LLM_VISION = "HINDSIGHT_API_LLM_VISION"
+# Whether the LiteLLM-backed providers (``litellm``, ``litellmrouter``, ``bedrock``) mark the
+# prompt for the provider's prompt cache and keep one reply shape across a tool conversation.
+# Tri-state like ENV_LLM_VISION: unset turns it on for a model named "claude"; true/false
+# overrides that, e.g. true for a Bedrock application inference profile ARN of a Claude model.
+ENV_LLM_LITELLM_PROMPT_CACHE = "HINDSIGHT_API_LLM_LITELLM_PROMPT_CACHE"
 # Whether the backend honours OpenAI's ``response_format={"type": "json_object"}``.
 # Tri-state like ENV_LLM_VISION: unset lets the provider decide (LM Studio, Ollama,
 # Volcano and z.ai say no; llama.cpp follows HINDSIGHT_API_LLAMACPP_NO_GRAMMAR; the
@@ -219,6 +224,31 @@ ENV_LLM_VISION = "HINDSIGHT_API_LLM_VISION"
 # for ``provider=openai`` pointed at a local server that can't constrain output and
 # instead rewrites the prompt in ways a thinking model can loop on (issue #4935).
 ENV_LLM_OPENAI_COMPATIBLE_JSON_MODE = "HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE"
+# On that soft path, ask the backend to enforce the response schema itself
+# (``response_format={"type": "json_schema", ..., "strict": false}``) instead of
+# ``json_object``, which only promises some JSON object. For a backend that
+# grammar-constrains any schema (vLLM, llama.cpp). Gemma 4 on vLLM is why: under
+# json_object, long nested replies (mental-model delta ops, consolidation) closed
+# the list early and repeated keys until the token cap (6 of 663 delta-ops replays);
+# enforced, 1 of 663, and 0 of 190 consolidation replays. The schema stays in the prompt: a grammar
+# forces only the required fields, and without the text Gemma never wrote the
+# optional ones it was not told about (retain's event dates on 0 of 390 facts, 252
+# of 402 with it). An earlier version left the text out, after retain went empty
+# with it; that was the whitespace below, not the text. Not the strict path: that
+# sends a rewritten schema (every field required, no defaults), which did worse.
+ENV_LLM_OPENAI_COMPATIBLE_ENFORCE_SCHEMA = "HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_ENFORCE_SCHEMA"
+# HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE for retain's fact extraction only,
+# falling back to the global value. Retain is the one answer that may legally be
+# empty, and under any decoding constraint -- json_object or the enforced schema --
+# Gemma 4 on vLLM took that exit on content full of facts: 17 to 39 of 120 hard
+# replays came back {"facts": []}. The cause is vLLM's
+# --structured-outputs-config.disable_any_whitespace: Gemma writes JSON across
+# lines, and the newline it wants right after '"facts": [' (probability ~1) is not
+# allowed, so ']' wins. Allowing whitespace fixed retain (0 of 120) but let a delta-ops
+# reply loop on newlines to the token cap (1 of 663), the loop that flag exists to stop,
+# so retain decodes unconstrained instead: 126/126 over three eval runs with
+# ENFORCE_SCHEMA on for everything else. Consolidation and refresh need no such switch.
+ENV_RETAIN_LLM_OPENAI_COMPATIBLE_JSON_MODE = "HINDSIGHT_API_RETAIN_LLM_OPENAI_COMPATIBLE_JSON_MODE"
 ENV_LLM_SEND_BANK_AS_USER = "HINDSIGHT_API_LLM_SEND_BANK_AS_USER"
 ENV_LLM_OLLAMA_NUM_CTX = "HINDSIGHT_API_LLM_OLLAMA_NUM_CTX"
 
@@ -549,6 +579,9 @@ ENV_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
 # variable, so either side can switch provider (local on one side, remote on the other).
 EMBEDDINGS_SIDE_QUERY = "QUERY"
 EMBEDDINGS_SIDE_PASSAGE = "PASSAGE"
+# The knowledge banks' text embedder ("text" provider), when it is not the memory banks' own:
+# HINDSIGHT_API_KB_TEXT_EMBEDDINGS_<X> for any HINDSIGHT_API_EMBEDDINGS_<X>.
+EMBEDDINGS_SIDE_KB_TEXT = "KB_TEXT"
 _ENV_EMBEDDINGS_PREFIX = "HINDSIGHT_API_EMBEDDINGS_"
 # Provider-agnostic asymmetric prefixes: applied client-side by every provider that
 # is plain text-in/vector-out (tei, litellm, litellm-sdk, openai-compatible). Providers
@@ -775,6 +808,7 @@ ENV_DECISION_MODEL_BASE_URL = "HINDSIGHT_API_DECISION_MODEL_BASE_URL"
 ENV_DECISION_MODEL_TIMEOUT = "HINDSIGHT_API_DECISION_MODEL_TIMEOUT"
 ENV_DECISION_MODEL_MAX_CONCURRENT = "HINDSIGHT_API_DECISION_MODEL_MAX_CONCURRENT"
 ENV_DECISION_MODEL_MAX_REQUEST_TOKENS = "HINDSIGHT_API_DECISION_MODEL_MAX_REQUEST_TOKENS"
+ENV_DECISION_MODEL_VISION = "HINDSIGHT_API_DECISION_MODEL_VISION"
 ENV_DECISION_MODEL_TOKENIZER = "HINDSIGHT_API_DECISION_MODEL_TOKENIZER"
 ENV_RECALL_DECISION_MODEL_PRUNE = "HINDSIGHT_API_RECALL_DECISION_MODEL_PRUNE"
 ENV_RECALL_DECISION_MODEL_DEDUP = "HINDSIGHT_API_RECALL_DECISION_MODEL_DEDUP"
@@ -968,6 +1002,50 @@ ENV_FILE_PARSER_IRIS_ORG_ID = "HINDSIGHT_API_FILE_PARSER_IRIS_ORG_ID"
 ENV_FILE_PARSER_LLAMA_PARSE_API_KEY = "HINDSIGHT_API_FILE_PARSER_LLAMA_PARSE_API_KEY"
 ENV_FILE_CONVERSION_MAX_BATCH_SIZE_MB = "HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE_MB"
 ENV_FILE_CONVERSION_MAX_BATCH_SIZE = "HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE"
+# Knowledge banks: multimodal document search (hindsight_api/knowledge/), no LLM anywhere
+ENV_KB_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_KB_EMBEDDINGS_PROVIDER"
+ENV_KB_EMBEDDINGS_MODEL = "HINDSIGHT_API_KB_EMBEDDINGS_MODEL"
+ENV_KB_EMBEDDINGS_API_KEY = "HINDSIGHT_API_KB_EMBEDDINGS_API_KEY"
+ENV_KB_EMBEDDINGS_DIMENSIONS = "HINDSIGHT_API_KB_EMBEDDINGS_DIMENSIONS"
+ENV_KB_EMBEDDINGS_BASE_URL = "HINDSIGHT_API_KB_EMBEDDINGS_BASE_URL"
+ENV_KB_EMBEDDINGS_MODALITIES = "HINDSIGHT_API_KB_EMBEDDINGS_MODALITIES"
+ENV_KB_EMBEDDINGS_DEVICE = "HINDSIGHT_API_KB_EMBEDDINGS_DEVICE"
+ENV_KB_EMBEDDINGS_BATCH_SIZE = "HINDSIGHT_API_KB_EMBEDDINGS_BATCH_SIZE"
+ENV_KB_EMBEDDINGS_MAX_IN_FLIGHT = "HINDSIGHT_API_KB_EMBEDDINGS_MAX_IN_FLIGHT"
+# Knowledge-bank search's reranker: any endpoint speaking Cohere's rerank API ({model, query,
+# documents} in, {results: [{index, relevance_score}]} out). Unset URL: search keeps its own order.
+ENV_KB_RERANKER_URL = "HINDSIGHT_API_KB_RERANKER_URL"
+ENV_KB_RERANKER_API_KEY = "HINDSIGHT_API_KB_RERANKER_API_KEY"
+ENV_KB_RERANKER_MODEL = "HINDSIGHT_API_KB_RERANKER_MODEL"
+ENV_KB_RERANKER_MAX_TOKENS = "HINDSIGHT_API_KB_RERANKER_MAX_TOKENS"
+ENV_KB_RERANKER_TOKENIZER = "HINDSIGHT_API_KB_RERANKER_TOKENIZER"
+ENV_KB_RERANKER_IMAGES = "HINDSIGHT_API_KB_RERANKER_IMAGES"
+ENV_KB_RERANKER_QUERY_IMAGES = "HINDSIGHT_API_KB_RERANKER_QUERY_IMAGES"
+# Media types (document, image, audio, video, text) this server refuses to ingest, comma-separated,
+# whatever its embedder could embed: e.g. "video,audio" to skip the cost of decoding clips.
+ENV_KB_DISABLED_MEDIA_TYPES = "HINDSIGHT_API_KB_DISABLED_MEDIA_TYPES"
+ENV_KB_IMAGE_TOKENS = "HINDSIGHT_API_KB_IMAGE_TOKENS"
+ENV_KB_MAX_FILE_MB = "HINDSIGHT_API_KB_MAX_FILE_MB"
+ENV_KB_MAX_FILE_MB_BY_MEDIA_TYPE = "HINDSIGHT_API_KB_MAX_FILE_MB_BY_MEDIA_TYPE"
+ENV_KB_MAX_IMAGE_MEGAPIXELS = "HINDSIGHT_API_KB_MAX_IMAGE_MEGAPIXELS"
+ENV_KB_MAX_MEDIA_SECONDS = "HINDSIGHT_API_KB_MAX_MEDIA_SECONDS"
+ENV_KB_MAX_PDF_PAGES = "HINDSIGHT_API_KB_MAX_PDF_PAGES"
+ENV_KB_AUDIO_WINDOW_SECONDS = "HINDSIGHT_API_KB_AUDIO_WINDOW_SECONDS"
+ENV_KB_VIDEO_WINDOW_SECONDS = "HINDSIGHT_API_KB_VIDEO_WINDOW_SECONDS"
+ENV_KB_MEDIA_OVERLAP_SECONDS = "HINDSIGHT_API_KB_MEDIA_OVERLAP_SECONDS"
+ENV_KB_PDF_PAGE_PIXELS = "HINDSIGHT_API_KB_PDF_PAGE_PIXELS"
+ENV_KB_PDF_TEXT_WEIGHT = "HINDSIGHT_API_KB_PDF_TEXT_WEIGHT"
+ENV_KB_PDF_BANDS = "HINDSIGHT_API_KB_PDF_BANDS"
+ENV_KB_KEYWORD_WEIGHT = "HINDSIGHT_API_KB_KEYWORD_WEIGHT"
+ENV_KB_TEXT_PASSAGE_TOKENS = "HINDSIGHT_API_KB_TEXT_PASSAGE_TOKENS"
+ENV_KB_INGEST_CHILD_BYTES = "HINDSIGHT_API_KB_INGEST_CHILD_BYTES"
+ENV_KB_INGEST_MEMORY_BUDGET_MB = "HINDSIGHT_API_KB_INGEST_MEMORY_BUDGET_MB"
+ENV_KB_STORE_EXTENSION = "HINDSIGHT_API_KB_STORE_EXTENSION"
+# Knowledge-bank ingestion strategies (knowledge/ingest_strategy.py): named mappings of file types to
+# the extension that pre-processes them (JSON, {name: {file_type: {"extension": "module:Class",
+# "settings": {...}}}}), and the one an ingest uses unless its item names another. Server-wide only.
+ENV_KB_INGEST_STRATEGIES = "HINDSIGHT_API_KB_INGEST_STRATEGIES"
+ENV_KB_INGEST_DEFAULT_STRATEGY = "HINDSIGHT_API_KB_INGEST_DEFAULT_STRATEGY"
 ENV_ENABLE_FILE_UPLOAD_API = "HINDSIGHT_API_ENABLE_FILE_UPLOAD_API"
 ENV_FILE_DELETE_AFTER_RETAIN = "HINDSIGHT_API_FILE_DELETE_AFTER_RETAIN"
 ENV_STORE_DOCUMENT_TEXT = "HINDSIGHT_API_STORE_DOCUMENT_TEXT"
@@ -976,6 +1054,7 @@ ENV_DEFAULT_TIMEZONE = "HINDSIGHT_API_DEFAULT_TIMEZONE"
 # Document transfer (export/import documents between banks without re-running the LLM)
 ENV_ENABLE_DOCUMENT_EXPORT_API = "HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API"
 ENV_ENABLE_DOCUMENT_IMPORT_API = "HINDSIGHT_API_ENABLE_DOCUMENT_IMPORT_API"
+ENV_ENABLE_KB = "HINDSIGHT_API_ENABLE_KB"
 
 # Observations settings (consolidated knowledge from facts)
 ENV_ENABLE_OBSERVATIONS = "HINDSIGHT_API_ENABLE_OBSERVATIONS"
@@ -1095,6 +1174,7 @@ WORKER_SLOT_TYPE_DEFAULTS: dict[str, int] = {
     "import_bank": 0,
     "export_bank": 0,
     "clone_bank": 0,
+    "knowledge_ingest": 0,
 }
 
 
@@ -1151,6 +1231,11 @@ ENV_REFLECT_WALL_TIMEOUT = "HINDSIGHT_API_REFLECT_WALL_TIMEOUT"
 ENV_REFLECT_MISSION = "HINDSIGHT_API_REFLECT_MISSION"
 ENV_REFLECT_SOURCE_FACTS_MAX_TOKENS = "HINDSIGHT_API_REFLECT_SOURCE_FACTS_MAX_TOKENS"
 ENV_REFLECT_MAX_COMPLETION_TOKENS = "HINDSIGHT_API_REFLECT_MAX_COMPLETION_TOKENS"
+ENV_REFLECT_KB_SEARCH_MEDIA_TYPES = "HINDSIGHT_API_REFLECT_KB_SEARCH_MEDIA_TYPES"
+ENV_REFLECT_KB_SEARCH_IMAGES = "HINDSIGHT_API_REFLECT_KB_SEARCH_IMAGES"
+ENV_REFLECT_KB_SEARCH_MAX_IMAGES = "HINDSIGHT_API_REFLECT_KB_SEARCH_MAX_IMAGES"
+ENV_REFLECT_KB_SEARCH_APPLY_TAGS = "HINDSIGHT_API_REFLECT_KB_SEARCH_APPLY_TAGS"
+ENV_REFLECT_KB_SEARCH_BUDGET = "HINDSIGHT_API_REFLECT_KB_SEARCH_BUDGET"
 ENV_RECALL_INCLUDE_CHUNKS = "HINDSIGHT_API_RECALL_INCLUDE_CHUNKS"
 ENV_RECALL_PREFER_OBSERVATIONS = "HINDSIGHT_API_RECALL_PREFER_OBSERVATIONS"
 ENV_RECALL_MAX_TOKENS = "HINDSIGHT_API_RECALL_MAX_TOKENS"
@@ -1241,14 +1326,14 @@ DEFAULT_LLM_PROVIDER = "openai"
 
 # Provider-specific default models
 PROVIDER_DEFAULT_MODELS = {
-    "openai": "gpt-4o-mini",
+    "openai": "gpt-5-nano",
     "openai-responses": "gpt-5.6",
-    "anthropic": "claude-haiku-4-5",
-    "gemini": "gemini-3.5-flash",
+    "anthropic": "claude-haiku-5-5",
+    "gemini": "gemini-3.8-flash",
     "groq": "openai/gpt-oss-120b",
     "minimax": "MiniMax-M3",
     "deepseek": "deepseek-v4-flash",
-    "zai": "glm-4.5-flash",
+    "zai": "glm-5.3-flash",
     "opencode-go": "deepseek-v4-flash",
     "atlas": "deepseek-ai/deepseek-v4-pro",
     "meta": "muse-spark-1.3",
@@ -1259,21 +1344,21 @@ PROVIDER_DEFAULT_MODELS = {
     "vertexai": "google/gemini-3.1-flash-lite",
     "openai-codex": "gpt-5.6-luna",
     "chatgpt": "gpt-6-luna",
-    "claude-code": "claude-sonnet-4-5-20250929",
+    "claude-code": "claude-sonnet-5-5",
     "cursor": "auto",
     "github-copilot": "gpt-5.6-terra",
     "mock": "mock-model",
     "none": "none",
-    "litellm": "gpt-4o-mini",
+    "litellm": "gpt-5-nano",
     "bedrock": "us.amazon.nova-2-lite-v1:0",
     "volcano": "doubao-pro-32k",
     "openrouter": "qwen/qwen3.5-9b",
-    "requesty": "openai/gpt-4o-mini",
-    "fireworks": "accounts/fireworks/models/llama-v3p1-8b-instruct",
+    "requesty": "openai/gpt-5-nano",
+    "fireworks": "accounts/fireworks/models/deepseek-v4-flash",
     "nous": "deepseek/deepseek-v4-flash",
     "xai-oauth": "grok-4.5",
 }
-DEFAULT_LLM_MODEL = "gpt-4o-mini"  # Fallback if provider not in table
+DEFAULT_LLM_MODEL = "gpt-5-nano"  # Fallback if provider not in table
 # Built-in llama.cpp defaults
 DEFAULT_LLAMACPP_GPU_LAYERS = -1  # -1 = offload all layers to GPU (Metal/CUDA)
 DEFAULT_LLAMACPP_CONTEXT_SIZE = 8192
@@ -1431,7 +1516,7 @@ DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 4  # Limit concurrent CPU-bound rerankin
 DEFAULT_RERANKER_LOCAL_TRUST_REMOTE_CODE = (
     False  # Security: disabled by default, required for some models like jina-reranker-v2
 )
-DEFAULT_RERANKER_LOCAL_FP16 = False  # FP16 inference: opt-in, faster on CUDA (not CPU)
+DEFAULT_RERANKER_LOCAL_FP16 = False  # FP16 inference: opt-in; faster on CUDA, halves memory on CPU
 DEFAULT_RERANKER_LOCAL_BUCKET_BATCHING = False  # Length-sorted bucket batching: opt-in, 36-54% speedup
 DEFAULT_RERANKER_LOCAL_BATCH_SIZE = 32  # Batch size for local reranker predict() calls
 # Wall-clock ceiling for scoring ONE recall's candidates on an in-process model.
@@ -1507,6 +1592,53 @@ RECALL_STRATEGY_NAMES = ("semantic", "bm25", "graph", "temporal")
 RECALL_BOOST_LEVELS = ("low", "medium", "high")
 # Level applied when a strategy is listed without one (e.g. "graph" or "graph:").
 DEFAULT_RECALL_BOOST_LEVEL = "medium"
+
+
+_KB_MEDIA_TYPES = ("document", "image", "audio", "video", "text")
+
+
+def _parse_kb_media_types(raw: str | None, env: str = ENV_KB_DISABLED_MEDIA_TYPES) -> frozenset[str]:
+    names = frozenset(n.strip().lower() for n in (raw or "").split(",") if n.strip())
+    unknown = names - set(_KB_MEDIA_TYPES)
+    if unknown:
+        raise ValueError(
+            f"{env}: unknown media types {', '.join(sorted(unknown))} (expected some of {', '.join(_KB_MEDIA_TYPES)})"
+        )
+    return names
+
+
+def _parse_kb_size_limits(raw: str | None) -> dict[str, int]:
+    """HINDSIGHT_API_KB_MAX_FILE_MB_BY_MEDIA_TYPE: ``video=2000,image=50`` -> {"video": 2000, "image": 50}."""
+    limits: dict[str, int] = {}
+    for part in (raw or "").split(","):
+        if not part.strip():
+            continue
+        name, _, value = part.partition("=")
+        name = name.strip().lower()
+        if name not in _KB_MEDIA_TYPES or not value.strip().isdigit() or int(value) < 1:
+            raise ValueError(
+                f"{ENV_KB_MAX_FILE_MB_BY_MEDIA_TYPE}: expected <media type>=<MB> pairs with media types among "
+                f"{', '.join(_KB_MEDIA_TYPES)}, got {part.strip()!r}"
+            )
+        limits[name] = int(value)
+    return limits
+
+
+def _parse_reflect_kb_search_budget(raw: str | None) -> str:
+    budget = (raw or DEFAULT_REFLECT_KB_SEARCH_BUDGET).strip().lower()
+    if budget not in ("low", "mid", "high"):
+        raise ValueError(f"{ENV_REFLECT_KB_SEARCH_BUDGET}: expected low, mid or high, got {raw!r}")
+    return budget
+
+
+def _parse_ingest_strategies(raw: str | None) -> dict | None:
+    """HINDSIGHT_API_KB_INGEST_STRATEGIES: a JSON object of strategy name -> its file-type mapping (an object)."""
+    if not raw:
+        return None
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict) or not all(isinstance(v, dict) for v in parsed.values()):
+        raise ValueError(f"{ENV_KB_INGEST_STRATEGIES} must be a JSON object of strategy name -> file-type mapping")
+    return parsed
 
 
 def _parse_strategy_boosts(raw: str | None) -> dict[str, str]:
@@ -1674,6 +1806,9 @@ DEFAULT_DECISION_MODEL_MAX_CONCURRENT = 24
 # typesafe) the gap is smaller, and the margin is headroom for that estimate's error. A request has to hold the state and at least one question,
 # hence the floor.
 DEFAULT_DECISION_MODEL_MAX_REQUEST_TOKENS = 26_000
+# Off: images on System One are a preview ("TypeSafe-Danger-Zone-Images"), and an endpoint or
+# model that does not take them would fail every request that carries one.
+DEFAULT_DECISION_MODEL_VISION = False
 MIN_DECISION_MODEL_MAX_REQUEST_TOKENS = 1_000
 # Off by default: dropping candidates changes what recall returns, so it is opt-in.
 DEFAULT_RECALL_DECISION_MODEL_PRUNE = False
@@ -1971,6 +2106,63 @@ DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT = """You are a precise OCR transcripti
 Transcribe only the visible text in the image. Do not describe the image, summarize it, translate it, infer missing content, or add commentary. Preserve the original language, wording, numbers, punctuation, capitalization, and reading order. Reconstruct headings, lists, key-value fields, stamps, and tables as clean Markdown when the layout is clear. If text is unreadable or uncertain, write [unclear] for that span. Return only the extracted Markdown."""
 DEFAULT_FILE_CONVERSION_MAX_BATCH_SIZE_MB = 100  # Max total batch size in MB (all files combined)
 DEFAULT_FILE_CONVERSION_MAX_BATCH_SIZE = 10  # Max files per batch upload
+# Knowledge banks: one embedder per server, its modalities deciding which media types can be ingested
+# (knowledge/embedders.py). Multimodal: "local" (EmbeddingGemma 2 in-process), "gemini" / "vertex"
+# (Gemini Embedding 2), "voyage" (text, image, video), "cohere" (text, image), "openai" (any compatible
+# server). Text only: "text", any memory-bank embeddings provider (see EMBEDDINGS_SIDE_KB_TEXT).
+DEFAULT_KB_EMBEDDINGS_PROVIDER = "local"
+DEFAULT_KB_EMBEDDINGS_LOCAL_MODEL = "google/embeddinggemma-2"
+DEFAULT_KB_EMBEDDINGS_GEMINI_MODEL = "gemini-embedding-2"
+DEFAULT_KB_EMBEDDINGS_VOYAGE_MODEL = "voyage-multimodal-3.5"
+DEFAULT_KB_EMBEDDINGS_COHERE_MODEL = "embed-v4.0"
+DEFAULT_KB_EMBEDDINGS_BATCH_SIZE = 32  # 8 left a GPU embedder idle between requests; 64 ran fine on dev
+# Requests to a remote knowledge embedder in flight at once from this process, across every ingest
+# batch and search. Each batch already caps its own, but a worker runs many batches, and their sum is
+# what the embedder (and any proxy in front of it) sees: past what it takes, it answers 429 and the
+# requests only come back later. 0 removes the cap.
+DEFAULT_KB_EMBEDDINGS_MAX_IN_FLIGHT = 16
+# Tokens of hits one knowledge rerank request holds on a mid or high budget (a low one holds at most
+# DEFAULT_KB_RERANKER_LOW_TOKENS). The hits go in search order while they fit, so this is how deep the
+# rerank goes. On ViDoRe V3 with a listwise decision-model reranker and a 262k-token window, 120k beat
+# 60k and 200k (markdown hr nDCG@10 72.55 / 73.12 / 72.75) and two requests of 120k (72.61). A reranker
+# with a smaller window splits what it is sent, or refuses it: lower this to its window.
+DEFAULT_KB_RERANKER_MAX_TOKENS = 120_000
+DEFAULT_KB_RERANKER_LOW_TOKENS = 26_000
+DEFAULT_KB_IMAGE_TOKENS = 280  # EmbeddingGemma 2 vision token budget per image (70..1120)
+DEFAULT_KB_MAX_FILE_MB = 500
+# Pillow's own refusal threshold (2 x its 89 MP decompression-bomb warning): a 5 MB PNG can be 30000 x 30000
+# pixels, and decoding it is memory by pixels (3-4 bytes each, twice over while converting), not by file size.
+DEFAULT_KB_MAX_IMAGE_MEGAPIXELS = 178
+DEFAULT_KB_MAX_MEDIA_SECONDS = 7200  # 2h of audio/video per file
+DEFAULT_KB_MAX_PDF_PAGES = 2000
+DEFAULT_KB_AUDIO_WINDOW_SECONDS = 60
+DEFAULT_KB_VIDEO_WINDOW_SECONDS = 30
+DEFAULT_KB_MEDIA_OVERLAP_SECONDS = 5
+DEFAULT_KB_PDF_PAGE_PIXELS = 1536  # Longest side of a rendered PDF page
+# A PDF page's score = (1 - w) * image score + w * best text score (its chunks, sentences, page text).
+# 0.6 was best on ViDoRe V3 before sentence vectors (PDF_GEMMA.md). With them, ViDoRe hr peaks at 0.7-0.8 on
+# both EmbeddingGemma 2 and Gemini Embedding 2 and is flat over 0.6-0.8: one value that holds across models.
+DEFAULT_KB_PDF_TEXT_WEIGHT = 0.7
+# Three sharper horizontal band crops per PDF page as extra vectors: +0.4 nDCG@10 for half the ingest speed.
+DEFAULT_KB_PDF_BANDS = False
+# Keyword match weight, fused for every query with a word rare enough in the bank (PDF_GEMMA.md: 0.2 best).
+DEFAULT_KB_KEYWORD_WEIGHT = 0.2
+# Structure-aware passages. 128 was best on LegalBench-RAG at a fixed budget of returned text (CHUNKING.md);
+# 256 beat it on every benchmark launch uses (EmbeddingGemma 2): SciFact 83.7 -> 84.2 nDCG@10,
+# EnterpriseRAG search 66.1 -> 67.6 (recall@10 77.1 -> 81.5), with half the passages. 512 led on
+# SciFact alone (85.6) and lost 3 points on EnterpriseRAG's per-category mean.
+DEFAULT_KB_TEXT_PASSAGE_TOKENS = 256
+# An async knowledge ingest is split into child operations of about this many bytes of stored files,
+# each its own worker task, so one big upload spreads across every free slot. Bytes, because the
+# passage count is only known once a file is split; a file over the budget is a child on its own.
+# A batch's memory is bounded by the budget below, not by its size, so a child can be big: 1 MiB is
+# ~3,000 text passages, or a few PDFs.
+DEFAULT_KB_INGEST_CHILD_BYTES = 1024 * 1024
+# Bytes of cut-but-uncommitted passages (text, files, vectors) one knowledge ingest batch may hold, as
+# RETAIN_MEMORY_BUDGET_MB bounds a retain: at the budget the batch commits what it has and waits. One
+# document is always held whole (its passages are replaced in one write), so a single document over the
+# budget still goes through. Budget for WORKER_MAX_SLOTS concurrent batches. 0 turns it off.
+DEFAULT_KB_INGEST_MEMORY_BUDGET_MB = 128
 DEFAULT_ENABLE_FILE_UPLOAD_API = True  # Enable file upload endpoint
 DEFAULT_FILE_DELETE_AFTER_RETAIN = True  # Delete file bytes after retain (saves storage)
 DEFAULT_STORE_DOCUMENT_TEXT = True  # Persist raw source text in documents.original_text / chunks.chunk_text
@@ -1979,6 +2171,9 @@ DEFAULT_DEFAULT_TIMEZONE = "UTC"  # IANA zone a retain timestamp with no UTC off
 # Document transfer defaults (export/import enabled by default; gated independently)
 DEFAULT_ENABLE_DOCUMENT_EXPORT_API = True
 DEFAULT_ENABLE_DOCUMENT_IMPORT_API = True
+# Knowledge banks ship hidden while they are being built: off, their HTTP routes answer 404, their
+# reflect ignores linked knowledge banks and the UI hides them.
+DEFAULT_ENABLE_KB = False
 
 # Observations defaults (consolidated knowledge from facts)
 DEFAULT_ENABLE_OBSERVATIONS = True  # Observations enabled by default
@@ -2202,6 +2397,17 @@ DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS = -1  # Token budget for source facts in
 # reasoning tokens and would otherwise cut pages off mid-word (#3365). Set an integer
 # only if you want a hard cost ceiling on the synthesis call.
 DEFAULT_REFLECT_MAX_COMPLETION_TOKENS: int | None = None
+# Reflect's search of the knowledge banks a memory bank links (config `knowledge_banks`).
+# The media types it may return; None = all of them.
+DEFAULT_REFLECT_KB_SEARCH_MEDIA_TYPES: list[str] | None = None
+# Show the model the picture behind an image or PDF-page hit, when it can read images.
+DEFAULT_REFLECT_KB_SEARCH_IMAGES = True
+# The most pictures one search hands the model: each costs input tokens.
+DEFAULT_REFLECT_KB_SEARCH_MAX_IMAGES = 4
+# Filter the knowledge search by the reflect's tags, tags_match and tag_groups, as its memories are.
+DEFAULT_REFLECT_KB_SEARCH_APPLY_TAGS = True
+# How deep that search ranks before its token budget picks (the public search's `budget`): low, mid or high.
+DEFAULT_REFLECT_KB_SEARCH_BUDGET = "mid"
 DEFAULT_RECALL_INCLUDE_CHUNKS = True  # Whether internal recall (e.g. mental model refresh) returns raw chunks
 DEFAULT_RECALL_PREFER_OBSERVATIONS = False  # Default for recall prefer_observations when the request omits it
 DEFAULT_RECALL_MAX_TOKENS = 2048  # Token budget for facts returned by internal recall
@@ -3346,6 +3552,8 @@ class DecisionModelConfig:
     #: The vocabulary ``max_request_tokens`` and the reranker's caps are counted in; None
     #: counts with HINDSIGHT_API_TOKENIZER_ENCODING.
     tokenizer: str | None = None
+    #: Whether it is shown pictures (HINDSIGHT_API_DECISION_MODEL_VISION), for every operation.
+    vision: bool = False
 
 
 # Every embeddings variable a side may override, so a misspelt override fails loudly.
@@ -3496,9 +3704,16 @@ class HindsightConfig:
     # Tri-state override for "can this LLM read images?". None defers to the
     # provider's own answer; True/False overrides it. See ENV_LLM_VISION.
     llm_vision: bool | None = field(default=None, kw_only=True)
+    # Tri-state override for "mark the prompt for the cache?" on LiteLLM. None defers to the
+    # model name. See ENV_LLM_LITELLM_PROMPT_CACHE.
+    llm_litellm_prompt_cache: bool | None = field(default=None, kw_only=True)
     # Tri-state override for "does the backend honour json_object?". None defers to
     # the provider's default. See ENV_LLM_OPENAI_COMPATIBLE_JSON_MODE.
     llm_openai_compatible_json_mode: bool | None = field(default=None, kw_only=True)
+    # Enforce the schema instead of json_object on the soft path. See ENV_LLM_OPENAI_COMPATIBLE_ENFORCE_SCHEMA.
+    llm_openai_compatible_enforce_schema: bool = field(default=False, kw_only=True)
+    # Retain's own override of llm_openai_compatible_json_mode. See ENV_RETAIN_LLM_OPENAI_COMPATIBLE_JSON_MODE.
+    retain_llm_openai_compatible_json_mode: bool | None = field(default=None, kw_only=True)
 
     # Per-operation sampling temperature. None means the temperature parameter is
     # omitted from the call (for models that reject explicit temperatures). See
@@ -3879,6 +4094,7 @@ class HindsightConfig:
     default_timezone: str  # IANA zone for retain times that carry no UTC offset
     enable_document_export_api: bool
     enable_document_import_api: bool
+    enable_kb: bool
 
     # Observations settings (consolidated knowledge from facts)
     enable_observations: bool
@@ -4183,6 +4399,9 @@ class HindsightConfig:
     decision_model_max_concurrent: int = DEFAULT_DECISION_MODEL_MAX_CONCURRENT
     # None: the provider's default (DecisionModelConfig.max_request_tokens holds the resolved value).
     decision_model_max_request_tokens: int | None = None
+    #: Whether the decision model is shown pictures (reflect's knowledge-bank pictures, when it
+    #: asks "is this enough?"). Server-wide, for the System One providers only.
+    decision_model_vision: bool = DEFAULT_DECISION_MODEL_VISION
     decision_model_tokenizer: str | None = None
     recall_decision_model_provider: str | None = None
     recall_decision_model_api_key: str | None = None
@@ -4203,6 +4422,61 @@ class HindsightConfig:
     consolidation_decision_model_api_key: str | None = None
     consolidation_decision_model_model: str | None = None
     consolidation_decision_model_base_url: str | None = None
+    # Knowledge banks (static, server-level: one embedding space per server)
+    kb_embeddings_provider: str = DEFAULT_KB_EMBEDDINGS_PROVIDER
+    kb_embeddings_model: str | None = None  # None: the provider's default
+    kb_embeddings_api_key: str | None = None
+    kb_embeddings_dimensions: int | None = None  # None: the model's native size
+    kb_embeddings_base_url: str | None = None  # openai provider: the server's /v1 URL
+    kb_embeddings_modalities: str = "text,image"  # openai provider: what the remote model embeds
+    kb_embeddings_device: str | None = None  # None: auto (cuda, mps, cpu)
+    kb_embeddings_batch_size: int = DEFAULT_KB_EMBEDDINGS_BATCH_SIZE
+    kb_embeddings_max_in_flight: int = DEFAULT_KB_EMBEDDINGS_MAX_IN_FLIGHT
+    kb_reranker_url: str | None = None
+    kb_reranker_api_key: str | None = None
+    kb_reranker_model: str | None = None
+    kb_reranker_max_tokens: int = DEFAULT_KB_RERANKER_MAX_TOKENS
+    # The encoding the reranker counts its window in; None: HINDSIGHT_API_TOKENIZER_ENCODING.
+    kb_reranker_tokenizer: str | None = None
+    # Send image and PDF page hits as pictures (with their text); off: by their text only, for a
+    # reranker that reads no images.
+    kb_reranker_images: bool = True
+    # Also send the picture of a search by an image as the rerank query (an image object, not a string);
+    # needs kb_reranker_images. Off: the query goes as its text, and a search with no text is not reranked.
+    kb_reranker_query_images: bool = False
+    kb_disabled_media_types: frozenset[str] = frozenset()
+    #: The "text" knowledge provider's own embeddings config (HINDSIGHT_API_KB_TEXT_EMBEDDINGS_*),
+    #: or None to use the memory banks' embedder.
+    kb_text_embeddings: "HindsightConfig | None" = None
+    kb_image_tokens: int = DEFAULT_KB_IMAGE_TOKENS
+    kb_max_file_mb: int = DEFAULT_KB_MAX_FILE_MB
+    #: Per media type, in place of kb_max_file_mb (server-only, like it: a bank cannot raise either).
+    kb_max_file_mb_by_media_type: dict[str, int] = field(default_factory=dict)
+    kb_max_image_megapixels: int = DEFAULT_KB_MAX_IMAGE_MEGAPIXELS
+    kb_max_media_seconds: int = DEFAULT_KB_MAX_MEDIA_SECONDS
+    kb_max_pdf_pages: int = DEFAULT_KB_MAX_PDF_PAGES
+    kb_audio_window_seconds: int = DEFAULT_KB_AUDIO_WINDOW_SECONDS
+    kb_video_window_seconds: int = DEFAULT_KB_VIDEO_WINDOW_SECONDS
+    kb_media_overlap_seconds: int = DEFAULT_KB_MEDIA_OVERLAP_SECONDS
+    kb_pdf_page_pixels: int = DEFAULT_KB_PDF_PAGE_PIXELS
+    kb_pdf_text_weight: float = DEFAULT_KB_PDF_TEXT_WEIGHT
+    kb_pdf_bands: bool = DEFAULT_KB_PDF_BANDS
+    kb_keyword_weight: float = DEFAULT_KB_KEYWORD_WEIGHT
+    kb_text_passage_tokens: int = DEFAULT_KB_TEXT_PASSAGE_TOKENS
+    kb_ingest_child_bytes: int = DEFAULT_KB_INGEST_CHILD_BYTES
+    kb_ingest_memory_budget_mb: int = DEFAULT_KB_INGEST_MEMORY_BUDGET_MB
+    kb_store_extension: str | None = None
+    kb_ingest_strategies: dict | None = None
+    kb_ingest_default_strategy: str | None = None
+    # Per bank: the knowledge banks a memory bank's reflect reads, as the authority
+    knowledge_banks: list[str] | None = None
+    # How reflect searches those knowledge banks (see DEFAULT_REFLECT_KB_SEARCH_*). Media types and
+    # tags are per bank; the pictures are the server's: what a model is shown costs the operator.
+    reflect_kb_search_media_types: list[str] | None = DEFAULT_REFLECT_KB_SEARCH_MEDIA_TYPES
+    reflect_kb_search_apply_tags: bool = DEFAULT_REFLECT_KB_SEARCH_APPLY_TAGS
+    reflect_kb_search_images: bool = DEFAULT_REFLECT_KB_SEARCH_IMAGES
+    reflect_kb_search_max_images: int = DEFAULT_REFLECT_KB_SEARCH_MAX_IMAGES
+    reflect_kb_search_budget: str = DEFAULT_REFLECT_KB_SEARCH_BUDGET
 
     # Class-level sets for configuration categorization
 
@@ -4283,6 +4557,9 @@ class HindsightConfig:
         "reflect_decision_model_base_url",
         "consolidation_decision_model_api_key",
         "consolidation_decision_model_base_url",
+        # Knowledge-bank reranker key and endpoint
+        "kb_reranker_api_key",
+        "kb_reranker_url",
         # chatgpt: points at a directory holding an OAuth grant.
         "llm_chatgpt_home",
     }
@@ -4373,6 +4650,10 @@ class HindsightConfig:
         "llm_gemini_safety_settings",
         # Memory Defense policy (validated against DefensePolicy schema on write)
         "memory_defense",
+        # Knowledge banks a memory bank reads as authoritative documents
+        "knowledge_banks",
+        "reflect_kb_search_media_types",
+        "reflect_kb_search_apply_tags",
     }
 
     @property
@@ -4535,6 +4816,8 @@ class HindsightConfig:
         """Validate configuration values and raise errors for invalid combinations."""
         for operation in DECISION_MODEL_OPERATIONS:
             self.decision_model_config(operation)  # raises on an unknown provider or a missing key
+        if self.kb_reranker_url and not self.kb_reranker_model:
+            raise ValueError(f"{ENV_KB_RERANKER_MODEL} is required when {ENV_KB_RERANKER_URL} is set")
         # Validate vector_extension
         validate_extension(self.vector_extension)
 
@@ -4744,6 +5027,7 @@ class HindsightConfig:
         # embeds anything, and validate() skips its dependency checks.
         config.query_embeddings = cls._embeddings_side_from_env(EMBEDDINGS_SIDE_QUERY)
         config.passage_embeddings = cls._embeddings_side_from_env(EMBEDDINGS_SIDE_PASSAGE)
+        config.kb_text_embeddings = cls._embeddings_side_from_env(EMBEDDINGS_SIDE_KB_TEXT)
         config.validate()
         return config
 
@@ -4876,8 +5160,16 @@ class HindsightConfig:
             llm_send_bank_as_user=os.getenv(ENV_LLM_SEND_BANK_AS_USER, str(DEFAULT_LLM_SEND_BANK_AS_USER)).lower()
             in ("true", "1"),
             llm_vision=_parse_tristate_bool(ENV_LLM_VISION, os.getenv(ENV_LLM_VISION)),
+            llm_litellm_prompt_cache=_parse_tristate_bool(
+                ENV_LLM_LITELLM_PROMPT_CACHE, os.getenv(ENV_LLM_LITELLM_PROMPT_CACHE)
+            ),
             llm_openai_compatible_json_mode=_parse_tristate_bool(
                 ENV_LLM_OPENAI_COMPATIBLE_JSON_MODE, os.getenv(ENV_LLM_OPENAI_COMPATIBLE_JSON_MODE)
+            ),
+            llm_openai_compatible_enforce_schema=os.getenv(ENV_LLM_OPENAI_COMPATIBLE_ENFORCE_SCHEMA, "false").lower()
+            in ("true", "1"),
+            retain_llm_openai_compatible_json_mode=_parse_tristate_bool(
+                ENV_RETAIN_LLM_OPENAI_COMPATIBLE_JSON_MODE, os.getenv(ENV_RETAIN_LLM_OPENAI_COMPATIBLE_JSON_MODE)
             ),
             llm_ollama_num_ctx=_parse_optional_positive_int(
                 ENV_LLM_OLLAMA_NUM_CTX,
@@ -5447,6 +5739,8 @@ class HindsightConfig:
                 else None
             ),
             decision_model_tokenizer=os.getenv(ENV_DECISION_MODEL_TOKENIZER) or None,
+            decision_model_vision=os.getenv(ENV_DECISION_MODEL_VISION, str(DEFAULT_DECISION_MODEL_VISION)).lower()
+            == "true",
             # Typed as Any: a splat of str values is otherwise checked against every keyword
             # parameter, including the non-str ones (query_embeddings, ...).
             **cast(
@@ -5679,6 +5973,69 @@ class HindsightConfig:
             file_conversion_max_batch_size=int(
                 os.getenv(ENV_FILE_CONVERSION_MAX_BATCH_SIZE, str(DEFAULT_FILE_CONVERSION_MAX_BATCH_SIZE))
             ),
+            kb_embeddings_provider=os.getenv(ENV_KB_EMBEDDINGS_PROVIDER, DEFAULT_KB_EMBEDDINGS_PROVIDER).lower(),
+            kb_embeddings_model=os.getenv(ENV_KB_EMBEDDINGS_MODEL) or None,
+            kb_embeddings_api_key=os.getenv(ENV_KB_EMBEDDINGS_API_KEY) or None,
+            kb_embeddings_dimensions=int(os.environ[ENV_KB_EMBEDDINGS_DIMENSIONS])
+            if os.getenv(ENV_KB_EMBEDDINGS_DIMENSIONS)
+            else None,
+            kb_embeddings_device=os.getenv(ENV_KB_EMBEDDINGS_DEVICE) or None,
+            kb_embeddings_base_url=os.getenv(ENV_KB_EMBEDDINGS_BASE_URL) or None,
+            kb_embeddings_modalities=os.getenv(ENV_KB_EMBEDDINGS_MODALITIES, "text,image").lower(),
+            kb_embeddings_batch_size=int(
+                os.getenv(ENV_KB_EMBEDDINGS_BATCH_SIZE, str(DEFAULT_KB_EMBEDDINGS_BATCH_SIZE))
+            ),
+            kb_embeddings_max_in_flight=int(
+                os.getenv(ENV_KB_EMBEDDINGS_MAX_IN_FLIGHT, str(DEFAULT_KB_EMBEDDINGS_MAX_IN_FLIGHT))
+            ),
+            kb_reranker_url=os.getenv(ENV_KB_RERANKER_URL) or None,
+            kb_reranker_api_key=os.getenv(ENV_KB_RERANKER_API_KEY) or None,
+            kb_reranker_model=os.getenv(ENV_KB_RERANKER_MODEL) or None,
+            kb_reranker_max_tokens=int(os.getenv(ENV_KB_RERANKER_MAX_TOKENS, str(DEFAULT_KB_RERANKER_MAX_TOKENS))),
+            kb_reranker_tokenizer=os.getenv(ENV_KB_RERANKER_TOKENIZER) or None,
+            kb_reranker_images=_parse_boolean_env(ENV_KB_RERANKER_IMAGES, True),
+            kb_reranker_query_images=_parse_boolean_env(ENV_KB_RERANKER_QUERY_IMAGES, False),
+            kb_image_tokens=int(os.getenv(ENV_KB_IMAGE_TOKENS, str(DEFAULT_KB_IMAGE_TOKENS))),
+            kb_disabled_media_types=_parse_kb_media_types(os.getenv(ENV_KB_DISABLED_MEDIA_TYPES)),
+            kb_max_file_mb=int(os.getenv(ENV_KB_MAX_FILE_MB, str(DEFAULT_KB_MAX_FILE_MB))),
+            kb_max_file_mb_by_media_type=_parse_kb_size_limits(os.getenv(ENV_KB_MAX_FILE_MB_BY_MEDIA_TYPE)),
+            kb_max_image_megapixels=int(os.getenv(ENV_KB_MAX_IMAGE_MEGAPIXELS, str(DEFAULT_KB_MAX_IMAGE_MEGAPIXELS))),
+            kb_max_media_seconds=int(os.getenv(ENV_KB_MAX_MEDIA_SECONDS, str(DEFAULT_KB_MAX_MEDIA_SECONDS))),
+            kb_max_pdf_pages=int(os.getenv(ENV_KB_MAX_PDF_PAGES, str(DEFAULT_KB_MAX_PDF_PAGES))),
+            kb_audio_window_seconds=int(os.getenv(ENV_KB_AUDIO_WINDOW_SECONDS, str(DEFAULT_KB_AUDIO_WINDOW_SECONDS))),
+            kb_video_window_seconds=int(os.getenv(ENV_KB_VIDEO_WINDOW_SECONDS, str(DEFAULT_KB_VIDEO_WINDOW_SECONDS))),
+            kb_media_overlap_seconds=int(
+                os.getenv(ENV_KB_MEDIA_OVERLAP_SECONDS, str(DEFAULT_KB_MEDIA_OVERLAP_SECONDS))
+            ),
+            kb_pdf_page_pixels=int(os.getenv(ENV_KB_PDF_PAGE_PIXELS, str(DEFAULT_KB_PDF_PAGE_PIXELS))),
+            kb_keyword_weight=float(os.getenv(ENV_KB_KEYWORD_WEIGHT, str(DEFAULT_KB_KEYWORD_WEIGHT))),
+            kb_pdf_bands=os.getenv(ENV_KB_PDF_BANDS, str(DEFAULT_KB_PDF_BANDS)).lower() == "true",
+            kb_pdf_text_weight=float(os.getenv(ENV_KB_PDF_TEXT_WEIGHT, str(DEFAULT_KB_PDF_TEXT_WEIGHT))),
+            kb_text_passage_tokens=int(os.getenv(ENV_KB_TEXT_PASSAGE_TOKENS, str(DEFAULT_KB_TEXT_PASSAGE_TOKENS))),
+            kb_ingest_child_bytes=int(os.getenv(ENV_KB_INGEST_CHILD_BYTES, str(DEFAULT_KB_INGEST_CHILD_BYTES))),
+            kb_ingest_memory_budget_mb=int(
+                os.getenv(ENV_KB_INGEST_MEMORY_BUDGET_MB, str(DEFAULT_KB_INGEST_MEMORY_BUDGET_MB))
+            ),
+            kb_store_extension=os.getenv(ENV_KB_STORE_EXTENSION) or None,
+            kb_ingest_strategies=_parse_ingest_strategies(os.getenv(ENV_KB_INGEST_STRATEGIES)),
+            kb_ingest_default_strategy=os.getenv(ENV_KB_INGEST_DEFAULT_STRATEGY) or None,
+            knowledge_banks=None,  # per bank only (bank config); no server-wide default
+            reflect_kb_search_media_types=sorted(
+                _parse_kb_media_types(os.getenv(ENV_REFLECT_KB_SEARCH_MEDIA_TYPES), ENV_REFLECT_KB_SEARCH_MEDIA_TYPES)
+            )
+            or DEFAULT_REFLECT_KB_SEARCH_MEDIA_TYPES,
+            reflect_kb_search_images=os.getenv(
+                ENV_REFLECT_KB_SEARCH_IMAGES, str(DEFAULT_REFLECT_KB_SEARCH_IMAGES)
+            ).lower()
+            == "true",
+            reflect_kb_search_budget=_parse_reflect_kb_search_budget(os.getenv(ENV_REFLECT_KB_SEARCH_BUDGET)),
+            reflect_kb_search_max_images=int(
+                os.getenv(ENV_REFLECT_KB_SEARCH_MAX_IMAGES, str(DEFAULT_REFLECT_KB_SEARCH_MAX_IMAGES))
+            ),
+            reflect_kb_search_apply_tags=os.getenv(
+                ENV_REFLECT_KB_SEARCH_APPLY_TAGS, str(DEFAULT_REFLECT_KB_SEARCH_APPLY_TAGS)
+            ).lower()
+            == "true",
             enable_file_upload_api=os.getenv(ENV_ENABLE_FILE_UPLOAD_API, str(DEFAULT_ENABLE_FILE_UPLOAD_API)).lower()
             == "true",
             file_delete_after_retain=os.getenv(
@@ -5695,6 +6052,7 @@ class HindsightConfig:
                 ENV_ENABLE_DOCUMENT_IMPORT_API, str(DEFAULT_ENABLE_DOCUMENT_IMPORT_API)
             ).lower()
             == "true",
+            enable_kb=os.getenv(ENV_ENABLE_KB, str(DEFAULT_ENABLE_KB)).lower() == "true",
             # Observations settings (consolidated knowledge from facts)
             enable_observations=os.getenv(ENV_ENABLE_OBSERVATIONS, str(DEFAULT_ENABLE_OBSERVATIONS)).lower() == "true",
             enable_auto_consolidation=os.getenv(
@@ -6225,6 +6583,7 @@ class HindsightConfig:
             max_concurrent=self.decision_model_max_concurrent,
             max_request_tokens=max_request_tokens,
             tokenizer=tokenizer,
+            vision=self.decision_model_vision,
         )
 
     def log_config(self) -> None:

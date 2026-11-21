@@ -105,6 +105,12 @@ class ToolCallTrace(BaseModel):
     output: dict = Field(description="Tool output/result")
     duration_ms: int = Field(description="Execution time in milliseconds")
     iteration: int = Field(default=0, description="Iteration number (1-based) when this tool was called")
+    # Epoch milliseconds overflow int32: without format int64 the Go client decodes into int32 and fails.
+    started_at_ms: int = Field(
+        default=0,
+        description="When the call started, in Unix epoch milliseconds",
+        json_schema_extra={"format": "int64"},
+    )
 
 
 class LLMCallTrace(BaseModel):
@@ -112,6 +118,12 @@ class LLMCallTrace(BaseModel):
 
     scope: str = Field(description="Call scope: agent_1, agent_2, final, etc.")
     duration_ms: int = Field(description="Execution time in milliseconds")
+    # Epoch milliseconds overflow int32: without format int64 the Go client decodes into int32 and fails.
+    started_at_ms: int = Field(
+        default=0,
+        description="When the call started, in Unix epoch milliseconds",
+        json_schema_extra={"format": "int64"},
+    )
 
 
 class ObservationRef(BaseModel):
@@ -586,6 +598,29 @@ class MentalModelResult(BaseModel):
     relevance: float = Field(default=0.0, description="Relevance score to the query")
 
 
+class KnowledgeDocumentHit(BaseModel):
+    """A passage from a knowledge bank the memory bank links: an authoritative document.
+
+    When it conflicts with a memory, the document wins.
+    """
+
+    bank_id: str = Field(description="The knowledge bank the passage is from")
+    document_id: str
+    passage_index: int
+    filename: str | None = None
+    media_type: str = Field(description="document (PDF, Office), image, audio, video or text")
+    text: str | None = Field(
+        default=None, description="Text of the passage (a PDF page's text layer, or a text passage)"
+    )
+    page: int | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
+    score: float = Field(description="The knowledge search's fused rank score, comparable within one bank only")
+    passage_url: str | None = Field(default=None, description="Streams this passage's page image or clip")
+    document_url: str = Field(description="Streams the original file")
+    tags: list[str] = Field(default_factory=list)
+
+
 class RecallResult(BaseModel):
     """
     Result from a recall operation.
@@ -636,6 +671,11 @@ class RecallResult(BaseModel):
             "results[].source_fact_ids have no entry in source_facts — the budget ran out, the "
             "references are not dangling. Only set when source facts were requested."
         ),
+    )
+    documents: list[KnowledgeDocumentHit] | None = Field(
+        None,
+        description="Passages from the knowledge banks this bank links (config `knowledge_banks`). They are "
+        "authoritative: when a document and a memory disagree, the document wins.",
     )
 
 

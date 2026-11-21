@@ -127,7 +127,7 @@ type FactKey = "world" | "experience" | "observation";
 
 // Palette. Memory-type hues deliberately avoid the link-type hues (teal/blue/amber)
 // so the two distributions read as different dimensions.
-const CHART_COLORS = {
+export const CHART_COLORS = {
   primary: "var(--primary)",
   // Memory composition — modern violet / pink / indigo palette.
   // Picked to stay distinct from the link-type hues (teal/blue/amber).
@@ -162,7 +162,7 @@ const FACT_META: Record<FactKey, { label: string; color: string }> = {
   observation: { label: "Observations", color: CHART_COLORS.observation },
 };
 
-function formatCompact(n: number): string {
+export function formatCompact(n: number): string {
   if (n < 1000) return n.toString();
   if (n < 1_000_000) {
     const k = n / 1000;
@@ -191,7 +191,7 @@ type ChartTooltipProps = Partial<TooltipContentProps<number, string>> & {
   valueLabel?: string;
 };
 
-function ChartTooltip({ active, payload, label, valueLabel }: ChartTooltipProps) {
+export function ChartTooltip({ active, payload, label, valueLabel }: ChartTooltipProps) {
   if (!active || !payload || payload.length === 0) return null;
   return (
     <div className="rounded-lg border border-border/60 bg-popover/95 backdrop-blur-sm px-3 py-2 shadow-md">
@@ -255,7 +255,7 @@ function parseBucketIso(iso: string): Date {
   return new Date(/[+Z-]$/.test(iso) || /[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`);
 }
 
-function formatBucketLabel(iso: string, trunc: string): string {
+export function formatBucketLabel(iso: string, trunc: string): string {
   const d = parseBucketIso(iso);
   if (trunc === "day") {
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
@@ -263,7 +263,7 @@ function formatBucketLabel(iso: string, trunc: string): string {
   return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
-function formatBucketTooltip(iso: string, trunc: string): string {
+export function formatBucketTooltip(iso: string, trunc: string): string {
   const d = parseBucketIso(iso);
   if (trunc === "day") {
     return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
@@ -313,9 +313,11 @@ interface DistributionItem {
   name: string;
   value: number;
   color: string;
+  /** Makes the legend entry a link (e.g. to the list filtered on it). */
+  href?: string;
 }
 
-function Distribution({
+export function Distribution({
   title,
   items,
   emptyLabel,
@@ -353,22 +355,40 @@ function Distribution({
               ))}
           </div>
           <div className="grid grid-cols-3 gap-3 text-sm">
-            {items.map((d) => (
-              <div key={d.name} className="space-y-0.5">
-                <div className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-[2px]" style={{ backgroundColor: d.color }} />
-                  <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
-                    {d.name}
-                  </span>
+            {items.map((d) => {
+              const body = (
+                <>
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-[2px]" style={{ backgroundColor: d.color }} />
+                    <span className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
+                      {d.name}
+                    </span>
+                  </div>
+                  <div className="flex items-baseline gap-1.5">
+                    <CompactNumber
+                      value={d.value}
+                      className="text-base font-semibold tabular-nums"
+                    />
+                    <span className="text-[10px] text-muted-foreground tabular-nums">
+                      {total > 0 ? `${((d.value / total) * 100).toFixed(0)}%` : "0%"}
+                    </span>
+                  </div>
+                </>
+              );
+              return d.href ? (
+                <Link
+                  key={d.name}
+                  href={d.href}
+                  className="-m-1 block space-y-0.5 rounded p-1 hover:bg-muted"
+                >
+                  {body}
+                </Link>
+              ) : (
+                <div key={d.name} className="space-y-0.5">
+                  {body}
                 </div>
-                <div className="flex items-baseline gap-1.5">
-                  <CompactNumber value={d.value} className="text-base font-semibold tabular-nums" />
-                  <span className="text-[10px] text-muted-foreground tabular-nums">
-                    {total > 0 ? `${((d.value / total) * 100).toFixed(0)}%` : "0%"}
-                  </span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </>
       )}
@@ -376,14 +396,20 @@ function Distribution({
   );
 }
 
-function InlineStat({
+export function InlineStat({
   icon: Icon,
   label,
   value,
+  display,
+  note,
 }: {
   icon: typeof Database;
   label: string;
   value: number;
+  /** Shown instead of the compact number (e.g. a byte size). */
+  display?: string;
+  /** A small line under the value (e.g. "2 in progress"). */
+  note?: React.ReactNode;
 }) {
   return (
     <div className="flex items-center gap-3 p-4">
@@ -392,10 +418,17 @@ function InlineStat({
       </div>
       <div className="flex-1 min-w-0">
         <p className="text-xs text-muted-foreground font-medium">{label}</p>
-        <CompactNumber
-          value={value}
-          className="text-2xl font-semibold text-foreground leading-tight tabular-nums block"
-        />
+        {display != null ? (
+          <span className="text-2xl font-semibold text-foreground leading-tight tabular-nums block">
+            {display}
+          </span>
+        ) : (
+          <CompactNumber
+            value={value}
+            className="text-2xl font-semibold text-foreground leading-tight tabular-nums block"
+          />
+        )}
+        {note}
       </div>
     </div>
   );
@@ -881,7 +914,7 @@ function MentalModelsCard({
   );
 }
 
-const AXIS_TICK_STYLE = {
+export const AXIS_TICK_STYLE = {
   fontSize: 11,
   fill: CHART_COLORS.mutedFg,
   fontWeight: 500,

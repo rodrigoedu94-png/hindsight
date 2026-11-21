@@ -180,3 +180,20 @@ class TestStripReasoningTags:
         """The orphan head and any later closed block are both removed."""
         content = "prefilled reasoning</think>Hello <think>more</think>World"
         assert _strip_reasoning_tags(content) == "Hello World"
+
+    def test_message_content_joins_typed_text_blocks_and_drops_thinking_blocks(self):
+        """#6758: Mistral returns message.content as a list of thinking + text blocks."""
+        from types import SimpleNamespace
+
+        from hindsight_api.engine.providers.openai_compatible_llm import _message_content
+
+        msg = {
+            "content": [
+                {"type": "thinking", "thinking": "internal step"},
+                {"type": "text", "text": '{"facts": '},
+                SimpleNamespace(type="text", text="[]}"),
+            ]
+        }
+        extracted = _message_content(msg)
+        assert extracted == '{"facts": []}'
+        assert _strip_reasoning_tags(extracted) == '{"facts": []}'

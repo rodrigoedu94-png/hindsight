@@ -281,6 +281,9 @@ def test_update_bank_config_forwards_the_full_configurable_surface(monkeypatch):
         default_timezone="Asia/Shanghai",
         memory_defense={"redact_secrets": True},
         audit_log_enabled=True,
+        knowledge_banks=["product-docs"],
+        reflect_kb_search_media_types=["document", "text"],
+        reflect_kb_search_apply_tags=False,
     )
 
     assert captured["updates"] == {
@@ -312,6 +315,9 @@ def test_update_bank_config_forwards_the_full_configurable_surface(monkeypatch):
         "default_timezone": "Asia/Shanghai",
         "memory_defense": {"redact_secrets": True},
         "audit_log_enabled": True,
+        "knowledge_banks": ["product-docs"],
+        "reflect_kb_search_media_types": ["document", "text"],
+        "reflect_kb_search_apply_tags": False,
     }
 
 

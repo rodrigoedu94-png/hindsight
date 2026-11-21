@@ -148,6 +148,11 @@ async def purge_bank_rows(*, conn, fq_table: Callable[[str], str], bank_id: str)
     # that stays would otherwise keep every one of them.
     await conn.execute(f"DELETE FROM {fq_table('attachments')} WHERE bank_id = $1", bank_id)
 
+    # Delete memory_links before memory_units / entities so the FK cascade does
+    # not remove bidirectional links in arbitrary endpoint order and deadlock
+    # against concurrent link writers (#4251, PI-96).
+    await conn.execute(f"DELETE FROM {fq_table('memory_links')} WHERE bank_id = $1", bank_id)
+
     # Delete memory units (cascades to unit_entities, memory_links)
     await conn.execute(f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1", bank_id)
 

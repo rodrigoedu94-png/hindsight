@@ -815,6 +815,20 @@ class TestOracleQueryRewriter:
         assert "::uuid" not in query
         assert "::varchar[]" not in query
 
+    def test_array_contained_by(self):
+        # #6585: the exact tag match emits `tags <@ $N`, which Oracle cannot parse (ORA-00936).
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("WHERE bank_id = $1 AND (tags @> $2 AND tags <@ $2)")
+        assert "<@" not in query
+        assert "NOT EXISTS (SELECT 1 FROM JSON_TABLE(tags," in query
+        assert "JSON_TABLE(:2," in query
+
+        qualified, _, _ = _rewrite_pg_to_oracle("WHERE mu.bank_id = $1 AND (mu.tags @> $2 AND mu.tags <@ $2)")
+        assert "<@" not in qualified
+        assert "mu.NOT EXISTS" not in qualified
+        assert "NOT EXISTS (SELECT 1 FROM JSON_TABLE(mu.tags," in qualified
+
     def test_jsonb_merge_returns_clob(self):
         # Without RETURNING CLOB, JSON_MERGEPATCH returns VARCHAR2(4000) with
         # NULL ON ERROR, so large merged documents silently become NULL.
@@ -1969,3 +1983,41 @@ class TestOracleSessionAndClobBinding:
         assert params["4"].lob_type == oracledb.DB_TYPE_CLOB and params["4"].data == text
         assert params["1"] == "doc-id" and params["3"] == bytes(16)  # a UUID stays RAW(16)
         assert params["5"] == "x" * 5000  # 4 000-32 767 bytes stay a string with a CLOB input size
+
+    def test_expand_any_lists_chunks_past_1000_items_for_ora_01795(self):
+        from hindsight_api.engine.db.oracle import OracleConnection, _rewrite_pg_to_oracle
+
+        items = [f"id-{i}" for i in range(2050)]
+
+        q_in, _, _ = _rewrite_pg_to_oracle("SELECT id FROM memory_units WHERE mu.id = ANY($1)")
+        expanded_in, params_in = OracleConnection._expand_any_lists(q_in, {"1": list(items)})
+        assert expanded_in.count("mu.id IN (") == 3
+        assert " OR mu.id IN (" in expanded_in
+        assert "1" not in params_in
+        assert len(params_in) == 2050
+
+        q_not_in, _, _ = _rewrite_pg_to_oracle("SELECT id FROM memory_units WHERE mu.id != ALL($1)")
+        expanded_not_in, params_not_in = OracleConnection._expand_any_lists(q_not_in, {"1": list(items)})
+        assert expanded_not_in.count("mu.id NOT IN (") == 3
+        assert " AND mu.id NOT IN (" in expanded_not_in
+        assert len(params_not_in) == 2050
+
+    @pytest.mark.asyncio
+    async def test_purge_bank_rows_deletes_memory_links_before_memory_units(self):
+        from hindsight_api.engine.memories.pg.engine_curation import purge_bank_rows
+
+        executed: list[str] = []
+
+        class FakeConn:
+            async def fetch(self, query, *args):
+                return []
+
+            async def execute(self, query, *args):
+                executed.append(query)
+                return "DELETE 0"
+
+        await purge_bank_rows(conn=FakeConn(), fq_table=lambda t: t, bank_id="b1")
+        links_idx = next(i for i, q in enumerate(executed) if "DELETE FROM memory_links" in q)
+        units_idx = next(i for i, q in enumerate(executed) if "DELETE FROM memory_units" in q)
+        entities_idx = next(i for i, q in enumerate(executed) if "DELETE FROM entities" in q)
+        assert links_idx < units_idx < entities_idx

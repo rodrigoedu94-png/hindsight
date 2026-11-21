@@ -93,6 +93,9 @@ describe("full bank config surface mapping", () => {
       llmGeminiSafetySettings: [{ category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" }],
       memoryDefense: { redact_secrets: true },
       auditLogEnabled: true,
+      knowledgeBanks: ["product-docs"],
+      reflectKbSearchMediaTypes: ["document", "text"],
+      reflectKbSearchApplyTags: false,
     });
 
     const body = mockedUpdateConfig.mock.calls[0][0].body as any;
@@ -125,6 +128,9 @@ describe("full bank config surface mapping", () => {
       ],
       memory_defense: { redact_secrets: true },
       audit_log_enabled: true,
+      knowledge_banks: ["product-docs"],
+      reflect_kb_search_media_types: ["document", "text"],
+      reflect_kb_search_apply_tags: false,
     });
   });
 

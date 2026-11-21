@@ -212,6 +212,9 @@ os.environ.setdefault("HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS", "-1")
 # The attachment sweep only deletes day-old rows, so it could not race a test's own
 # fresh attachments — but left on it alone would start the loop for the suite.
 os.environ.setdefault("HINDSIGHT_API_ATTACHMENT_SWEEP_INTERVAL_SECONDS", "0")
+# Knowledge banks are off by default (a hidden feature); the suite tests them, so it turns them on.
+# test_knowledge_banks.py checks what a server with the flag off hides.
+os.environ.setdefault("HINDSIGHT_API_ENABLE_KB", "true")
 
 # Same reason, for the worker poller the API lifespan starts by default. Any test
 # that runs ``app.router.lifespan_context`` (the MCP routing tests, for one) would
@@ -234,6 +237,12 @@ def pytest_configure(config):
         # session, matching the precedence hindsight_api used to apply at import
         # time (removed in #2961 so library imports are side-effect-free).
         load_dotenv(env_file, override=True)
+        # Importing this conftest already built the config, before .env was read.
+        # Session fixtures (``llm_config``) set up before the per-test cache reset,
+        # so without this they saw the pre-.env defaults.
+        from hindsight_api.config import clear_config_cache
+
+        clear_config_cache()
     else:
         print(f"Warning: {env_file} not found, tests may fail without proper configuration")
 
