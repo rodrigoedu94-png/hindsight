@@ -1077,11 +1077,15 @@ class OracleConnection(DatabaseConnection):
         if params is None or "/*" not in query:
             return query, params
 
-        expand_re = re.compile(r"/\*EXPAND:(\d+)\*/")
+        expand_re = re.compile(r"(?:(\w+(?:\.\w+)?)\s+(NOT\s+)?IN\s*\(\s*)?/\*EXPAND:(\d+)\*/(\s*\))?", re.IGNORECASE)
         keys_to_remove: set[str] = set()
 
         def _replace(m):
-            param_key = m.group(1)
+            col = m.group(1)
+            not_kw = m.group(2)
+            param_key = m.group(3)
+            close_paren = m.group(4) or ""
+            head = f"{col} {'NOT ' if not_kw else ''}IN (" if col else ""
             val = params.get(param_key)
             # Handle JSON string lists (from _convert_arg serialization)
             if isinstance(val, str):
@@ -1098,11 +1102,11 @@ class OracleConnection(DatabaseConnection):
                                 converted.append(item)
                         val = converted
                 except (json.JSONDecodeError, TypeError):
-                    return f":{param_key}"
+                    return f"{head}:{param_key}{close_paren}"
             if val is None or not isinstance(val, (list, tuple)):
-                return f":{param_key}"
+                return f"{head}:{param_key}{close_paren}"
             if len(val) == 0:
-                return "NULL"
+                return f"{head}NULL{close_paren}"
             OracleConnection._expand_counter += 1
             prefix = f"any{OracleConnection._expand_counter}"
             expanded_keys = []
@@ -1111,7 +1115,16 @@ class OracleConnection(DatabaseConnection):
                 params[k] = item
                 expanded_keys.append(f":{k}")
             keys_to_remove.add(param_key)
-            return ", ".join(expanded_keys)
+            # Oracle caps a scalar IN (...) list at 1000 expressions (ORA-01795).
+            if col and close_paren and len(expanded_keys) > 1000:
+                op = f"{col} NOT IN" if not_kw else f"{col} IN"
+                joiner = " AND " if not_kw else " OR "
+                chunks = [
+                    f"{op} ({', '.join(expanded_keys[start : start + 1000])})"
+                    for start in range(0, len(expanded_keys), 1000)
+                ]
+                return f"({joiner.join(chunks)})"
+            return f"{head}{', '.join(expanded_keys)}{close_paren}"
 
         query = expand_re.sub(_replace, query)
 

@@ -326,7 +326,22 @@ def _message_for_choice(choice: Any) -> Any:
 
 
 def _message_content(message: Any) -> Any:
-    return _response_get(message, "content")
+    content = _response_get(message, "content")
+    if isinstance(content, list):
+        # Mistral and other OpenAI-compatible reasoning endpoints return
+        # message.content as a list of typed blocks (e.g. thinking + text) (#6758).
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict):
+                if part.get("type") == "text" and isinstance(part.get("text"), str):
+                    text_parts.append(part["text"])
+            else:
+                if getattr(part, "type", None) == "text" and isinstance(getattr(part, "text", None), str):
+                    text_parts.append(part.text)
+        return "".join(text_parts)
+    return content
 
 
 def _message_tool_calls(message: Any) -> Any:

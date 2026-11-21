@@ -467,6 +467,28 @@ class TestSemaphoreEnforcement:
             assert (await asyncio.wait_for(task, timeout=3)).content == "ok"
 
     @pytest.mark.asyncio
+    async def test_cancelled_attempt_keeps_in_flight_stage_without_backoff_suffix(self):
+        """#6673: cancelling an in-flight call at the wall ceiling must not stamp .backoff."""
+        from hindsight_api.worker.stage import set_stage
+
+        holder = StageHolder()
+        in_flight = asyncio.Event()
+
+        async def run():
+            bind_holder(holder)
+            async with llm_wrapper._attempt_permits("mental_model_delta_ops"):
+                set_stage("llm.openai.mental_model_delta_ops.attempt=1/1")
+                in_flight.set()
+                await asyncio.sleep(60)
+
+        task = asyncio.create_task(run())
+        await asyncio.wait_for(in_flight.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert holder.stage == "llm.openai.mental_model_delta_ops.attempt=1/1"
+
+    @pytest.mark.asyncio
     async def test_per_op_composes_with_global(self):
         """When both caps are set, the tighter one wins on its operation but
         the global cap still constrains the sum across operations."""

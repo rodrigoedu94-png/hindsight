@@ -2509,6 +2509,7 @@ class _MentalModelRefreshRun:
     usage: TokenUsage = field(default_factory=TokenUsage)
     duration_ms: int = 0
     warnings: list[str] = field(default_factory=list)
+    delta_ops_transient_failure: bool = False
 
     def to_trace(self, *, include_tool_outputs: bool = False) -> MentalModelRefreshTrace:
         """Render the run as a trace.
@@ -18846,6 +18847,7 @@ class MemoryEngine(MemoryEngineInterface):
                 usage=reflect_result.usage or TokenUsage(),
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 warnings=warnings,
+                delta_ops_transient_failure=delta_ops_transient_failure,
             )
 
         # Delta-mode path: emit structured operations against the existing
@@ -18873,6 +18875,7 @@ class MemoryEngine(MemoryEngineInterface):
         final_content = reflect_result.text
         final_structured: StructuredDocument | None = None
         delta_applied = False
+        delta_ops_transient_failure = False
         delta_operations: MentalModelDeltaOperations | None = None
         # Both op calls share one LLM handle, built on first use so a refresh that
         # neither retracts nor has new facts still pays no config resolution.
@@ -18944,6 +18947,9 @@ class MemoryEngine(MemoryEngineInterface):
                             system_prompt=STRUCTURED_RETRACTION_SYSTEM_PROMPT,
                             user_prompt=unsay_prompt,
                             scope="mental_model_retraction_ops",
+                            response_format=DeltaOperationList,
+                            strict_schema=get_config().llm_strict_schema_reflect,
+                            skip_validation=True,
                             max_completion_tokens=get_config().reflect_max_completion_tokens,
                             temperature=get_config().llm_temperature_mental_model_refresh,
                         )
@@ -19131,6 +19137,7 @@ class MemoryEngine(MemoryEngineInterface):
                         f"({exc}); delta operations were not applied"
                     )
                     mode_fallback_reason = "delta_ops_failed"
+                    delta_ops_transient_failure = is_transient_remote_error(exc)
 
             # The unsay ops edited the same document, in the same refresh, before the
             # new-facts ops did — so they belong in the same log, in that order.
@@ -19470,7 +19477,12 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
             async def _preserve_and_fail(
-                *, reason: RefreshFailureReason, outcome: RefreshOperationOutcome, detail: str, retryable: bool = True
+                *,
+                reason: RefreshFailureReason,
+                outcome: RefreshOperationOutcome,
+                detail: str,
+                retryable: bool = True,
+                pause_automatic: bool = True,
             ) -> NoReturn:
                 """Fail the refresh without touching the document.
 
@@ -19505,6 +19517,7 @@ class MemoryEngine(MemoryEngineInterface):
                     outcome=outcome,
                     failure_reason=reason,
                     error_message=detail,
+                    pause_automatic=pause_automatic,
                 )
                 raise MentalModelRefreshError(
                     f"Refresh failed for mental_model_id={mental_model_id}: {detail} "
@@ -19524,6 +19537,8 @@ class MemoryEngine(MemoryEngineInterface):
             if run.outcome == "refresh_failed_delta_not_applied":
                 # #3112: the reflect candidate only covers the delta window, so it is
                 # not a document — see the guard in _execute_mental_model_refresh.
+                # #6674: a transient remote failure (429, 5xx, timeout) on the delta
+                # LLM call must not permanently pause automatic refresh.
                 await _preserve_and_fail(
                     reason=_delta_failure_reason(run.mode_fallback_reason),
                     outcome="refresh_failed_delta_not_applied",
@@ -19532,6 +19547,7 @@ class MemoryEngine(MemoryEngineInterface):
                         "memories newer than the last refresh, so writing it would drop the rest of the document. "
                         "If this keeps happening, set the model's refresh mode to full."
                     ),
+                    pause_automatic=not run.delta_ops_transient_failure,
                 )
 
             # Last check before readers get the document: the validator's verdict from

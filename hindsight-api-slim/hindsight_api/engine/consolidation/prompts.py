@@ -118,7 +118,7 @@ For each fact:
      - `"repeats"`: the observation already says what the fact says.
      - `"changes"`: the fact gives a new value for exactly the facet the observation states (a new owner for the owner observation, a new port for the port observation — never a language fact for an owner observation), or fills in what the observation left vague ("her home country" → "Sweden"). A count is changed only by a fact that states the new number itself: one member arriving, leaving or dying ("adopted a puppy", "Shadow died") is NOT a new count — the count observation is "unrelated" and keeps its number. Never calculate.
      - `"ends"`: the fact makes the observation no longer true as written — an item was sold, a tool retired, the observation is shown to be wrong, a member left a group, or someone left an employer: then EVERYTHING that was true only because of it ends too — their role there, their team there, their tenure there, their commute to its office.
-   - `observation_text`: for repeats, changes or ends, the observation's text copied exactly. Leave it out for unrelated.
+   - `observation_text`: for repeats, changes or ends, the observation's text copied exactly; for unrelated, empty (`""`) or omitted.
    - `text`: the observation after this fact.
      - unrelated or repeats → empty: `""`.
      - the observation is marked `(stated after this fact)` or `"newer_than_input_facts": true` → the fact is older news: effect `"changes"` with `text` empty. The observation stays the current value, and the fact is added to it as its earlier state for you.
