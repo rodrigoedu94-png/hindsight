@@ -1279,7 +1279,7 @@ class OracleConnection(DatabaseConnection):
             return "SET"
         orig_query = query
         query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
-            query, supports_for_update_row_limit=self._supports_for_update_row_limit
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         cursor = self._conn.cursor()
         try:
@@ -1321,7 +1321,7 @@ class OracleConnection(DatabaseConnection):
 
     async def executemany(self, query: str, args: list[tuple[Any, ...]], *, timeout: float | None = None) -> None:
         query, ignore_dup, _ = _rewrite_pg_to_oracle(
-            query, supports_for_update_row_limit=self._supports_for_update_row_limit
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         converted = _convert_args_list(args)
         # Batch writes carry the same str() embeddings as single writes (e.g.
@@ -1383,7 +1383,7 @@ class OracleConnection(DatabaseConnection):
         if not args:
             return
         query, ignore_dup, _ = _rewrite_pg_to_oracle(
-            query, supports_for_update_row_limit=self._supports_for_update_row_limit
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         converted = _convert_args_list(args)
         converted_dicts = [{str(i + 1): v for i, v in enumerate(row)} for row in converted]
@@ -1448,7 +1448,7 @@ class OracleConnection(DatabaseConnection):
 
     async def fetch(self, query: str, *args: Any, timeout: float | None = None) -> list[ResultRow]:
         query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
-            query, supports_for_update_row_limit=self._supports_for_update_row_limit
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         cursor = self._conn.cursor()
         try:
@@ -1495,7 +1495,7 @@ class OracleConnection(DatabaseConnection):
 
     async def fetchrow(self, query: str, *args: Any, timeout: float | None = None) -> ResultRow | None:
         query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
-            query, supports_for_update_row_limit=self._supports_for_update_row_limit
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         cursor = self._conn.cursor()
         try:
@@ -1542,7 +1542,7 @@ class OracleConnection(DatabaseConnection):
 
     async def fetchval(self, query: str, *args: Any, column: int = 0, timeout: float | None = None) -> Any:
         query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
-            query, supports_for_update_row_limit=self._supports_for_update_row_limit
+            query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         cursor = self._conn.cursor()
         try:
