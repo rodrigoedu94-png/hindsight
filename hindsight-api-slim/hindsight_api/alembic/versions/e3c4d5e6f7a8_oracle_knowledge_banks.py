@@ -17,7 +17,7 @@ All foreign keys are leading prefixes of their composite primary keys, so every
 foreign key is indexed (zero unindexed FKs). Also creates ``idx_kb_docs_source``,
 ``idx_kb_docs_updated``, ``idx_kb_passages_bank``, the Oracle Text index
 ``idx_kb_passages_text`` (``CTXSYS.CONTEXT``, ``SYNC (ON COMMIT)``), and grants
-``SELECT, INSERT, UPDATE, DELETE`` to every grantee holding ``SELECT`` on
+``SELECT, INSERT, UPDATE, DELETE`` to every grantee holding ``INSERT`` on
 ``MEMORY_UNITS``.
 
 Oracle-only: PostgreSQL skips both upgrade and downgrade cleanly.

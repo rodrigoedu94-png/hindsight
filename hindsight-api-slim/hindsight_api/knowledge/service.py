@@ -37,6 +37,7 @@ from ..config import DEFAULT_KB_RERANKER_LOW_TOKENS, get_config
 from ..engine import bank_aliases
 from ..engine.aiohttp_session import UpstreamHTTPError
 from ..engine.cross_encoder import CohereCompatibleRerankClient, reranker_retry_policy
+from ..engine.db.oracle import OracleLiteralStr
 from ..engine.db_utils import acquire_with_retry
 from ..engine.decision_model import JEV_IMAGE_SIDE, jev_accepts
 from ..engine.operation_metadata import KnowledgeIngestChildMetadata, KnowledgeIngestParentMetadata
@@ -710,7 +711,10 @@ class KnowledgeService:
 
     async def _kind_of(self, bank_id: str) -> str | None:
         async with acquire_with_retry(await self._engine._get_backend()) as conn:
-            return await conn.fetchval(f"SELECT kind FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
+            return await conn.fetchval(
+                f"SELECT kind FROM {fq_table('banks')} WHERE bank_id = $1",
+                OracleLiteralStr(bank_id),
+            )
 
     async def _require_bank(self, bank_id: str) -> None:
         kind = await self._kind_of(bank_id)
@@ -790,8 +794,8 @@ class KnowledgeService:
                                 INSERT (bank_id, name, disposition, mission, internal_id, kind)
                                 VALUES (src.bank_id, src.name, src.disposition, src.mission, src.internal_id, src.kind)
                             """,
-                            bank_id,
-                            bank_id,
+                            OracleLiteralStr(bank_id),
+                            OracleLiteralStr(bank_id),
                             json.dumps(bank_utils.DEFAULT_DISPOSITION),
                             uuid.uuid4(),
                             KIND,
@@ -835,7 +839,7 @@ class KnowledgeService:
             where_parts = ["kind = $1"]
             params: list[Any] = [KIND]
             if q:
-                params.append(q)
+                params.append(OracleLiteralStr(q))
                 where_parts.append(f"INSTR(LOWER(bank_id), LOWER(${len(params)})) > 0")
             if allowed is not None:
                 chunks = [allowed[i : i + 900] for i in range(0, len(allowed), 900)]
@@ -843,7 +847,7 @@ class KnowledgeService:
                 for chunk in chunks:
                     phs = []
                     for item in chunk:
-                        params.append(item)
+                        params.append(OracleLiteralStr(item))
                         phs.append(f"${len(params)}")
                     or_groups.append(f"bank_id IN ({', '.join(phs)})")
                 where_parts.append("(" + " OR ".join(or_groups) + ")")
@@ -937,7 +941,7 @@ class KnowledgeService:
         async with acquire_with_retry(await self._engine._get_backend()) as conn:
             row = await conn.fetchrow(
                 f"SELECT bank_id, created_at FROM {fq_table('banks')} WHERE bank_id = $1 AND kind = $2",
-                bank_id,
+                OracleLiteralStr(bank_id),
                 KIND,
             )
         if not row:

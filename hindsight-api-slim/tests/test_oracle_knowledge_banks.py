@@ -407,7 +407,7 @@ async def test_knowledge_service_oracle_create_list_and_overrides():
         _operation_validator=None,
         _authenticate_tenant=AsyncMock(),
     )
-    svc = KnowledgeService(engine)  # type: ignore[arg-type]
+    svc = KnowledgeService(engine)  # ty: ignore[invalid-argument-type]
     assert isinstance(svc.store, OracleKnowledgeStore)
 
     conn.fetchval_responses.extend([None])
@@ -440,3 +440,29 @@ async def test_knowledge_service_oracle_create_list_and_overrides():
     saved_cfg = json.loads(update_args[0])
     assert saved_cfg["unrelated_key"] == "keep"
     assert "kb_text_passage_tokens" not in saved_cfg
+
+
+@pytest.mark.asyncio
+async def test_oracle_uuid_shaped_bank_id_and_tags_stay_str():
+    from hindsight_api.engine.db.oracle import OracleLiteralStr, _convert_arg
+    from hindsight_api.knowledge.store_oracle import _oracle_tags_predicate
+
+    uuid_bank = "11111111-2222-3333-4444-555555555555"
+    uuid_tag = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    conn = _FakeConn()
+    conn.fetchval_responses.append(0)
+    conn.fetch_responses.append([])
+    store = OracleKnowledgeStore(AsyncMock(return_value=_FakeBackend(conn)))
+
+    await store.list_documents(uuid_bank, limit=10, offset=0, tags=[uuid_tag])
+    count_sql, count_args = next((s, a) for s, a in conn.executed if s.startswith("SELECT COUNT(*)"))
+    assert "JSON_EXISTS(tags" in count_sql
+    assert all(isinstance(arg, OracleLiteralStr) and isinstance(_convert_arg(arg), str) for arg in count_args)
+
+    params: list[object] = []
+    pred = _oracle_tags_predicate([uuid_tag], params, "d.", "exact")
+    assert "JSON_EXISTS" in pred
+    assert len(params) == 2
+    assert isinstance(params[0], OracleLiteralStr)
+    assert isinstance(_convert_arg(params[0]), str)
