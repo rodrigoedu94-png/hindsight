@@ -904,6 +904,24 @@ async def test_oracle_backend_drop_failure_closes_conn_and_post_commit_release_f
     assert release_fail_pool.dropped == [post_conn]
     assert closed == closed_before + 1
 
+    # 3) A cancellation delivered during pool.release still drops the connection, but is NOT
+    #    swallowed: the cancelled caller must not return normally.
+    class _CancelOnReleasePool(_FailingPool):
+        async def release(self, conn: _FakeRawOracleConn) -> None:
+            self.released.append(conn)
+            raise asyncio.CancelledError
+
+    cancel_conn = _TrackedConn()
+    cancel_pool = _CancelOnReleasePool(cancel_conn)
+    backend._pool = cancel_pool
+
+    with pytest.raises(asyncio.CancelledError):
+        async with backend.acquire():
+            pass
+
+    assert cancel_conn.commits == 1
+    assert cancel_pool.dropped == [cancel_conn]
+
 
 @pytest.mark.asyncio
 async def test_poller_cancel_bank_operations_isolates_tenant_schemas() -> None:

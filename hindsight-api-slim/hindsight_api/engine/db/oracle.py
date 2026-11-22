@@ -14,6 +14,7 @@ Supports multi-tenant schema isolation via ALTER SESSION SET CURRENT_SCHEMA.
 """
 
 import array
+import asyncio
 import datetime
 import functools
 import inspect
@@ -1783,6 +1784,11 @@ class OracleBackend(DatabaseBackend):
                         f"discarding connection: {rel_err!r}"
                     )
                     await self._release_or_drop_conn(pool, conn, broken=True)
+                    # Ordinary release failures stay suppressed (the work already committed or
+                    # is already unwinding), but a cancellation delivered during the release
+                    # must still reach the caller, or a cancelled task would return normally.
+                    if isinstance(rel_err, asyncio.CancelledError):
+                        raise
             else:
                 await self._release_or_drop_conn(pool, conn, broken=False)
 
