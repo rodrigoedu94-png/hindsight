@@ -1181,14 +1181,20 @@ class OracleConnection(DatabaseConnection):
     async def transaction(self) -> AsyncIterator["OracleConnection"]:
         sp_name = f"sp_{_uuid_mod.uuid4().hex[:12]}"
         cursor = self._conn.cursor()
-        await cursor.execute(f"SAVEPOINT {sp_name}")
-        cursor.close()
+        try:
+            await cursor.execute(f"SAVEPOINT {sp_name}")
+        finally:
+            cursor.close()
         try:
             yield self
-        except Exception:
-            cursor = self._conn.cursor()
-            await cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
-            cursor.close()
+        except BaseException:
+            rb_cursor = self._conn.cursor()
+            try:
+                await rb_cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+            except BaseException as rb_err:
+                logger.debug(f"ROLLBACK TO SAVEPOINT {sp_name} failed during unwind: {rb_err!r}")
+            finally:
+                rb_cursor.close()
             raise
 
     # -- DML methods ------------------------------------------------------
@@ -1710,12 +1716,24 @@ class OracleBackend(DatabaseBackend):
         except Exception:
             return None
 
+    async def _release_or_drop_conn(self, pool: Any, conn: Any, *, broken: bool) -> None:
+        """Return a healthy connection to the pool or drop a broken/unclean one."""
+        if broken and hasattr(pool, "drop"):
+            try:
+                await pool.drop(conn)
+                return
+            except Exception as drop_err:
+                logger.debug(f"Oracle pool.drop failed; falling back to release: {drop_err!r}")
+        await pool.release(conn)
+
     @asynccontextmanager
-    async def acquire(self) -> AsyncIterator[OracleConnection]:
+    async def _session(self) -> AsyncIterator[OracleConnection]:
+        """Acquire a pooled Oracle connection, apply schema context, and commit or roll back cleanly."""
         pool = self._ensure_pool()
         conn = await acquire_conn(
             pool.acquire(), pool_stats=self._pool_stats, warn_threshold_s=self._acquire_warn_threshold_s
         )
+        broken = False
         try:
             await self._set_session_schema(conn)
             wrapper = OracleConnection(conn)
@@ -1724,29 +1742,28 @@ class OracleBackend(DatabaseBackend):
             # Auto-commit on clean exit (asyncpg uses autocommit by default;
             # oracledb does not, so we must commit explicitly)
             await conn.commit()
-        except Exception:
-            await conn.rollback()
+        except BaseException:
+            # Roll back on cancellation (BaseException) as well as Exception so
+            # an aborted task never hands an open transaction or held row locks
+            # back to another caller from the pool.
+            try:
+                await conn.rollback()
+            except BaseException as rb_err:
+                broken = True
+                logger.debug(f"Oracle rollback failed during session unwind; dropping connection: {rb_err!r}")
             raise
         finally:
-            await pool.release(conn)
+            await self._release_or_drop_conn(pool, conn, broken=broken)
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[OracleConnection]:
+        async with self._session() as wrapper:
+            yield wrapper
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[OracleConnection]:
-        pool = self._ensure_pool()
-        conn = await acquire_conn(
-            pool.acquire(), pool_stats=self._pool_stats, warn_threshold_s=self._acquire_warn_threshold_s
-        )
-        try:
-            await self._set_session_schema(conn)
-            wrapper = OracleConnection(conn)
+        async with self._session() as wrapper:
             yield wrapper
-            await wrapper._run_before_commit()
-            await conn.commit()
-        except Exception:
-            await conn.rollback()
-            raise
-        finally:
-            await pool.release(conn)
 
     def get_pool(self) -> Any:
         return self._ensure_pool()

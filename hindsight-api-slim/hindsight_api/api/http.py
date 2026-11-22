@@ -4577,6 +4577,10 @@ def create_app(
                 consolidation_bank_priority=config.worker_consolidation_bank_priority or None,
                 on_wall_timeout=memory.on_task_wall_timeout,
             )
+            memory.register_worker_cancellers(
+                cancel_operation=poller.cancel_active_operation,
+                cancel_bank_operations=poller.cancel_active_bank_operations,
+            )
             poller_task = asyncio.create_task(poller.run())
             _stop_claiming_on_sigterm(poller, asyncio.get_running_loop())
             logging.info(f"Worker poller started (worker_id={worker_id})")
@@ -4605,6 +4609,7 @@ def create_app(
 
         # Shutdown worker poller if running
         if poller is not None:
+            memory.register_worker_cancellers(cancel_operation=None, cancel_bank_operations=None)
             await poller.shutdown_graceful(timeout=config.worker_shutdown_drain_seconds)
             if poller_task is not None:
                 poller_task.cancel()

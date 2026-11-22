@@ -16,12 +16,13 @@ import os
 import random
 import signal
 import time
+import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from ..config import (
     ENV_CONSOLIDATION_WALL_TIMEOUT,
@@ -245,6 +246,13 @@ logger = logging.getLogger(__name__)
 
 # Progress logging interval in seconds
 PROGRESS_LOG_INTERVAL = 30
+# How often active in-flight tasks are checked against DB cancellations/bank deletes
+CANCEL_CHECK_INTERVAL_S = 1.0
+
+
+class _OperationCancelledInFlight(Exception):
+    """Raised when an in-flight task is interrupted because its operation was cancelled or bank deleted."""
+
 
 # How long a final status write ('completed', 'failed', retry, defer) is retried
 # before the worker gives up and shuts itself down (issue #5377). Long enough to
@@ -331,6 +339,9 @@ class ActiveTaskInfo:
     last_stack_dump_threshold: int = 0
     last_stack_dump_stage: str | None = None
     task_type: str = ""
+    all_operation_ids: tuple[str, ...] = ()
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    exec_task: "asyncio.Task[Any] | None" = None
 
 
 @dataclass
@@ -395,6 +406,7 @@ class WorkerPoller:
         consolidation_bank_priority: dict[str, int] | None = None,
         max_retries: int = 3,
         on_wall_timeout: Callable[[dict[str, Any], str | None, str, str], Awaitable[None]] | None = None,
+        cancel_check_interval_s: float = CANCEL_CHECK_INTERVAL_S,
     ):
         """
         Initialize the worker poller.
@@ -480,6 +492,8 @@ class WorkerPoller:
         self._active_tasks: dict[str, ActiveTaskInfo] = {}
         # Track in-flight tasks by operation type
         self._in_flight_by_type: dict[str, int] = {}
+        self._cancel_check_interval_s = max(0.05, cancel_check_interval_s)
+        self._last_cancel_check = time.monotonic()
         # Rotation offset for per-tenant fair claiming. Advances past the last
         # schema we serviced so a busy tenant can't monopolize the poll order.
         self._next_schema_idx: int = 0
@@ -1213,23 +1227,28 @@ class WorkerPoller:
         # poller reads it during periodic logging to surface what each
         # in-flight task is doing.
         holder = StageHolder(stage=f"queued.{task_type}")
+        cancel_event = asyncio.Event()
+        info = ActiveTaskInfo(
+            op_type=operation_type,
+            bank_id=bank_id,
+            schema=task.schema,
+            bg_task=cast("asyncio.Task[Any]", None),
+            started_at=time.monotonic(),
+            stage_holder=holder,
+            task_type=task_type,
+            all_operation_ids=tuple(task.all_operation_ids),
+            cancel_event=cancel_event,
+        )
 
         # Create background task. The holder is passed in and bound to the
         # task's own contextvar scope inside _execute_task_inner so engine
         # code running under that task sees it via stage.set_stage().
-        bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
+        bg_task = asyncio.create_task(self._execute_task_inner(task, holder, info))
+        info.bg_task = bg_task
 
         # Track this task as active
         async with self._in_flight_lock:
-            self._active_tasks[task.operation_id] = ActiveTaskInfo(
-                op_type=operation_type,
-                bank_id=bank_id,
-                schema=task.schema,
-                bg_task=bg_task,
-                started_at=time.monotonic(),
-                stage_holder=holder,
-                task_type=task_type,
-            )
+            self._active_tasks[task.operation_id] = info
             self._in_flight_count += 1
             self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
 
@@ -1249,11 +1268,166 @@ class WorkerPoller:
                         del self._in_flight_by_type[operation_type]
                 self._slot_freed.set()
 
-    async def _run_executor(self, task: ClaimedTask, task_type: str, holder: StageHolder | None = None) -> None:
+    def cancel_active_operation(self, operation_id: str) -> bool:
+        """Signal immediate cancellation for an in-flight operation running on this poller."""
+        info = self._active_tasks.get(operation_id)
+        if info is None:
+            return False
+        current = asyncio.current_task()
+        if current is not None and current in (info.bg_task, info.exec_task):
+            return False
+        # Multi-operation folded executions share a coroutine; defer to the DB watcher
+        # so cancelling a single folded child does not kill non-cancelled siblings.
+        if len(info.all_operation_ids) > 1:
+            return False
+        if not info.cancel_event.is_set():
+            info.cancel_event.set()
+            logger.info(
+                f"Signalled in-flight cancellation for operation {operation_id} "
+                f"(type={info.task_type}, bank={info.bank_id})"
+            )
+        return True
+
+    def cancel_active_bank_operations(self, bank_id: str) -> int:
+        """Signal immediate cancellation for all in-flight tasks targeting ``bank_id``."""
+        current = asyncio.current_task()
+        count = 0
+        for op_id, info in list(self._active_tasks.items()):
+            if info.bank_id != bank_id:
+                continue
+            if current is not None and current in (info.bg_task, info.exec_task):
+                continue
+            if not info.cancel_event.is_set():
+                info.cancel_event.set()
+                count += 1
+                logger.info(
+                    f"Signalled in-flight bank-delete cancellation for operation {op_id} "
+                    f"(type={info.task_type}, bank={bank_id})"
+                )
+        return count
+
+    async def _check_cancelled_active_tasks(self) -> int:
+        """Poll DB for active tasks whose operation row was cancelled or bank deleted."""
+        by_schema: dict[str | None, list[tuple[str, ActiveTaskInfo]]] = {}
+        async with self._in_flight_lock:
+            for op_id, info in self._active_tasks.items():
+                if not info.cancel_event.is_set():
+                    by_schema.setdefault(info.schema, []).append((op_id, info))
+        if not by_schema:
+            return 0
+
+        cancelled_count = 0
+        try:
+            async with self._backend.acquire() as conn:
+                for schema, entries in by_schema.items():
+                    op_ids: list[str] = []
+                    seen_ids: set[str] = set()
+                    for primary_id, info in entries:
+                        for oid in info.all_operation_ids or (primary_id,):
+                            if oid not in seen_ids:
+                                seen_ids.add(oid)
+                                op_ids.append(oid)
+                    if not op_ids:
+                        continue
+                    param_ids: list[Any] = []
+                    for oid in op_ids:
+                        try:
+                            param_ids.append(uuid.UUID(oid))
+                        except (ValueError, AttributeError):
+                            param_ids.append(oid)
+                    table = fq_table("async_operations", schema)
+                    rows = await conn.fetch(
+                        f"SELECT operation_id, status FROM {table} WHERE operation_id = ANY($1::uuid[])",
+                        param_ids,
+                    )
+                    if not isinstance(rows, (list, tuple)):
+                        continue
+                    status_by_id = {str(r["operation_id"]): r["status"] for r in rows}
+                    for primary_id, info in entries:
+                        ids = info.all_operation_ids or (primary_id,)
+                        if all(status_by_id.get(oid) in (None, "cancelled") for oid in ids):
+                            if not info.cancel_event.is_set():
+                                info.cancel_event.set()
+                                cancelled_count += 1
+                                logger.info(
+                                    f"Cancelled in-flight task {primary_id} "
+                                    f"(type={info.task_type}, bank={info.bank_id}) "
+                                    "after DB status became cancelled/deleted"
+                                )
+        except Exception as e:
+            logger.debug(f"Worker {self._worker_id} active-task cancellation check failed: {e}")
+        return cancelled_count
+
+    async def _check_cancelled_active_tasks_if_due(self) -> int:
+        if not self._active_tasks:
+            return 0
+        now = time.monotonic()
+        if now - self._last_cancel_check < self._cancel_check_interval_s:
+            return 0
+        self._last_cancel_check = now
+        return await self._check_cancelled_active_tasks()
+
+    async def _await_executor_cancellable(self, task: ClaimedTask, info: ActiveTaskInfo | None) -> None:
+        if info is None:
+            await self._executor(task.task_dict)
+            return
+
+        if info.cancel_event.is_set():
+            raise _OperationCancelledInFlight()
+
+        async def _run_executor_coro() -> None:
+            await self._executor(task.task_dict)
+
+        exec_task = asyncio.create_task(_run_executor_coro())
+        cancel_waiter = asyncio.create_task(info.cancel_event.wait())
+        info.exec_task = exec_task
+        try:
+            done, _ = await asyncio.wait(
+                [exec_task, cancel_waiter],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if exec_task in done:
+                if not cancel_waiter.done():
+                    cancel_waiter.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await cancel_waiter
+                exec_task.result()
+                return
+
+            if not exec_task.done():
+                exec_task.cancel()
+                _, stuck = await asyncio.wait([exec_task], timeout=_CANCEL_DRAIN_TIMEOUT)
+                if stuck:
+                    logger.warning(
+                        f"Task {task.operation_id} did not finish cancelling within {_CANCEL_DRAIN_TIMEOUT}s"
+                    )
+            if exec_task.done() and not exec_task.cancelled():
+                _ = exec_task.exception()
+            raise _OperationCancelledInFlight()
+        finally:
+            info.exec_task = None
+            for sub_task in (cancel_waiter, exec_task):
+                if not sub_task.done():
+                    sub_task.cancel()
+            pending_cleanup = [t for t in (cancel_waiter, exec_task) if not t.done()]
+            if pending_cleanup:
+                await asyncio.wait(pending_cleanup, timeout=_CANCEL_DRAIN_TIMEOUT)
+            for sub_task in (cancel_waiter, exec_task):
+                if sub_task.done() and not sub_task.cancelled():
+                    with suppress(BaseException):
+                        _ = sub_task.exception()
+
+    async def _run_executor(
+        self,
+        task: ClaimedTask,
+        task_type: str,
+        holder: StageHolder | None = None,
+        info: ActiveTaskInfo | None = None,
+    ) -> None:
         """Run the task executor under its type's wall-clock ceiling, if it has one."""
         wall_timeout = _wall_timeout_for(task_type)
         if wall_timeout is None:
-            await self._executor(task.task_dict)
+            await self._await_executor_cancellable(task, info)
             return
 
         ceiling = _WALL_CEILINGS[task_type]
@@ -1285,7 +1459,7 @@ class WorkerPoller:
                     progress_holder.on_progress = _extend_deadline
                 try:
                     with excluding_permit_wait(cm, wall_timeout) if ceiling.excludes_permit_wait else nullcontext():
-                        await self._executor(task.task_dict)
+                        await self._await_executor_cancellable(task, info)
                 finally:
                     if holder is not None:
                         holder.on_progress = None
@@ -1311,7 +1485,9 @@ class WorkerPoller:
         except Exception as e:
             logger.warning(f"Wall-timeout notification failed for task {task.operation_id}: {e}")
 
-    async def _execute_task_inner(self, task: ClaimedTask, holder: StageHolder | None = None):
+    async def _execute_task_inner(
+        self, task: ClaimedTask, holder: StageHolder | None = None, info: ActiveTaskInfo | None = None
+    ):
         """Inner task execution with retry/fail handling.
 
         Tasks that want to be retried raise RetryTaskAt; the poller sets next_retry_at
@@ -1362,8 +1538,15 @@ class WorkerPoller:
             else:
                 task.task_dict.pop("_schema", None)
             with worker_task(task.operation_id, task.queued_at):
-                await self._run_executor(task, task_type, holder)
+                await self._run_executor(task, task_type, holder, info)
             logger.debug(f"Task {task.operation_id} execution finished")
+        except _OperationCancelledInFlight:
+            stage = holder.stage if holder is not None else "unknown"
+            logger.info(
+                f"Task {task.operation_id} (type={task_type}, bank={bank_id}) interrupted in flight "
+                f"at stage={stage} (operation cancelled or bank deleted)"
+            )
+            return
         except _WallTimeoutExceeded as e:
             # The executor has already been cancelled; all that's left is to say so
             # clearly. Handled apart from the generic branch below so the operator
@@ -2043,20 +2226,27 @@ class WorkerPoller:
                     for task in tasks:
                         await self.execute_task(task)
 
+                await self._check_cancelled_active_tasks_if_due()
+
                 if tasks:
                     # Continue immediately to claim more tasks (if slots available)
                     continue
 
                 # No tasks claimed (either no pending tasks or slots full).
                 # Wait for the poll interval, shutdown, or a task finishing.
+                wait_timeout = (
+                    min(self._poll_interval_ms / 1000, self._cancel_check_interval_s)
+                    if self._active_tasks
+                    else self._poll_interval_ms / 1000
+                )
                 waiters = [asyncio.ensure_future(self._shutdown.wait()), asyncio.ensure_future(self._slot_freed.wait())]
                 try:
-                    await asyncio.wait(
-                        waiters, timeout=self._poll_interval_ms / 1000, return_when=asyncio.FIRST_COMPLETED
-                    )
+                    await asyncio.wait(waiters, timeout=wait_timeout, return_when=asyncio.FIRST_COMPLETED)
                 finally:
                     for w in waiters:
                         w.cancel()
+
+                await self._check_cancelled_active_tasks_if_due()
 
                 # Log progress stats periodically
                 await self._log_progress_if_due()

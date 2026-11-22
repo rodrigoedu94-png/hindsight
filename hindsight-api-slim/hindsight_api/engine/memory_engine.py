@@ -3561,6 +3561,8 @@ class MemoryEngine(MemoryEngineInterface):
         from .maintenance import MaintenanceLoop
 
         self._maintenance_loop: MaintenanceLoop | None = None
+        self._active_operation_canceller: Callable[[str], bool] | None = None
+        self._active_bank_operations_canceller: Callable[[str], int] | None = None
 
         # Backpressure mechanism: limit concurrent searches to prevent overwhelming the database
         # Configurable via HINDSIGHT_API_RECALL_MAX_CONCURRENT (default: 50)
@@ -4138,7 +4140,13 @@ class MemoryEngine(MemoryEngineInterface):
         )
 
         async with self._retrieve_archive(storage_key) as archive:
-            result = await self._run_import_documents(bank_id, archive, on_conflict, context)
+            result = await self._run_import_documents(bank_id, archive, on_conflict, context, operation_id=operation_id)
+
+        if result.cancelled:
+            logger.info(
+                "Document import operation %s cancelled; skipping completion metadata and archive cleanup", operation_id
+            )
+            return
 
         if operation_id:
             counts = {
@@ -4335,10 +4343,17 @@ class MemoryEngine(MemoryEngineInterface):
                 ),
                 operation_id=operation_id,
             )
-            # Restored documents are reported like imported ones. Only here, not in
-            # import_bank_async: a clone reuses that restore, but copies documents the
-            # tenant already has rather than bringing in new ones.
-            await self._report_imported_documents(result.bank_id, archive, result.fact_unit_ids, {}, context)
+            if not result.cancelled:
+                # Restored documents are reported like imported ones. Only here, not in
+                # import_bank_async: a clone reuses that restore, but copies documents the
+                # tenant already has rather than bringing in new ones.
+                await self._report_imported_documents(result.bank_id, archive, result.fact_unit_ids, {}, context)
+
+        if result.cancelled:
+            logger.info(
+                "Bank import operation %s cancelled; skipping completion metadata and archive cleanup", operation_id
+            )
+            return
 
         if operation_id:
             counts = {
@@ -5336,6 +5351,16 @@ class MemoryEngine(MemoryEngineInterface):
                 # and lose the "not a failure" semantics entirely.
                 raise
             except Exception as e:
+                if bank_id and _is_foreign_key_violation(e) and job_bank_bound(bank_id):
+                    try:
+                        await assert_job_bank_alive_on_pool(await self._get_backend(), bank_id)
+                    except BankDeletedError as bank_gone:
+                        logger.info(
+                            f"Dropping {task_type} (operation {operation_id}) after FK violation on deleted bank "
+                            f"{bank_id}: {bank_gone}"
+                        )
+                        audit_entry.response = {"status": "dropped", "operation_id": operation_id}
+                        return
                 if is_embedding_model_mismatch(e):
                     # This server is on the embedding model a re-embed just replaced: not a
                     # failure of the task, and it clears once a server on the new model runs it.
@@ -9462,6 +9487,7 @@ class MemoryEngine(MemoryEngineInterface):
             # own storage under its own keys (see transfer._restore_attachments).
             file_storage=self._file_storage,
             on_bank_created=on_bank_created,
+            check_alive=(lambda: self._check_op_alive(operation_id)) if operation_id else None,
         )
 
     async def import_documents_async(
@@ -9619,6 +9645,8 @@ class MemoryEngine(MemoryEngineInterface):
         # point rejects anything else, and the task path replays a value it wrote itself.
         on_conflict: "OnConflict",
         request_context: "RequestContext",
+        *,
+        operation_id: str | None = None,
     ) -> "ImportResult":
         """Run the deterministic import inline (shared by the worker handler).
 
@@ -9652,7 +9680,16 @@ class MemoryEngine(MemoryEngineInterface):
             archive=archive,
             on_conflict=on_conflict,
             outbox_callback_factory=outbox_factory,
+            check_alive=(lambda: self._check_op_alive(operation_id)) if operation_id else None,
         )
+
+        if result.cancelled:
+            logger.info(
+                "Document import cancelled for bank %s (operation %s); skipping post-import maintenance",
+                bank_id,
+                operation_id,
+            )
+            return result
 
         await self._report_imported_documents(
             bank_id, archive, result.fact_unit_ids, result.remapped_document_ids, request_context
@@ -12595,6 +12632,16 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankWriteOperation.DELETE_BANK, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
+        if not fact_type and delete_bank_profile and self._active_bank_operations_canceller is not None:
+            try:
+                cancelled_in_flight = self._active_bank_operations_canceller(bank_id)
+                if cancelled_in_flight:
+                    logger.info(
+                        f"Signalled {cancelled_in_flight} in-flight task(s) for bank {bank_id} before delete_bank"
+                    )
+            except Exception as e:
+                logger.debug(f"In-flight bank task cancellation hook failed for {bank_id}: {e}")
+
         backend = await self._get_backend()
         invalidated_obs = 0
         result: dict[str, int] = {}
@@ -12607,11 +12654,19 @@ class MemoryEngine(MemoryEngineInterface):
         # post-commit gate sits outside the transaction that fetches the row.
         bank_present = False
         freed_aliases: list[str] = []
-        async with acquire_with_retry(backend) as conn:
-            # Ensure connection is not in read-only mode (can happen with connection poolers)
-            await conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
-            async with conn.transaction():
-                try:
+
+        async def _delete_tx() -> None:
+            nonlocal invalidated_obs, result, bank_internal_id, legacy_files, bank_present, freed_aliases
+            invalidated_obs = 0
+            result = {}
+            bank_internal_id = None
+            legacy_files = []
+            bank_present = False
+            freed_aliases = []
+            async with acquire_with_retry(backend) as conn:
+                # Ensure connection is not in read-only mode (can happen with connection poolers)
+                await conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
+                async with conn.transaction():
                     # Match delete_document's bank-before-data order. Otherwise a
                     # bank delete could hold its documents while waiting for the
                     # bank row held by a concurrent document delete.
@@ -12752,26 +12807,30 @@ class MemoryEngine(MemoryEngineInterface):
                                 bank_internal_id = str(internal_id)
                             result["bank_deleted"] = True
 
-                except Exception as e:
-                    # Name the type: a lock-wait timeout or cancellation has an empty str(), and
-                    # the message alone then says nothing about what went wrong (#5805).
-                    raise Exception(f"Failed to delete agent data: {type(e).__name__}: {e}") from e
+        try:
+            await retry_with_backoff(_delete_tx, max_retries=5, max_delay=5.0)
+        except Exception as e:
+            # Name the type: a lock-wait timeout or cancellation has an empty str(), and
+            # the message alone then says nothing about what went wrong (#5805).
+            raise Exception(f"Failed to delete agent data: {type(e).__name__}: {e}") from e
 
-            # Drop per-bank vector indexes AFTER the transaction commits: the
-            # drop runs CONCURRENTLY (see ops.drop_bank_vector_indexes), which
-            # cannot run inside a transaction block. Same-process drops are
-            # serialized by the ops-level DDL lock; retry_with_backoff absorbs
-            # the residual cross-process deadlock a concurrent index build/drop
-            # on the shared memory_units table can still trigger (sqlstate
-            # 40P01 / ORA-00060) so a delete is never lost to a transient lock
-            # cycle. Sized well above the defaults: a many-process delete storm
-            # (CI teardown ran 8 workers' drops at once) drains at roughly one
-            # deadlock victim per deadlock_timeout (1s), so the default ~2.4s
-            # of backoff lost every retry; ~30s of jittered backoff outlasts
-            # any realistic pile-up.
-            if bank_internal_id:
+        # Drop per-bank vector indexes AFTER the transaction commits: the
+        # drop runs CONCURRENTLY (see ops.drop_bank_vector_indexes), which
+        # cannot run inside a transaction block. Same-process drops are
+        # serialized by the ops-level DDL lock; retry_with_backoff absorbs
+        # the residual cross-process deadlock a concurrent index build/drop
+        # on the shared memory_units table can still trigger (sqlstate
+        # 40P01 / ORA-00060) so a delete is never lost to a transient lock
+        # cycle. Sized well above the defaults: a many-process delete storm
+        # (CI teardown ran 8 workers' drops at once) drains at roughly one
+        # deadlock victim per deadlock_timeout (1s), so the default ~2.4s
+        # of backoff lost every retry; ~30s of jittered backoff outlasts
+        # any realistic pile-up.
+        if bank_internal_id:
+            internal_id_to_drop = bank_internal_id
+            async with acquire_with_retry(backend) as conn:
                 await retry_with_backoff(
-                    lambda: bank_utils.drop_bank_vector_indexes(conn, bank_internal_id, ops=self._backend.ops),
+                    lambda: bank_utils.drop_bank_vector_indexes(conn, internal_id_to_drop, ops=self._backend.ops),
                     max_retries=7,
                     max_delay=10.0,
                 )
@@ -22975,6 +23034,16 @@ class MemoryEngine(MemoryEngineInterface):
                     "error_message": None,
                 }
 
+    def register_worker_cancellers(
+        self,
+        *,
+        cancel_operation: Callable[[str], bool] | None = None,
+        cancel_bank_operations: Callable[[str], int] | None = None,
+    ) -> None:
+        """Register callbacks that immediately cancel in-flight worker tasks in this process."""
+        self._active_operation_canceller = cancel_operation
+        self._active_bank_operations_canceller = cancel_bank_operations
+
     async def cancel_operation(
         self,
         bank_id: str,
@@ -23049,12 +23118,18 @@ class MemoryEngine(MemoryEngineInterface):
             except Exception as e:
                 logger.warning(f"Failed to roll cancellation of {operation_id} up to its parent: {e}")
 
-            return {
-                "success": True,
-                "message": f"Operation {operation_id} cancelled",
-                "operation_id": operation_id,
-                "bank_id": bank_id,
-            }
+        if self._active_operation_canceller is not None:
+            try:
+                self._active_operation_canceller(operation_id)
+            except Exception as e:
+                logger.debug(f"In-flight operation cancellation hook failed for {operation_id}: {e}")
+
+        return {
+            "success": True,
+            "message": f"Operation {operation_id} cancelled",
+            "operation_id": operation_id,
+            "bank_id": bank_id,
+        }
 
     async def retry_operation(
         self,
