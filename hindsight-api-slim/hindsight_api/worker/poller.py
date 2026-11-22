@@ -250,6 +250,22 @@ PROGRESS_LOG_INTERVAL = 30
 CANCEL_CHECK_INTERVAL_S = 1.0
 
 
+def _operation_id_params(operation_ids: Iterable[str]) -> list[Any]:
+    """Bind operation ids for ``operation_id = ANY($1)``.
+
+    ``ClaimedTask`` keeps ids as strings, but the column is a uuid: pass ``uuid.UUID`` objects
+    so the Postgres driver binds a uuid[] instead of a text[]. Ids that are not uuids (some
+    test doubles) are passed through unchanged.
+    """
+    params: list[Any] = []
+    for oid in operation_ids:
+        try:
+            params.append(uuid.UUID(oid))
+        except (ValueError, AttributeError, TypeError):
+            params.append(oid)
+    return params
+
+
 class _OperationCancelledInFlight(Exception):
     """Raised when an in-flight task is interrupted because its operation was cancelled or bank deleted."""
 
@@ -917,7 +933,7 @@ class WorkerPoller:
             # swallowing the error only moved the failure to a later query.
             claim_rows = await conn.fetch(
                 f"SELECT operation_id, claimed_at FROM {table} WHERE operation_id = ANY($1)",
-                [oid for claimed_task in result for oid in claimed_task.all_operation_ids],
+                _operation_id_params(oid for claimed_task in result for oid in claimed_task.all_operation_ids),
             )
             claimed_at_by_op: dict[str, datetime] = {
                 str(r["operation_id"]): r["claimed_at"] for r in claim_rows if r["claimed_at"] is not None
@@ -1470,12 +1486,7 @@ class WorkerPoller:
                                 op_ids.append(oid)
                     if not op_ids:
                         continue
-                    param_ids: list[Any] = []
-                    for oid in op_ids:
-                        try:
-                            param_ids.append(uuid.UUID(oid))
-                        except (ValueError, AttributeError):
-                            param_ids.append(oid)
+                    param_ids = _operation_id_params(op_ids)
                     table = fq_table("async_operations", schema)
                     rows = await conn.fetch(
                         f"SELECT operation_id, status FROM {table} WHERE operation_id = ANY($1::uuid[])",
@@ -1695,12 +1706,7 @@ class WorkerPoller:
                     return
 
             table = fq_table("async_operations", task.schema)
-            param_ids: list[Any] = []
-            for oid in task.all_operation_ids:
-                try:
-                    param_ids.append(uuid.UUID(oid))
-                except (ValueError, AttributeError):
-                    param_ids.append(oid)
+            param_ids = _operation_id_params(task.all_operation_ids)
             if not param_ids:
                 return
 
