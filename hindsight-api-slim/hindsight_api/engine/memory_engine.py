@@ -12854,6 +12854,10 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankWriteOperation.DELETE_BANK, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
+        # Resolved before the in-flight gate below is taken: everything between taking the gate
+        # and the try/finally that releases it must not raise, or interrupted tasks would wait
+        # out the full reconcile timeout on a gate nobody releases.
+        backend = await self._get_backend()
         delete_schema = _current_schema.get()
         delete_gate_acquired = False
         if (
@@ -12874,7 +12878,6 @@ class MemoryEngine(MemoryEngineInterface):
             except Exception as e:
                 logger.debug(f"In-flight bank task cancellation hook failed for {bank_id}: {e}")
 
-        backend = await self._get_backend()
         invalidated_obs = 0
         result: dict[str, int] = {}
         bank_internal_id: str | None = None

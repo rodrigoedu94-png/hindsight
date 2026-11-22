@@ -1814,3 +1814,113 @@ async def test_api_delete_operation_cancels_inflight_transfer_end_to_end() -> No
         get_resp = await client.get(f"/v1/default/banks/{bank_id}/operations/{op_id}")
         assert get_resp.status_code == 200
         assert get_resp.json()["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_poller_keeps_configured_schema_qualified_while_cancel_matches_it() -> None:
+    """A non-public ``database_schema`` must stay a real schema for polling SQL.
+
+    Folding it to ``None`` made every claim/update query unqualified, so Postgres resolved
+    ``async_operations`` through ``search_path`` instead of the configured schema. Cancellation
+    still has to treat ``public``/``None`` and the configured schema as the same default tenant.
+    """
+    from hindsight_api.worker import poller as poller_module
+
+    started = asyncio.Event()
+
+    async def executor(_task_dict):
+        started.set()
+        await asyncio.sleep(60)
+
+    poller = WorkerPoller(backend=cast(Any, _FakePollerBackend()), worker_id="w-schema", executor=executor)
+    op_id = str(uuid.uuid4())
+    await poller.execute_task(
+        ClaimedTask(
+            operation_id=op_id,
+            task_dict={"type": "import_documents", "operation_type": "import_documents", "bank_id": "bank-s"},
+            schema="myschema",
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    with patch.object(poller_module, "get_config", return_value=SimpleNamespace(database_schema="myschema")):
+        assert WorkerPoller._normalize_poll_schema("myschema") == "myschema"
+        assert WorkerPoller._normalize_poll_schema("public") is None
+        # The engine reports the request schema as the configured name or as the default.
+        assert poller.is_operation_active(op_id, "myschema") is True
+        assert poller.is_operation_active(op_id, None) is True
+        assert poller.is_operation_active(op_id, "other_tenant") is False
+        assert poller.cancel_active_bank_operations("bank-s", "myschema") == 1
+    assert await poller.wait_for_active_tasks(timeout=2.0) is True
+
+
+@pytest.mark.asyncio
+async def test_poller_cancel_with_expected_claim_skips_task_with_unknown_claim() -> None:
+    """An attempt-scoped cancel must not hit a task whose claim timestamp is unknown."""
+    started = asyncio.Event()
+
+    async def executor(_task_dict):
+        started.set()
+        await asyncio.sleep(60)
+
+    poller = WorkerPoller(backend=cast(Any, _FakePollerBackend()), worker_id="w-claim", executor=executor)
+    op_id = str(uuid.uuid4())
+    await poller.execute_task(
+        ClaimedTask(
+            operation_id=op_id,
+            task_dict={"type": "import_documents", "operation_type": "import_documents", "bank_id": "bank-c"},
+            schema=None,
+            claimed_at=None,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    expected = datetime(2026, 11, 22, 16, 0, tzinfo=timezone.utc)
+    assert poller.cancel_active_operation(op_id, expected_worker_id="w-claim", expected_claimed_at=expected) is False
+    assert poller.cancel_active_operation(op_id) is True
+    assert await poller.wait_for_active_tasks(timeout=2.0) is True
+
+
+@pytest.mark.asyncio
+async def test_poller_wall_timeout_waits_for_slow_executor_cleanup_before_failing() -> None:
+    """The row must not be failed (and the slot freed) while the executor is still unwinding.
+
+    Regression: the drain after an outer cancel was capped at _CANCEL_DRAIN_TIMEOUT, so a
+    cleanup slower than that kept writing after the poller had already failed the operation.
+    """
+    events: list[str] = []
+    started = asyncio.Event()
+
+    async def executor_with_slow_cleanup(_task_dict):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            # Longer than the (patched) drain timeout below.
+            await asyncio.sleep(0.3)
+            events.append("cleanup_done")
+
+    poller = WorkerPoller(
+        backend=cast(Any, _FakePollerBackend()), worker_id="w-slow", executor=executor_with_slow_cleanup
+    )
+
+    async def _mark_failed(*_args, **_kwargs):
+        events.append("marked_failed")
+
+    poller._mark_all_failed = AsyncMock(side_effect=_mark_failed)
+
+    op_id = str(uuid.uuid4())
+    with (
+        patch("hindsight_api.worker.poller._wall_timeout_for", return_value=0.05),
+        patch("hindsight_api.worker.poller._CANCEL_DRAIN_TIMEOUT", 0.05),
+    ):
+        await poller.execute_task(
+            ClaimedTask(
+                operation_id=op_id,
+                task_dict={"type": "batch_retain", "operation_id": op_id, "bank_id": "bank-slow"},
+                schema=None,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert await poller.wait_for_active_tasks(timeout=5.0) is True
+
+    assert events == ["cleanup_done", "marked_failed"]

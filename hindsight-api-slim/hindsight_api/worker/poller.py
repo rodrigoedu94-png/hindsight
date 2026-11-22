@@ -349,6 +349,22 @@ class ActiveTaskInfo:
 
 
 @dataclass
+class _ActiveTaskMatch:
+    """An active task found for a cancellation request: the fold's primary id and its tracking info."""
+
+    primary_id: str
+    info: ActiveTaskInfo
+
+
+@dataclass
+class _BankDeleteGate:
+    """In-process gate held while ``delete_bank`` runs, so interrupted tasks reconcile after it settles."""
+
+    refcount: int
+    settled: asyncio.Event
+
+
+@dataclass
 class ClaimedTask:
     """A task claimed from the database with its schema context."""
 
@@ -496,8 +512,8 @@ class WorkerPoller:
         self._recovery_task: asyncio.Task | None = None
         # Track active tasks locally: operation_id -> ActiveTaskInfo
         self._active_tasks: dict[str, ActiveTaskInfo] = {}
-        # Active bank-delete transaction gates: (normalized_schema, bank_id) -> (refcount, settled_event)
-        self._deleting_banks: dict[tuple[str | None, str], tuple[int, asyncio.Event]] = {}
+        # Active bank-delete gates keyed by (cancel scope key, bank_id)
+        self._deleting_banks: dict[tuple[str | None, str], _BankDeleteGate] = {}
         # Track in-flight tasks by operation type
         self._in_flight_by_type: dict[str, int] = {}
         self._cancel_check_interval_s = max(0.05, cancel_check_interval_s)
@@ -524,6 +540,21 @@ class WorkerPoller:
     @staticmethod
     def _normalize_poll_schema(schema: str | None) -> str | None:
         """Use None internally for the default schema because SQL helpers omit that prefix."""
+        from ..config import DEFAULT_DATABASE_SCHEMA
+
+        return None if schema == DEFAULT_DATABASE_SCHEMA else schema
+
+    @staticmethod
+    def _cancel_scope_key(schema: str | None) -> str | None:
+        """Schema key used only to match cancellation requests against active tasks.
+
+        The engine reports the request's ``_current_schema`` (``public`` or the configured
+        ``database_schema`` in a single-tenant install), while an active task carries the schema
+        the poller claimed it under (``None`` for the default). Both spellings of the default
+        must compare equal here. This is deliberately NOT ``_normalize_poll_schema``: folding the
+        configured schema to ``None`` there made every claim/update query unqualified, so a
+        Postgres install with a non-public ``database_schema`` polled ``search_path`` instead.
+        """
         from ..config import DEFAULT_DATABASE_SCHEMA
 
         if schema in (None, DEFAULT_DATABASE_SCHEMA, get_config().database_schema):
@@ -836,18 +867,16 @@ class WorkerPoller:
             if not all_rows:
                 return []
 
-            claimed_at_by_op: dict[str, datetime] = {}
-            try:
-                claim_rows = await conn.fetch(
-                    f"SELECT operation_id, claimed_at FROM {table} WHERE operation_id = ANY($1)",
-                    [row["operation_id"] for row in all_rows],
-                )
-                if isinstance(claim_rows, (list, tuple)):
-                    claimed_at_by_op = {
-                        str(r["operation_id"]): r["claimed_at"] for r in claim_rows if r.get("claimed_at") is not None
-                    }
-            except Exception:
-                claimed_at_by_op = {}
+            # Not wrapped in try/except: this runs inside the claim transaction, and on
+            # Postgres a failed statement aborts it, so swallowing the error here only moved
+            # the failure to the fold queries below with a less useful message.
+            claim_rows = await conn.fetch(
+                f"SELECT operation_id, claimed_at FROM {table} WHERE operation_id = ANY($1)",
+                [row["operation_id"] for row in all_rows],
+            )
+            claimed_at_by_op: dict[str, datetime] = {
+                str(r["operation_id"]): r["claimed_at"] for r in claim_rows if r["claimed_at"] is not None
+            }
 
             result = []
             for row in all_rows:
@@ -1303,14 +1332,14 @@ class WorkerPoller:
                     del self._in_flight_by_type[operation_type]
             self._slot_freed.set()
 
-    def _find_active_task(self, operation_id: str, schema: str | None) -> tuple[str, ActiveTaskInfo] | None:
+    def _find_active_task(self, operation_id: str, schema: str | None) -> _ActiveTaskMatch | None:
         """Look up an active task matching ``operation_id`` (including folded members) in ``schema``."""
-        target_schema = self._normalize_poll_schema(schema)
+        target_schema = self._cancel_scope_key(schema)
         for primary_id, info in list(self._active_tasks.items()):
-            if self._normalize_poll_schema(info.schema) != target_schema:
+            if self._cancel_scope_key(info.schema) != target_schema:
                 continue
             if primary_id == operation_id or operation_id in info.all_operation_ids:
-                return primary_id, info
+                return _ActiveTaskMatch(primary_id=primary_id, info=info)
         return None
 
     def is_operation_active(self, operation_id: str, schema: str | None = None) -> bool:
@@ -1331,11 +1360,14 @@ class WorkerPoller:
         found = self._find_active_task(operation_id, schema)
         if found is None:
             return False
-        primary_id, info = found
+        primary_id, info = found.primary_id, found.info
         current = asyncio.current_task()
         if current is not None and current in (info.bg_task, info.exec_task):
             return False
-        if expected_claimed_at is not None and info.claimed_at is not None and info.claimed_at != expected_claimed_at:
+        # A caller that names an attempt only cancels that attempt. An active task whose claim
+        # timestamp is unknown cannot be proven to be it, so it is not signalled (the DB status
+        # watcher still interrupts it once it sees the row cancelled).
+        if expected_claimed_at is not None and info.claimed_at != expected_claimed_at:
             return False
         if not info.cancel_event.is_set():
             info.cancel_event.set()
@@ -1353,19 +1385,19 @@ class WorkerPoller:
         track_delete_gate: bool = False,
     ) -> int:
         """Signal immediate cancellation for all in-flight tasks targeting ``bank_id`` in ``schema``."""
-        target_schema = self._normalize_poll_schema(schema)
+        target_schema = self._cancel_scope_key(schema)
         if track_delete_gate:
             key = (target_schema, bank_id)
-            existing = self._deleting_banks.get(key)
-            if existing is None:
-                self._deleting_banks[key] = (1, asyncio.Event())
+            gate = self._deleting_banks.get(key)
+            if gate is None:
+                self._deleting_banks[key] = _BankDeleteGate(refcount=1, settled=asyncio.Event())
             else:
-                self._deleting_banks[key] = (existing[0] + 1, existing[1])
+                gate.refcount += 1
 
         current = asyncio.current_task()
         count = 0
         for op_id, info in list(self._active_tasks.items()):
-            if self._normalize_poll_schema(info.schema) != target_schema:
+            if self._cancel_scope_key(info.schema) != target_schema:
                 continue
             tracked_banks = info.bank_ids or (info.bank_id,)
             if bank_id not in tracked_banks:
@@ -1384,16 +1416,15 @@ class WorkerPoller:
 
     def finish_bank_delete(self, bank_id: str, schema: str | None = None) -> None:
         """Release an in-flight bank-delete gate so interrupted tasks can safely reconcile."""
-        key = (self._normalize_poll_schema(schema), bank_id)
-        entry = self._deleting_banks.get(key)
-        if entry is None:
+        key = (self._cancel_scope_key(schema), bank_id)
+        gate = self._deleting_banks.get(key)
+        if gate is None:
             return
-        refcount, event = entry
-        if refcount <= 1:
+        if gate.refcount <= 1:
             self._deleting_banks.pop(key, None)
-            event.set()
+            gate.settled.set()
         else:
-            self._deleting_banks[key] = (refcount - 1, event)
+            gate.refcount -= 1
 
     async def _check_cancelled_active_tasks(self) -> int:
         """Poll DB for active tasks whose operation row was cancelled or bank deleted."""
@@ -1456,6 +1487,33 @@ class WorkerPoller:
         self._last_cancel_check = now
         return await self._check_cancelled_active_tasks()
 
+    async def _drain_exec_task(self, task: ClaimedTask, exec_task: "asyncio.Task[None]") -> bool:
+        """Wait until a cancelled ``exec_task`` has fully unwound, however long its cleanup takes.
+
+        Returns True when the outer task was itself cancelled while waiting, so the caller can
+        re-raise ``CancelledError`` once the executor is done.
+
+        The wait is unbounded on purpose. When the executor was awaited inline, a wall-clock
+        timeout or shutdown cancel reached it and the poller resumed only after its cleanup
+        (e.g. batch_retain's flush) finished. Capping this at _CANCEL_DRAIN_TIMEOUT let the
+        poller mark the row failed/retried and free the slot while the old run was still
+        writing, i.e. two executions of one operation at once. A further cancel of the outer
+        task is forwarded to the executor, matching what an inline await would do.
+        """
+        outer_cancelled = False
+        while not exec_task.done():
+            try:
+                _, stuck = await asyncio.wait([exec_task], timeout=_CANCEL_DRAIN_TIMEOUT)
+            except asyncio.CancelledError:
+                outer_cancelled = True
+                exec_task.cancel()
+                continue
+            if stuck:
+                logger.warning(
+                    f"Task {task.operation_id} still unwinding after cancellation (waiting for executor cleanup)"
+                )
+        return outer_cancelled
+
     async def _await_executor_cancellable(self, task: ClaimedTask, info: ActiveTaskInfo | None) -> None:
         if info is None:
             await self._executor(task.task_dict)
@@ -1488,12 +1546,8 @@ class WorkerPoller:
                 # Cancel at most once so cleanup blocks (e.g. batch_retain's finally) are never aborted mid-flush.
                 exec_task.cancel()
                 exec_cancelled = True
-            while not exec_task.done():
-                _, stuck = await asyncio.wait([exec_task], timeout=_CANCEL_DRAIN_TIMEOUT)
-                if stuck:
-                    logger.warning(
-                        f"Task {task.operation_id} still unwinding after cancellation (waiting for executor cleanup)"
-                    )
+            if await self._drain_exec_task(task, exec_task):
+                raise asyncio.CancelledError()
             if not exec_task.cancelled():
                 with suppress(BaseException):
                     _ = exec_task.exception()
@@ -1507,7 +1561,9 @@ class WorkerPoller:
                 if not exec_cancelled:
                     exec_task.cancel()
                     exec_cancelled = True
-                await asyncio.wait([exec_task], timeout=_CANCEL_DRAIN_TIMEOUT)
+                # Reached when the outer task is cancelled (wall timeout, shutdown); the
+                # CancelledError already in flight propagates once the executor is done.
+                await self._drain_exec_task(task, exec_task)
             info.exec_task = None
             for sub_task in (cancel_waiter, exec_task):
                 if sub_task.done() and not sub_task.cancelled():
@@ -1584,13 +1640,13 @@ class WorkerPoller:
 
     async def _reconcile_cancelled_task(self, task: ClaimedTask, info: ActiveTaskInfo | None) -> None:
         """Reconcile DB rows after ``_OperationCancelledInFlight`` interrupts execution."""
-        schema_key = self._normalize_poll_schema(task.schema)
+        schema_key = self._cancel_scope_key(task.schema)
         if info is not None and info.cancelled_by_bank_delete:
             for deleted_bank_id in list(info.cancelled_by_bank_delete):
                 gate = self._deleting_banks.get((schema_key, deleted_bank_id))
                 if gate is not None:
                     with suppress(asyncio.TimeoutError):
-                        await asyncio.wait_for(gate[1].wait(), timeout=30.0)
+                        await asyncio.wait_for(gate.settled.wait(), timeout=30.0)
 
         try:
             if (
