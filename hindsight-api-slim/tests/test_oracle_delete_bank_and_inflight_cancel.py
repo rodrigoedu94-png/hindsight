@@ -1953,3 +1953,75 @@ async def test_drain_does_not_recancel_executor_cleanup_on_second_outer_cancel()
         assert await asyncio.wait_for(drain, timeout=2.0) is True
 
     assert events == ["cleanup_done"]
+
+
+@pytest.mark.asyncio
+async def test_poller_reconcile_matches_folded_peer_against_its_own_claim_timestamp() -> None:
+    """A folded peer stamped by its own UPDATE (Oracle: now() per statement) must still be requeued.
+
+    Regression: reconcile compared every row with the primary's claim timestamp, so a peer
+    whose claimed_at differed was skipped and stayed in 'processing' with no executor.
+    """
+    op_primary = str(uuid.uuid4())
+    op_peer = str(uuid.uuid4())
+    primary_claim = datetime(2026, 11, 22, 16, 0, 0, 100, tzinfo=timezone.utc)
+    peer_claim = datetime(2026, 11, 22, 16, 0, 0, 900, tzinfo=timezone.utc)
+    rows = {
+        op_primary: {"status": "cancelled", "claimed_at": primary_claim},
+        op_peer: {"status": "processing", "claimed_at": peer_claim},
+    }
+    requeue_args: list[tuple[Any, ...]] = []
+
+    class _FoldBackend:
+        backend_type = "oracle"
+
+        @asynccontextmanager
+        async def acquire(self):
+            class _Conn:
+                @asynccontextmanager
+                async def transaction(self):
+                    yield self
+
+                async def fetch(self, query: str, *args):
+                    if "FROM" in query:
+                        return [
+                            {"operation_id": oid, "worker_id": "w-fold2", **rows[str(oid)]}
+                            for oid in args[0]
+                            if str(oid) in rows
+                        ]
+                    return []
+
+                async def execute(self, query: str, *args):
+                    if "SET status = 'pending'" in query:
+                        requeue_args.append(args)
+                        rows[str(args[0])]["status"] = "pending"
+                        return "UPDATE 1"
+                    return "UPDATE 0"
+
+            yield _Conn()
+
+    started = asyncio.Event()
+
+    async def fold_exec(_task_dict):
+        started.set()
+        await asyncio.sleep(60)
+
+    poller = WorkerPoller(backend=cast(Any, _FoldBackend()), worker_id="w-fold2", executor=fold_exec)
+    await poller.execute_task(
+        ClaimedTask(
+            operation_id=op_primary,
+            task_dict={"type": "batch_retain", "operation_id": op_primary, "bank_id": "b-fold2"},
+            schema=None,
+            folded_operation_ids=[op_peer],
+            claimed_at=primary_claim,
+            member_claimed_at={op_primary: primary_claim, op_peer: peer_claim},
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    assert poller.cancel_active_operation(op_primary) is True
+    assert await poller.wait_for_active_tasks(timeout=2.0) is True
+    await _wait_until(lambda: rows[op_peer]["status"] == "pending")
+    assert rows[op_primary]["status"] == "cancelled"
+    # The guarded UPDATE carries the peer's own claim timestamp, not the primary's.
+    assert [a[2] for a in requeue_args] == [peer_claim]

@@ -343,6 +343,8 @@ class ActiveTaskInfo:
     target_bank_id: str | None = None
     bank_ids: tuple[str, ...] = ()
     claimed_at: datetime | None = None
+    #: Claim timestamp of every operation in the execution (primary and folded peers), by id.
+    member_claimed_at: dict[str, datetime] = field(default_factory=dict)
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     exec_task: "asyncio.Task[Any] | None" = None
     cancelled_by_bank_delete: set[str] = field(default_factory=set)
@@ -354,6 +356,14 @@ class _ActiveTaskMatch:
 
     primary_id: str
     info: ActiveTaskInfo
+
+
+@dataclass
+class _RequeueTarget:
+    """A surviving operation row to put back to 'pending', with the claim it must still carry."""
+
+    operation_id: Any
+    expected_claimed_at: datetime | None
 
 
 @dataclass
@@ -376,6 +386,10 @@ class ClaimedTask:
     queued_at: datetime | None = None
     #: Claim timestamp assigned by ``mark_operations_processing`` for attempt matching.
     claimed_at: datetime | None = None
+    #: Claim timestamp of every operation in the execution (primary and folded peers), by id.
+    #: Peers are stamped by their own UPDATE; on Oracle ``now()`` is per statement, so a
+    #: peer's timestamp differs from the primary's and must be matched on its own.
+    member_claimed_at: dict[str, datetime] = field(default_factory=dict)
     """Peers coalesced into this execution (see ``engine.retain.fold``).
 
     They were claimed by the same transaction that claimed ``operation_id`` and
@@ -867,18 +881,7 @@ class WorkerPoller:
             if not all_rows:
                 return []
 
-            # Not wrapped in try/except: this runs inside the claim transaction, and on
-            # Postgres a failed statement aborts it, so swallowing the error here only moved
-            # the failure to the fold queries below with a less useful message.
-            claim_rows = await conn.fetch(
-                f"SELECT operation_id, claimed_at FROM {table} WHERE operation_id = ANY($1)",
-                [row["operation_id"] for row in all_rows],
-            )
-            claimed_at_by_op: dict[str, datetime] = {
-                str(r["operation_id"]): r["claimed_at"] for r in claim_rows if r["claimed_at"] is not None
-            }
-
-            result = []
+            result: list[ClaimedTask] = []
             for row in all_rows:
                 payload = row["task_payload"]
                 # Oracle may return JSON columns as dict directly
@@ -904,9 +907,26 @@ class WorkerPoller:
                         schema=schema,
                         folded_operation_ids=folded,
                         queued_at=row.get("created_at"),
-                        claimed_at=claimed_at_by_op.get(op_id_str, row.get("claimed_at")),
                     )
                 )
+
+            # Read back every claim timestamp, peers included, AFTER folding: peers are
+            # stamped by their own UPDATE in _fold_retain_peers, so reading before the fold
+            # (as this first did) never saw them. Not wrapped in try/except: this runs inside
+            # the claim transaction, and on Postgres a failed statement aborts it, so
+            # swallowing the error only moved the failure to a later query.
+            claim_rows = await conn.fetch(
+                f"SELECT operation_id, claimed_at FROM {table} WHERE operation_id = ANY($1)",
+                [oid for claimed_task in result for oid in claimed_task.all_operation_ids],
+            )
+            claimed_at_by_op: dict[str, datetime] = {
+                str(r["operation_id"]): r["claimed_at"] for r in claim_rows if r["claimed_at"] is not None
+            }
+            for claimed_task in result:
+                claimed_task.member_claimed_at = {
+                    oid: claimed_at_by_op[oid] for oid in claimed_task.all_operation_ids if oid in claimed_at_by_op
+                }
+                claimed_task.claimed_at = claimed_at_by_op.get(claimed_task.operation_id)
             return result
 
     async def _fold_retain_peers(self, conn, table: str, row, task_dict: dict[str, Any]) -> list[str]:
@@ -1297,6 +1317,7 @@ class WorkerPoller:
             target_bank_id=target_bank_id,
             bank_ids=bank_ids,
             claimed_at=task.claimed_at,
+            member_claimed_at=dict(task.member_claimed_at),
             cancel_event=cancel_event,
         )
 
@@ -1683,7 +1704,17 @@ class WorkerPoller:
             if not param_ids:
                 return
 
-            requeue_ids: list[Any] = []
+            def _expected_claim(oid: str) -> datetime | None:
+                # Each member is matched against its own claim: folded peers are stamped by a
+                # separate UPDATE, so comparing them with the primary's timestamp (as this first
+                # did) left them stuck in 'processing' on Oracle, where now() is per statement.
+                if info is None:
+                    return None
+                if oid in info.member_claimed_at:
+                    return info.member_claimed_at[oid]
+                return info.claimed_at if oid == task.operation_id else None
+
+            requeue: list[_RequeueTarget] = []
             async with self._backend.acquire() as conn:
                 rows = await conn.fetch(
                     f"SELECT operation_id, status, worker_id, claimed_at FROM {table} "
@@ -1698,20 +1729,17 @@ class WorkerPoller:
                     row_worker = row.get("worker_id")
                     if row_worker is not None and row_worker != self._worker_id:
                         continue
+                    expected = _expected_claim(str(row["operation_id"]))
                     row_claimed_at = row.get("claimed_at")
-                    if (
-                        info is not None
-                        and info.claimed_at is not None
-                        and row_claimed_at is not None
-                        and row_claimed_at != info.claimed_at
-                    ):
+                    if expected is not None and row_claimed_at is not None and row_claimed_at != expected:
                         continue
-                    requeue_ids.append(row["operation_id"])
+                    requeue.append(_RequeueTarget(operation_id=row["operation_id"], expected_claimed_at=expected))
 
-                if requeue_ids:
-                    expected_claimed_at = info.claimed_at if info is not None else None
+                if requeue:
                     async with conn.transaction():
-                        for oid in requeue_ids:
+                        for target in requeue:
+                            oid = target.operation_id
+                            expected_claimed_at = target.expected_claimed_at
                             if expected_claimed_at is not None:
                                 await conn.execute(
                                     f"""
@@ -1745,7 +1773,7 @@ class WorkerPoller:
                                     self._worker_id,
                                 )
                     logger.info(
-                        f"Requeued {len(requeue_ids)} surviving operation(s) from interrupted task {task.operation_id}"
+                        f"Requeued {len(requeue)} surviving operation(s) from interrupted task {task.operation_id}"
                     )
         except Exception as e:
             logger.warning(f"Failed to reconcile interrupted task {task.operation_id}: {e}")
