@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hindsight_api.engine.db.oracle import OracleLiteralStr, _convert_arg
 from hindsight_api.engine.search.tags import TagGroupLeaf
 from hindsight_api.knowledge.service import KnowledgeService
 from hindsight_api.knowledge.store import (
@@ -37,9 +38,9 @@ def _load_migration_module():
         / "hindsight_api"
         / "alembic"
         / "versions"
-        / "o3c4d5e6f7a8_oracle_knowledge_banks.py"
+        / "e3c4d5e6f7a8_oracle_knowledge_banks.py"
     )
-    spec = importlib.util.spec_from_file_location("o3c4d5e6f7a8_oracle_knowledge_banks", path)
+    spec = importlib.util.spec_from_file_location("e3c4d5e6f7a8_oracle_knowledge_banks", path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -118,7 +119,7 @@ def _sample_doc_row(doc_id: str = "doc-1", *, tags: object = '["alpha", "beta"]'
 
 def test_oracle_knowledge_banks_migration_ddl_and_dialect():
     mod = _load_migration_module()
-    assert mod.revision == "o3c4d5e6f7a8"
+    assert mod.revision == "e3c4d5e6f7a8"
     assert mod.down_revision == "o2b3c4d5e6f7"
 
     exec_stmts: list[str] = []
@@ -130,12 +131,16 @@ def test_oracle_knowledge_banks_migration_ddl_and_dialect():
 
     with patch.object(mod.op, "get_bind", return_value=mock_bind):
         mod.upgrade()
+        mod.upgrade()
+        mod.downgrade()
 
     joined = "\n".join(exec_stmts)
     for tbl in ("kb_documents", "kb_passages", "kb_passage_vectors", "kb_staged_passages", "kb_staged_passage_vectors"):
-        assert f"CREATE TABLE {tbl}" in joined
+        assert joined.count(f"CREATE TABLE {tbl}") == 2
+        assert f"DROP TABLE {tbl} CASCADE CONSTRAINTS PURGE" in joined
     assert "idx_kb_passages_text" in joined
     assert "CTXSYS.CONTEXT" in joined
+    assert "privilege = 'INSERT'" in joined
     assert "GRANT SELECT, INSERT, UPDATE, DELETE ON" in joined
 
     pg_bind = MagicMock()
@@ -144,6 +149,12 @@ def test_oracle_knowledge_banks_migration_ddl_and_dialect():
         mod.upgrade()
         mod.downgrade()
     pg_bind.exec_driver_sql.assert_not_called()
+
+
+def test_oracle_literal_str_preserves_uuid_document_ids():
+    raw_uuid = "550e8400-e29b-41d4-a716-446655440000"
+    assert isinstance(_convert_arg(raw_uuid), bytes)
+    assert _convert_arg(OracleLiteralStr(raw_uuid)) == raw_uuid
 
 
 def test_load_knowledge_store_dispatches_oracle_and_postgres():
@@ -159,7 +170,14 @@ async def test_oracle_store_put_list_get_delete_and_statuses():
     conn = _FakeConn()
     backend = _FakeBackend(conn)
     store = OracleKnowledgeStore(AsyncMock(return_value=backend))
+    conn.fetch_responses.append([])  # ensure_ready dimension check on empty kb_passages
     await store.ensure_ready(1536)
+
+    conn2 = _FakeConn()
+    conn2.fetch_responses.append([{"dim": 768}])
+    store2 = OracleKnowledgeStore(AsyncMock(return_value=_FakeBackend(conn2)))
+    with pytest.raises(RuntimeError, match="does not match configured dimension 1536"):
+        await store2.ensure_ready(1536)
 
     conn.fetch_responses.append([{"document_id": "doc-1", "storage_key": "old-key"}])
     prev = await store.put_documents(
@@ -203,7 +221,7 @@ async def test_oracle_store_put_list_get_delete_and_statuses():
     conn.fetch_responses.append([{"document_id": "doc-1"}])
     deleted_count = await store.delete_some_documents("kb-1", 5)
     assert deleted_count == 1
-    assert any("FOR UPDATE SKIP LOCKED" in sql for sql, _ in conn.executed)
+    assert any("ROWNUM <= $2 FOR UPDATE SKIP LOCKED" in sql for sql, _ in conn.executed)
 
     conn.fetch_responses.append([_sample_doc_row("doc-1")])
     deleted = await store.delete_documents("kb-1", ["doc-1"])
@@ -260,6 +278,7 @@ async def test_oracle_store_stage_replace_and_passages():
     )
     assert replaced.stale_media_keys == ["stale-media"]
     assert replaced.skipped_document_ids == []
+    assert any("INSERT INTO" in sql and "kb_passages" in sql for sql, _ in conn.executemany_calls)
 
 
 @pytest.mark.asyncio
@@ -320,6 +339,32 @@ async def test_oracle_store_search_tags_stats_and_timeseries():
     assert res.hits[0].document.document_id == "doc-1"
     assert ("doc-1", 1) in res.nearby
     assert trace.candidates == 1
+    vec_arm_sql = next(sql for sql, _ in conn.executed if "FETCH EXACT FIRST" in sql)
+    assert "$[*]?(@ == $t)" in vec_arm_sql
+    assert "= '[]'" not in vec_arm_sql
+
+    # Exact tag matching: non-empty checks count, empty [] filters to untagged
+    conn.fetchval_responses.append(1)
+    conn.fetch_responses.extend([[], []])
+    await store.search(
+        "kb-1",
+        [1.0, 0.0],
+        top_k=5,
+        filters=SearchFilters(tags=["alpha"], tags_match="exact"),
+    )
+    exact_sql = next(sql for sql, _ in reversed(conn.executed) if "FETCH EXACT FIRST" in sql)
+    assert "COUNT(DISTINCT jt.tag)" in exact_sql
+
+    conn.fetchval_responses.append(1)
+    conn.fetch_responses.extend([[], []])
+    await store.search(
+        "kb-1",
+        [1.0, 0.0],
+        top_k=5,
+        filters=SearchFilters(tags=[], tags_match="exact"),
+    )
+    empty_exact_sql = next(sql for sql, _ in reversed(conn.executed) if "FETCH EXACT FIRST" in sql)
+    assert "NOT JSON_EXISTS(d.tags, '$[*]')" in empty_exact_sql
 
     conn.fetchval_responses.append(1)
     conn.fetch_responses.append([{"tag": "alpha", "documents": 2}])
@@ -345,9 +390,11 @@ async def test_oracle_store_search_tags_stats_and_timeseries():
     assert stats["kb-1"].document_count == 2
     assert stats["kb-1"].content_tokens == 100
 
-    conn.fetch_responses.append([{"t": now, "documents": 2, "passages": 4}])
+    naive_now = datetime(2026, 11, 22, 12, 0)
+    conn.fetch_responses.append([{"t": naive_now, "documents": 2, "passages": 4}])
     buckets = await store.timeseries("kb-1", since=now, trunc="day")
     assert len(buckets) == 1 and buckets[0].passages == 4
+    assert buckets[0].time.tzinfo == timezone.utc
 
 
 @pytest.mark.asyncio
@@ -385,9 +432,11 @@ async def test_knowledge_service_oracle_create_list_and_overrides():
     assert page.total == 1
     assert any("INSTR(LOWER(bank_id)" in sql for sql, _ in conn.executed)
 
-    conn.fetchval_responses.append(json.dumps({"unrelated_key": "keep", "kb_pdf_text_weight": 0.5}))
+    conn.fetchval_responses.append(json.dumps({"unrelated_key": "keep", "kb_text_passage_tokens": 256}))
     with patch.object(svc, "_open_bank", AsyncMock()):
         await svc.reset_bank_config("kb-ora", MagicMock())
     update_sql, update_args = next((s, a) for s, a in conn.executed if s.startswith("UPDATE ") and "SET config =" in s)
     assert "SYSTIMESTAMP" in update_sql
-    assert json.loads(update_args[0])["unrelated_key"] == "keep"
+    saved_cfg = json.loads(update_args[0])
+    assert saved_cfg["unrelated_key"] == "keep"
+    assert "kb_text_passage_tokens" not in saved_cfg

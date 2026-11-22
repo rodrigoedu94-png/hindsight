@@ -8,9 +8,10 @@ import logging
 import math
 import re
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, cast
 
+from ..engine.db.oracle import OracleLiteralStr
 from ..engine.db_utils import acquire_with_retry
 from ..engine.schema import fq_table
 from ..engine.search.tags import TagGroup, TagGroupAnd, TagGroupLeaf, TagGroupNot, TagGroupOr, TagsMatch
@@ -72,6 +73,15 @@ def _in_chunks(values: Sequence[Any], chunk_size: int = _ORACLE_IN_CHUNK) -> lis
     return [list(values[i : i + chunk_size]) for i in range(0, len(values), chunk_size)]
 
 
+def _lit(value: str) -> OracleLiteralStr:
+    """Wrap a VARCHAR2 string so ``OracleConnection`` never converts UUID-shaped IDs to RAW(16)."""
+    return OracleLiteralStr(value)
+
+
+def _lit_opt(value: str | None) -> OracleLiteralStr | None:
+    return OracleLiteralStr(value) if value is not None else None
+
+
 def _parse_tags(raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -85,6 +95,7 @@ def _parse_tags(raw: Any) -> list[str]:
             parsed = json.loads(text)
             return [str(x) for x in parsed] if isinstance(parsed, list) else []
         except ValueError:
+            logger.warning("Malformed JSON in kb_documents.tags; returning empty tags list")
             return []
     return list(raw)
 
@@ -121,15 +132,28 @@ def _oracle_tags_predicate(
     match: TagsMatch,
 ) -> str:
     """Build an Oracle JSON predicate over ``<alias>tags`` matching PostgreSQL semantics."""
+    col = f"{alias}tags"
+    if match == "exact":
+        if not tags:
+            return f"AND ({col} IS NULL OR NOT JSON_EXISTS({col}, '$[*]'))"
+        unique_tags = list(dict.fromkeys(tags))
+        and_clauses = []
+        for tag in unique_tags:
+            params.append(tag)
+            and_clauses.append(f"JSON_EXISTS({col}, '$[*]?(@ == $t)' PASSING ${len(params)} AS \"t\")")
+        params.append(len(unique_tags))
+        count_expr = (
+            f"(SELECT COUNT(DISTINCT jt.tag) FROM JSON_TABLE({col}, '$[*]' COLUMNS (tag VARCHAR2(4000) PATH '$')) jt)"
+        )
+        return "AND (" + " AND ".join(and_clauses) + f" AND {count_expr} = ${len(params)})"
     if not tags:
         return ""
-    col = f"{alias}tags"
     if match == "any":
         or_clauses = []
         for tag in tags:
             params.append(tag)
             or_clauses.append(f"JSON_EXISTS({col}, '$[*]?(@ == $t)' PASSING ${len(params)} AS \"t\")")
-        return f"AND (({col} IS NULL OR {col} = '[]') OR (" + " OR ".join(or_clauses) + "))"
+        return f"AND (({col} IS NULL OR NOT JSON_EXISTS({col}, '$[*]')) OR (" + " OR ".join(or_clauses) + "))"
     if match == "any_strict":
         or_clauses = []
         for tag in tags:
@@ -141,7 +165,7 @@ def _oracle_tags_predicate(
         for tag in tags:
             params.append(tag)
             and_clauses.append(f"JSON_EXISTS({col}, '$[*]?(@ == $t)' PASSING ${len(params)} AS \"t\")")
-        return f"AND (({col} IS NULL OR {col} = '[]') OR (" + " AND ".join(and_clauses) + "))"
+        return f"AND (({col} IS NULL OR NOT JSON_EXISTS({col}, '$[*]')) OR (" + " AND ".join(and_clauses) + "))"
     # all_strict
     and_clauses = []
     for tag in tags:
@@ -166,13 +190,13 @@ def _oracle_tag_group_expr(group: TagGroup, params: list[Any], alias: str) -> st
     return "1=1"
 
 
-def _oracle_in_clause(col: str, values: Sequence[str], params: list[Any]) -> str:
+def _oracle_in_clause(col: str, values: Sequence[str], params: list[Any], *, literal_str: bool = False) -> str:
     """Build a chunked ``col IN (...)`` clause safe for >1000 elements."""
     groups: list[str] = []
     for chunk in _in_chunks(values):
         placeholders = []
         for val in chunk:
-            params.append(val)
+            params.append(_lit(val) if literal_str else val)
             placeholders.append(f"${len(params)}")
         groups.append(f"{col} IN ({', '.join(placeholders)})")
     return "(" + " OR ".join(groups) + ")" if groups else "1=0"
@@ -192,7 +216,17 @@ class OracleKnowledgeStore(KnowledgeStore):
         schema = get_current_schema() or "default"
         if self._ready.get(schema) == dimension:
             return
-        # Oracle kb_passages.embedding uses a flexible VECTOR column; no ALTER is needed.
+        async with acquire_with_retry(await self._pool()) as conn:
+            rows = await conn.fetch(
+                f"SELECT DISTINCT VECTOR_DIMENSION_COUNT(embedding) AS dim "
+                f"FROM {fq_table('kb_passages')} FETCH FIRST 2 ROWS ONLY"
+            )
+            dims = {int(r["dim"]) for r in rows if r["dim"] is not None}
+            if dims and dims != {dimension}:
+                raise RuntimeError(
+                    f"Knowledge passages already store vectors of dimension {sorted(dims)}, "
+                    f"which does not match configured dimension {dimension}."
+                )
         self._ready[schema] = dimension
 
     async def get_documents(self, bank_id: str, document_ids: list[str]) -> dict[str, KnowledgeDocument]:
@@ -203,7 +237,7 @@ class OracleKnowledgeStore(KnowledgeStore):
         async with acquire_with_retry(await self._pool()) as conn:
             for chunk in _in_chunks(document_ids):
                 params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
+                in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                 rows = await conn.fetch(
                     f"SELECT {_DOC_COLUMNS} FROM {table} WHERE bank_id = $1 AND {in_sql}",
                     *params,
@@ -219,59 +253,66 @@ class OracleKnowledgeStore(KnowledgeStore):
         table = fq_table("kb_documents")
         ordered = sorted(documents, key=lambda d: d.document_id)
         doc_ids = [d.document_id for d in ordered]
-        found: dict[str, str | None] = {}
-        async with acquire_with_retry(await self._pool()) as conn, conn.transaction():
-            for chunk in _in_chunks(doc_ids):
-                params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
-                prev_rows = await conn.fetch(
-                    f"SELECT document_id, storage_key FROM {table} "
-                    f"WHERE bank_id = $1 AND {in_sql} ORDER BY document_id FOR UPDATE",
-                    *params,
-                )
-                for r in prev_rows:
-                    found[r["document_id"]] = r["storage_key"]
-
-            merge_sql = (
-                f"MERGE INTO {table} target "
-                "USING (SELECT $1 AS bank_id, $2 AS document_id, $3 AS filename, $4 AS content_type, "
-                "$5 AS media_type, $6 AS size_bytes, $7 AS storage_key, $8 AS content_hash, "
-                "$9 AS status, $10 AS tags, $11 AS source_document_id, $12 AS content_tokens FROM DUAL) src "
-                "ON (target.bank_id = src.bank_id AND target.document_id = src.document_id) "
-                "WHEN MATCHED THEN UPDATE SET "
-                "target.filename = src.filename, target.content_type = src.content_type, "
-                "target.media_type = src.media_type, target.size_bytes = src.size_bytes, "
-                "target.storage_key = src.storage_key, target.content_hash = src.content_hash, "
-                "target.status = src.status, target.error = NULL, target.tags = src.tags, "
-                "target.source_document_id = src.source_document_id, target.content_tokens = src.content_tokens, "
-                "target.updated_at = SYSTIMESTAMP "
-                "WHEN NOT MATCHED THEN INSERT "
-                "(bank_id, document_id, filename, content_type, media_type, size_bytes, storage_key, "
-                "content_hash, status, error, tags, source_document_id, content_tokens) "
-                "VALUES (src.bank_id, src.document_id, src.filename, src.content_type, src.media_type, "
-                "src.size_bytes, src.storage_key, src.content_hash, src.status, NULL, src.tags, "
-                "src.source_document_id, src.content_tokens)"
+        merge_sql = (
+            f"MERGE INTO {table} target "
+            "USING (SELECT $1 AS bank_id, $2 AS document_id, $3 AS filename, $4 AS content_type, "
+            "$5 AS media_type, $6 AS size_bytes, $7 AS storage_key, $8 AS content_hash, "
+            "$9 AS status, $10 AS tags, $11 AS source_document_id, $12 AS content_tokens FROM DUAL) src "
+            "ON (target.bank_id = src.bank_id AND target.document_id = src.document_id) "
+            "WHEN MATCHED THEN UPDATE SET "
+            "target.filename = src.filename, target.content_type = src.content_type, "
+            "target.media_type = src.media_type, target.size_bytes = src.size_bytes, "
+            "target.storage_key = src.storage_key, target.content_hash = src.content_hash, "
+            "target.status = src.status, target.error = NULL, target.tags = src.tags, "
+            "target.source_document_id = src.source_document_id, target.content_tokens = src.content_tokens, "
+            "target.updated_at = SYSTIMESTAMP "
+            "WHEN NOT MATCHED THEN INSERT "
+            "(bank_id, document_id, filename, content_type, media_type, size_bytes, storage_key, "
+            "content_hash, status, error, tags, source_document_id, content_tokens) "
+            "VALUES (src.bank_id, src.document_id, src.filename, src.content_type, src.media_type, "
+            "src.size_bytes, src.storage_key, src.content_hash, src.status, NULL, src.tags, "
+            "src.source_document_id, src.content_tokens)"
+        )
+        batch = [
+            (
+                bank_id,
+                _lit(d.document_id),
+                d.filename,
+                d.content_type,
+                d.media_type,
+                d.size_bytes,
+                d.storage_key,
+                d.content_hash,
+                d.status,
+                json.dumps(d.tags),
+                _lit_opt(d.source_document_id),
+                d.content_tokens,
             )
-            batch = [
-                (
-                    bank_id,
-                    d.document_id,
-                    d.filename,
-                    d.content_type,
-                    d.media_type,
-                    d.size_bytes,
-                    d.storage_key,
-                    d.content_hash,
-                    d.status,
-                    json.dumps(d.tags),
-                    d.source_document_id,
-                    d.content_tokens,
-                )
-                for d in ordered
-            ]
-            for chunk in _chunks(batch):
-                await conn.executemany(merge_sql, chunk)
-        return {d.document_id: found.get(d.document_id) for d in documents}
+            for d in ordered
+        ]
+        for attempt in range(2):
+            found: dict[str, str | None] = {}
+            try:
+                async with acquire_with_retry(await self._pool()) as conn, conn.transaction():
+                    for chunk in _in_chunks(doc_ids):
+                        params: list[Any] = [bank_id]
+                        in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
+                        prev_rows = await conn.fetch(
+                            f"SELECT document_id, storage_key FROM {table} "
+                            f"WHERE bank_id = $1 AND {in_sql} ORDER BY document_id FOR UPDATE",
+                            *params,
+                        )
+                        for r in prev_rows:
+                            found[r["document_id"]] = r["storage_key"]
+
+                    for chunk in _chunks(batch):
+                        await conn.executemany(merge_sql, chunk)
+                return {d.document_id: found.get(d.document_id) for d in documents}
+            except Exception as exc:
+                if attempt == 0 and "ORA-00001" in str(exc):
+                    continue
+                raise
+        return {}
 
     async def list_documents(
         self,
@@ -326,7 +367,7 @@ class OracleKnowledgeStore(KnowledgeStore):
             held: dict[str, str | None] = {}
             for chunk in _in_chunks(doc_ids):
                 params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
+                in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                 locked_rows = await conn.fetch(
                     f"SELECT document_id, storage_key FROM {table} "
                     f"WHERE bank_id = $1 AND {in_sql} ORDER BY document_id FOR UPDATE",
@@ -344,7 +385,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                 to_update.append(u)
 
             if to_update:
-                batch = [(u.status, u.error, bank_id, u.document_id) for u in to_update]
+                batch = [(u.status, u.error, bank_id, _lit(u.document_id)) for u in to_update]
                 for chunk in _chunks(batch):
                     await conn.executemany(
                         f"UPDATE {table} SET status = $1, error = $2, updated_at = SYSTIMESTAMP "
@@ -354,7 +395,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                 failed = [u.document_id for u in to_update if u.status == "failed"]
                 for chunk in _in_chunks(failed):
                     params = [bank_id]
-                    in_sql = _oracle_in_clause("document_id", chunk, params)
+                    in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                     await conn.execute(f"DELETE FROM {staged} WHERE bank_id = $1 AND {in_sql}", *params)
 
     async def _held(self, conn: Any, bank_id: str, document_ids: list[str]) -> dict[str, str | None]:
@@ -364,7 +405,7 @@ class OracleKnowledgeStore(KnowledgeStore):
         out: dict[str, str | None] = {}
         for chunk in _in_chunks(sorted(set(document_ids))):
             params: list[Any] = [bank_id]
-            in_sql = _oracle_in_clause("document_id", chunk, params)
+            in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
             rows = await conn.fetch(
                 f"SELECT document_id, storage_key FROM {table} "
                 f"WHERE bank_id = $1 AND {in_sql} ORDER BY document_id FOR UPDATE",
@@ -385,7 +426,7 @@ class OracleKnowledgeStore(KnowledgeStore):
         rows = [
             (
                 bank_id,
-                i.document_id,
+                _lit(i.document_id),
                 p.index,
                 p.modality,
                 p.text,
@@ -404,7 +445,7 @@ class OracleKnowledgeStore(KnowledgeStore):
             for chunk in _chunks(rows):
                 await conn.executemany(f"INSERT INTO {table} ({columns}) VALUES ({values})", chunk)
         extras = [
-            (bank_id, i.document_id, p.index, v.role, v.n, _vec(v.embedding))
+            (bank_id, _lit(i.document_id), p.index, v.role, v.n, _vec(v.embedding))
             for i in items
             for p in i.passages
             for v in p.extra_vectors
@@ -431,7 +472,7 @@ class OracleKnowledgeStore(KnowledgeStore):
             restart = [i.document_id for i in kept if i.staged == 0]
             for chunk in _in_chunks(restart):
                 params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
+                in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                 await conn.execute(f"DELETE FROM {staged} WHERE bank_id = $1 AND {in_sql}", *params)
             await self._insert_passages(conn, bank_id, kept, staged, fq_table("kb_staged_passage_vectors"))
         return skipped
@@ -458,7 +499,7 @@ class OracleKnowledgeStore(KnowledgeStore):
             old_keys: list[str] = []
             for chunk in _in_chunks(document_ids):
                 params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
+                in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                 old_rows = await conn.fetch(
                     f"SELECT media_key FROM {table} WHERE bank_id = $1 AND {in_sql} AND media_key IS NOT NULL",
                     *params,
@@ -470,13 +511,14 @@ class OracleKnowledgeStore(KnowledgeStore):
             moved_count: dict[str, int] = {}
             moved_keys: set[str] = set()
             for item in with_staged:
+                lit_doc_id = _lit(item.document_id)
                 for lo in range(0, item.staged, _MOVE_WINDOW):
                     hi = min(item.staged, lo + _MOVE_WINDOW)
                     staged_rows = await conn.fetch(
                         f"SELECT media_key FROM {staged_table} "
                         "WHERE bank_id = $1 AND document_id = $2 AND idx >= $3 AND idx < $4",
                         bank_id,
-                        item.document_id,
+                        lit_doc_id,
                         lo,
                         hi,
                     )
@@ -488,7 +530,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                         "SELECT bank_id, document_id, idx, modality, text, page, start_ms, end_ms, media_key, embedding "
                         f"FROM {staged_table} WHERE bank_id = $1 AND document_id = $2 AND idx >= $3 AND idx < $4",
                         bank_id,
-                        item.document_id,
+                        lit_doc_id,
                         lo,
                         hi,
                     )
@@ -498,19 +540,21 @@ class OracleKnowledgeStore(KnowledgeStore):
                         f"FROM {staged_vectors_table} "
                         "WHERE bank_id = $1 AND document_id = $2 AND idx >= $3 AND idx < $4",
                         bank_id,
-                        item.document_id,
+                        lit_doc_id,
                         lo,
                         hi,
                     )
 
             for chunk in _in_chunks(document_ids):
                 params = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
+                in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                 await conn.execute(f"DELETE FROM {staged_table} WHERE bank_id = $1 AND {in_sql}", *params)
 
             await self._insert_passages(conn, bank_id, kept, table, vectors_table)
 
-            doc_updates = [(moved_count.get(i.document_id, 0) + len(i.passages), bank_id, i.document_id) for i in kept]
+            doc_updates = [
+                (moved_count.get(i.document_id, 0) + len(i.passages), bank_id, _lit(i.document_id)) for i in kept
+            ]
             for chunk in _chunks(doc_updates):
                 await conn.executemany(
                     f"UPDATE {fq_table('kb_documents')} "
@@ -533,7 +577,7 @@ class OracleKnowledgeStore(KnowledgeStore):
         async with acquire_with_retry(await self._pool()) as conn:
             for chunk in _in_chunks(document_ids):
                 params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
+                in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                 rows = await conn.fetch(
                     f"SELECT document_id, {_PASSAGE_COLUMNS} FROM {table} "
                     f"WHERE bank_id = $1 AND {in_sql} ORDER BY document_id, idx",
@@ -553,7 +597,7 @@ class OracleKnowledgeStore(KnowledgeStore):
             params: list[Any] = [bank_id]
             conds: list[str] = []
             for doc_id, first, last in batch:
-                params.extend([doc_id, first, last])
+                params.extend([_lit(doc_id), first, last])
                 b = len(params)
                 conds.append(f"(document_id = ${b - 2} AND idx BETWEEN ${b - 1} AND ${b})")
             rows = await conn.fetch(
@@ -595,7 +639,7 @@ class OracleKnowledgeStore(KnowledgeStore):
         async with acquire_with_retry(await self._pool()) as conn:
             for chunk in _in_chunks(document_ids):
                 params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
+                in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                 rows = await conn.fetch(
                     f"SELECT media_key FROM {table} WHERE bank_id = $1 AND {in_sql} AND media_key IS NOT NULL",
                     *params,
@@ -611,7 +655,7 @@ class OracleKnowledgeStore(KnowledgeStore):
         async with acquire_with_retry(await self._pool()) as conn:
             for chunk in _in_chunks(document_ids):
                 params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("source_document_id", chunk, params)
+                in_sql = _oracle_in_clause("source_document_id", chunk, params, literal_str=True)
                 rows = await conn.fetch(
                     f"SELECT source_document_id, document_id FROM {table} "
                     f"WHERE bank_id = $1 AND {in_sql} ORDER BY document_id",
@@ -629,7 +673,7 @@ class OracleKnowledgeStore(KnowledgeStore):
         async with acquire_with_retry(await self._pool()) as conn, conn.transaction():
             for chunk in _in_chunks(sorted(set(document_ids))):
                 params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
+                in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                 rows = await conn.fetch(
                     f"SELECT {_DOC_COLUMNS} FROM {table} "
                     f"WHERE bank_id = $1 AND {in_sql} ORDER BY document_id FOR UPDATE",
@@ -645,18 +689,18 @@ class OracleKnowledgeStore(KnowledgeStore):
             return 0
         table = fq_table("kb_documents")
         async with acquire_with_retry(await self._pool()) as conn, conn.transaction():
-            # Oracle forbids FOR UPDATE with FETCH FIRST (ORA-02014); lock unlocked rows and take <= limit.
             rows = await conn.fetch(
-                f"SELECT document_id FROM {table} WHERE bank_id = $1 ORDER BY document_id FOR UPDATE SKIP LOCKED",
+                f"SELECT document_id FROM {table} WHERE bank_id = $1 AND ROWNUM <= $2 FOR UPDATE SKIP LOCKED",
                 bank_id,
+                limit,
             )
-            picked = [r["document_id"] for r in rows[:limit]]
+            picked = [r["document_id"] for r in rows]
             if not picked:
                 return 0
             total_deleted = 0
             for chunk in _in_chunks(picked):
                 params: list[Any] = [bank_id]
-                in_sql = _oracle_in_clause("document_id", chunk, params)
+                in_sql = _oracle_in_clause("document_id", chunk, params, literal_str=True)
                 await conn.execute(f"DELETE FROM {table} WHERE bank_id = $1 AND {in_sql}", *params)
                 total_deleted += len(chunk)
             return total_deleted
@@ -692,20 +736,20 @@ class OracleKnowledgeStore(KnowledgeStore):
             filter_params: list[Any] = [bank_id]
             where = ""
             if filters.document_ids:
-                where += " AND " + _oracle_in_clause("x.document_id", filters.document_ids, filter_params)
+                where += " AND " + _oracle_in_clause(
+                    "x.document_id", filters.document_ids, filter_params, literal_str=True
+                )
             if filters.media_types:
                 where += " AND " + _oracle_in_clause("d.media_type", filters.media_types, filter_params)
-            if filters.tags:
-                where += " " + _oracle_tags_predicate(filters.tags, filter_params, "d.", filters.tags_match)
+            if filters.tags or filters.tags_match == "exact":
+                where += " " + _oracle_tags_predicate(filters.tags or [], filter_params, "d.", filters.tags_match)
             if filters.tag_groups:
                 for grp in filters.tag_groups:
                     where += " AND " + _oracle_tag_group_expr(grp, filter_params, "d.")
 
             # Arm 1: primary passage embeddings (EXACT cosine distance).
             vec_params = [qvec, *filter_params]
-            p_where = where.replace("$", "__P__")
-            for idx in range(len(filter_params), 0, -1):
-                p_where = p_where.replace(f"__P__{idx}", f"${idx + 1}")
+            p_where = re.sub(r"\$(\d+)", lambda m: f"${int(m.group(1)) + 1}", where)
             primary_rows = await conn.fetch(
                 f"SELECT x.document_id, x.idx, 1 - VECTOR_DISTANCE(x.embedding, $1, COSINE) AS arm_score "
                 f"FROM {passages_table} x "
@@ -811,7 +855,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                 params = [qvec, bank_id]
                 conds = []
                 for doc_id, idx in key_batch:
-                    params.extend([doc_id, idx])
+                    params.extend([_lit(doc_id), idx])
                     b = len(params)
                     conds.append(f"(p.document_id = ${b - 1} AND p.idx = ${b})")
                 fetched = await conn.fetch(
@@ -834,7 +878,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                 params = [qvec, bank_id]
                 conds = []
                 for doc_id, idx in key_batch:
-                    params.extend([doc_id, idx])
+                    params.extend([_lit(doc_id), idx])
                     b = len(params)
                     conds.append(f"(v.document_id = ${b - 1} AND v.idx = ${b})")
                 vrows = await conn.fetch(
@@ -863,7 +907,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                     s_params: list[Any] = [qvec, bank_id]
                     conds = []
                     for i in idx_batch:
-                        s_params.extend([rows[i]["document_id"], int(rows[i]["idx"])])
+                        s_params.extend([_lit(rows[i]["document_id"]), int(rows[i]["idx"])])
                         b = len(s_params)
                         conds.append(f"(v.document_id = ${b - 1} AND v.idx = ${b})")
                     srows = await conn.fetch(
@@ -1002,10 +1046,16 @@ class OracleKnowledgeStore(KnowledgeStore):
             media_sql = f" AND media_type = ${len(params)}"
         async with acquire_with_retry(await self._pool()) as conn:
             rows = await conn.fetch(
-                f"SELECT TRUNC(created_at, '{ora_fmt}') AS t, COUNT(*) AS documents, "
+                f"SELECT TRUNC(SYS_EXTRACT_UTC(created_at), '{ora_fmt}') AS t, COUNT(*) AS documents, "
                 f"COALESCE(SUM(passage_count), 0) AS passages "
                 f"FROM {fq_table('kb_documents')} WHERE bank_id = $1 AND created_at >= $2{media_sql} "
-                f"GROUP BY TRUNC(created_at, '{ora_fmt}') ORDER BY t",
+                f"GROUP BY TRUNC(SYS_EXTRACT_UTC(created_at), '{ora_fmt}') ORDER BY t",
                 *params,
             )
-        return [TimeBucket(time=r["t"], documents=int(r["documents"]), passages=int(r["passages"])) for r in rows]
+        buckets: list[TimeBucket] = []
+        for r in rows:
+            ts = r["t"]
+            if isinstance(ts, datetime) and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            buckets.append(TimeBucket(time=ts, documents=int(r["documents"]), passages=int(r["passages"])))
+        return buckets

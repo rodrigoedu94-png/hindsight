@@ -1,6 +1,6 @@
 """Add Oracle Knowledge Banks tables, indexes, Oracle Text index, and runtime grants.
 
-Revision ID: o3c4d5e6f7a8
+Revision ID: e3c4d5e6f7a8
 Revises: o2b3c4d5e6f7
 Create Date: 2026-11-22
 
@@ -29,7 +29,7 @@ from alembic import op
 
 from hindsight_api.alembic._dialect import run_for_dialect
 
-revision: str = "o3c4d5e6f7a8"
+revision: str = "e3c4d5e6f7a8"
 down_revision: str | Sequence[str] | None = "o2b3c4d5e6f7"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -134,7 +134,7 @@ BEGIN
     SELECT DISTINCT grantee
     FROM user_tab_privs_made
     WHERE table_name = 'MEMORY_UNITS'
-      AND privilege = 'SELECT'
+      AND privilege = 'INSERT'
       AND grantee NOT IN ('PUBLIC')
   ) LOOP
     FOR t IN (
@@ -185,8 +185,8 @@ def _oracle_upgrade() -> None:
     for idx_sql in _INDEXES:
         _oracle_exec_ignoring(idx_sql, -955, -1408)
 
-    # -955: name used; -1408: already indexed; -29855: domain index creation error if ctxsys unavailable.
-    _oracle_exec_ignoring(_TEXT_INDEX, -955, -1408, -29855)
+    # -955: name used; -1408: already indexed (fail loudly on ORA-29855 so missing Oracle Text is never silent).
+    _oracle_exec_ignoring(_TEXT_INDEX, -955, -1408)
     op.get_bind().exec_driver_sql(_GRANT_KB_TABLES_PLSQL)
 
 

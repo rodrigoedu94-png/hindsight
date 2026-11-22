@@ -779,22 +779,26 @@ class KnowledgeService:
                 # bank, so the alias would silently start pointing here (see bank_utils' create path).
                 await bank_aliases.refuse_alias_as_bank_id_on_conn(conn, bank_id)
                 if getattr(conn, "backend_type", None) == "oracle":
-                    await conn.execute(
-                        f"""
-                        MERGE INTO {fq_table("banks")} target
-                        USING (SELECT $1 AS bank_id, $2 AS name, $3 AS disposition, NULL AS mission,
-                                      $4 AS internal_id, $5 AS kind FROM DUAL) src
-                        ON (target.bank_id = src.bank_id)
-                        WHEN NOT MATCHED THEN
-                            INSERT (bank_id, name, disposition, mission, internal_id, kind)
-                            VALUES (src.bank_id, src.name, src.disposition, src.mission, src.internal_id, src.kind)
-                        """,
-                        bank_id,
-                        bank_id,
-                        json.dumps(bank_utils.DEFAULT_DISPOSITION),
-                        uuid.uuid4(),
-                        KIND,
-                    )
+                    try:
+                        await conn.execute(
+                            f"""
+                            MERGE INTO {fq_table("banks")} target
+                            USING (SELECT $1 AS bank_id, $2 AS name, $3 AS disposition, NULL AS mission,
+                                          $4 AS internal_id, $5 AS kind FROM DUAL) src
+                            ON (target.bank_id = src.bank_id)
+                            WHEN NOT MATCHED THEN
+                                INSERT (bank_id, name, disposition, mission, internal_id, kind)
+                                VALUES (src.bank_id, src.name, src.disposition, src.mission, src.internal_id, src.kind)
+                            """,
+                            bank_id,
+                            bank_id,
+                            json.dumps(bank_utils.DEFAULT_DISPOSITION),
+                            uuid.uuid4(),
+                            KIND,
+                        )
+                    except Exception as exc:
+                        if "ORA-00001" not in str(exc):
+                            raise
                 else:
                     await conn.execute(
                         f"""

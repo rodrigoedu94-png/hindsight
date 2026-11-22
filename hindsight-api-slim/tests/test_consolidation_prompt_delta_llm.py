@@ -16,11 +16,54 @@ import pytest
 
 from hindsight_api import LLMConfig
 from hindsight_api.config import _get_raw_config
-from hindsight_api.engine.consolidation.consolidator import _consolidate_batch_with_llm
+from hindsight_api.engine.consolidation.consolidator import _consolidate_batch_with_llm, _FactBatchResponse
 from hindsight_api.engine.response_models import MemoryFact
 from tests.llm_judge import assert_meets_criteria
 
 pytestmark = pytest.mark.hs_llm_core
+
+
+def test_unrelated_observation_text_can_be_empty_or_omitted():
+    """Verify the schema accepts both empty and omitted observation_text for unrelated entries."""
+    payload_omitted = {
+        "facts": [
+            {
+                "fact_id": "F1",
+                "about": "Alice",
+                "kind": "lasting",
+                "existing": [
+                    {
+                        "observation_id": "O1",
+                        "observation_about": "Alice",
+                        "effect": "unrelated",
+                        "text": "",
+                    }
+                ],
+                "new": ["Alice ran backup on Tuesday."],
+            }
+        ]
+    }
+    payload_empty = {
+        "facts": [
+            {
+                "fact_id": "F1",
+                "about": "Alice",
+                "kind": "lasting",
+                "existing": [
+                    {
+                        "observation_id": "O1",
+                        "observation_about": "Alice",
+                        "effect": "unrelated",
+                        "observation_text": "",
+                        "text": "",
+                    }
+                ],
+                "new": ["Alice ran backup on Tuesday."],
+            }
+        ]
+    }
+    assert len(_FactBatchResponse.model_validate(payload_omitted).facts) == 1
+    assert len(_FactBatchResponse.model_validate(payload_empty).facts) == 1
 
 
 @pytest.mark.asyncio
@@ -61,10 +104,16 @@ async def test_real_model_respects_momentary_grumble_and_separate_event_occurren
     )
 
     assert result.failed is False, "the consolidation batch call failed outright"
+    fact_by_id = {str(m["id"]): m["text"] for m in memories}
     writes = "\n".join(
-        [f"- CREATE: {c.text}" for c in result.creates]
+        [f"- EXISTING {obs_id}: {pool[0].text}"]
+        + [
+            f"- CREATE (from {fact_by_id.get(c.source_memory_ids[0], '?') if c.source_memory_ids else '?'}): {c.text}"
+            for c in result.creates
+        ]
         + [f"- UPDATE {u.observation_id}: {u.text}" for u in result.updates]
         + [f"- DELETE {d.observation_id}: {d.reason}" for d in result.deletes]
+        + [f"- SKIPPED COUNT: {result.skips}"]
     )
     await assert_meets_criteria(
         response=writes or "(no actions)",
