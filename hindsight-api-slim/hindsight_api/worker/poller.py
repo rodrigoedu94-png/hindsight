@@ -1498,7 +1498,9 @@ class WorkerPoller:
         (e.g. batch_retain's flush) finished. Capping this at _CANCEL_DRAIN_TIMEOUT let the
         poller mark the row failed/retried and free the slot while the old run was still
         writing, i.e. two executions of one operation at once. A further cancel of the outer
-        task is forwarded to the executor, matching what an inline await would do.
+        task is recorded but NOT forwarded: the executor was already cancelled once, and a second
+        cancel would interrupt its running cleanup (the "cancel at most once" rule above).
+        Shutdown stays bounded because shutdown_graceful applies its own drain timeout.
         """
         outer_cancelled = False
         while not exec_task.done():
@@ -1506,7 +1508,6 @@ class WorkerPoller:
                 _, stuck = await asyncio.wait([exec_task], timeout=_CANCEL_DRAIN_TIMEOUT)
             except asyncio.CancelledError:
                 outer_cancelled = True
-                exec_task.cancel()
                 continue
             if stuck:
                 logger.warning(

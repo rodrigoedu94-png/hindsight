@@ -1924,3 +1924,32 @@ async def test_poller_wall_timeout_waits_for_slow_executor_cleanup_before_failin
         assert await poller.wait_for_active_tasks(timeout=5.0) is True
 
     assert events == ["cleanup_done", "marked_failed"]
+
+
+@pytest.mark.asyncio
+async def test_drain_does_not_recancel_executor_cleanup_on_second_outer_cancel() -> None:
+    """A second outer cancel during the drain must not interrupt the executor's cleanup."""
+    cleanup_started = asyncio.Event()
+    events: list[str] = []
+
+    async def executor_body() -> None:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cleanup_started.set()
+            await asyncio.sleep(0.2)
+            events.append("cleanup_done")
+
+    poller = WorkerPoller(backend=cast(Any, _FakePollerBackend()), worker_id="w-drain", executor=AsyncMock())
+    task = ClaimedTask(operation_id=str(uuid.uuid4()), task_dict={"type": "batch_retain"}, schema=None)
+    exec_task = asyncio.create_task(executor_body())
+    await asyncio.sleep(0)
+    exec_task.cancel()
+
+    with patch("hindsight_api.worker.poller._CANCEL_DRAIN_TIMEOUT", 0.05):
+        drain = asyncio.create_task(poller._drain_exec_task(task, exec_task))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=2.0)
+        drain.cancel()  # second, outer cancel while cleanup is running
+        assert await asyncio.wait_for(drain, timeout=2.0) is True
+
+    assert events == ["cleanup_done"]
