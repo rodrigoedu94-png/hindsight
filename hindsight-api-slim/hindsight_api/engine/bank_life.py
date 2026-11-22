@@ -62,6 +62,11 @@ async def bind_job_bank(pool: DatabaseBackend, bank_id: str) -> AbstractContextM
     return _bind(bank_id, internal_id)
 
 
+def bind_job_bank_internal_id(bank_id: str, internal_id: str) -> AbstractContextManager[None]:
+    """Bind ``bank_id`` to a known ``internal_id`` (e.g. immediately after creating a restored bank)."""
+    return _bind(bank_id, internal_id)
+
+
 def job_bank_bound(bank_id: str) -> bool:
     """True when the running job is bound to ``bank_id`` and must not create it."""
     bound = _job_bank.get()

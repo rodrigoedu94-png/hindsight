@@ -27,8 +27,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import IO, TYPE_CHECKING, Any, Literal, cast
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from ...schema_context import get_current_schema
 from .. import bank_aliases
+from ..bank_life import assert_job_bank_alive, assert_job_bank_alive_on_pool, bind_job_bank_internal_id
 from ..causal_links import CANONICAL_CAUSAL_LINK_TYPE, LEGACY_CAUSAL_LINK_TYPES
 from ..db.ops_postgresql import pg_search_vector_expr
 from ..db_utils import acquire_with_retry
@@ -149,6 +152,39 @@ class ImportResult:
     # Source memory-unit id -> regenerated target id, kept only for the ids the
     # caller asked for: the ones mental-model evidence and restored rows cite.
     remapped_unit_ids: dict[str, str] = field(default_factory=dict)
+    cancelled: bool = False
+
+
+class ImportCheckpoint(BaseModel):
+    """Progress of one document-import operation, saved after every committed batch.
+
+    A retry of the same operation (``retry_operation``, or a worker retry after a crash or
+    cancel) resumes from it instead of writing again what an earlier attempt committed:
+
+    - ``document_targets`` records, per source document, the id it was written under in
+      this bank. Without it a retry re-resolved conflicts, so ``new-id`` generated a fresh
+      id again and imported the document (and its facts) a second time, and documents the
+      first attempt wrote under their own id looked like pre-existing conflicts.
+    - ``observations_done`` counts the ``observations.json`` entries already handled
+      (written or skipped, in archive order), so a retry does not insert an already
+      committed observation batch a second time.
+
+    A crash between a batch's commit and this checkpoint's save still replays that one
+    batch: the batch writes and the checkpoint are separate transactions.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    document_targets: dict[str, str] = Field(default_factory=dict)
+    fact_unit_ids: dict[str, list[str | None]] = Field(default_factory=dict)
+    remapped_unit_ids: dict[str, str] = Field(default_factory=dict)
+    observations_done: int = 0
+    observations_imported: int = 0
+    observations_skipped: int = 0
+
+
+#: Persists the cumulative checkpoint after a committed batch.
+CheckpointSaver = Callable[[ImportCheckpoint], Awaitable[None]]
 
 
 @dataclass
@@ -158,6 +194,16 @@ class _ObservationOutcome:
     imported: int = 0
     skipped: int = 0
     remapped_unit_ids: dict[str, str] = field(default_factory=dict)
+    cancelled: bool = False
+
+
+class _RestoreCancelled(Exception):
+    """Internal control-flow signal raised to roll back a partially written restore transaction."""
+
+
+async def _check_cancelled(check_alive: Callable[[], Awaitable[bool]] | None) -> bool:
+    """Return True when a cooperative cancellation probe reports the op dead/cancelled."""
+    return check_alive is not None and not await check_alive()
 
 
 @dataclass
@@ -365,6 +411,9 @@ async def import_documents(
     on_conflict: OnConflict = "skip",
     ops: Any = None,
     outbox_callback_factory: Any = None,
+    check_alive: Callable[[], Awaitable[bool]] | None = None,
+    checkpoint: ImportCheckpoint | None = None,
+    on_checkpoint: CheckpointSaver | None = None,
 ) -> ImportResult:
     """Import every document in ``archive`` into ``bank_id``.
 
@@ -414,26 +463,47 @@ async def import_documents(
             ops=ops,
             outbox_callback_factory=outbox_callback_factory,
             keep_unit_ids=_referenced_ids(mental_models),
+            check_alive=check_alive,
+            checkpoint=checkpoint,
+            on_checkpoint=on_checkpoint,
         )
 
+    if result.cancelled:
+        logger.info("[transfer] Document import cancelled for bank %s", bank_id)
+        return result
+
     if mental_models or knowledge_pages:
+        if await _check_cancelled(check_alive):
+            result.cancelled = True
+            return result
+        await assert_job_bank_alive_on_pool(backend, bank_id)
         # Facts and observations were replayed under fresh ids: point the models'
         # based_on evidence at them, as the whole-bank restore does (#5298).
         _remap_mental_model_evidence(mental_models, result.remapped_unit_ids)
         mm_embeddings = await _regenerate_mental_model_embeddings(embeddings_model, mental_models)
-        async with acquire_with_retry(backend) as conn:
-            # Document archives serialize bank-row JSON values directly. Keep
-            # JSON strings as raw JSON here; treating them as decoded values
-            # would encode an object such as trigger_data as a JSON string,
-            # which later makes mental-model listing/tree endpoints fail.
-            result.mental_models_imported = await _restore_mental_models(
-                conn, mental_models, knowledge_pages, bank_rows_json_encoding="serialized"
-            )
-            await _apply_mental_model_derived_state(conn, bank_id, mm_embeddings, config)
-            result.knowledge_pages_imported = await _restore_pages(conn, bank_id, knowledge_pages)
-            # After the tree AND its mental models exist: the index is derived from rows that
-            # must already be there, and is read back from them rather than from the archive.
-            result.knowledge_pages_indexed = await _index_restored_pages(conn, bank_id, knowledge_pages, mm_embeddings)
+        try:
+            async with acquire_with_retry(backend) as conn:
+                async with conn.transaction():
+                    if await _check_cancelled(check_alive):
+                        raise _RestoreCancelled()
+                    await assert_job_bank_alive(conn, bank_id)
+                    # Document archives serialize bank-row JSON values directly. Keep
+                    # JSON strings as raw JSON here; treating them as decoded values
+                    # would encode an object such as trigger_data as a JSON string,
+                    # which later makes mental-model listing/tree endpoints fail.
+                    result.mental_models_imported = await _restore_mental_models(
+                        conn, mental_models, knowledge_pages, bank_rows_json_encoding="serialized"
+                    )
+                    await _apply_mental_model_derived_state(conn, bank_id, mm_embeddings, config)
+                    result.knowledge_pages_imported = await _restore_pages(conn, bank_id, knowledge_pages)
+                    # After the tree AND its mental models exist: the index is derived from rows that
+                    # must already be there, and is read back from them rather than from the archive.
+                    result.knowledge_pages_indexed = await _index_restored_pages(
+                        conn, bank_id, knowledge_pages, mm_embeddings
+                    )
+        except _RestoreCancelled:
+            result.cancelled = True
+            return result
 
     logger.info(
         "[transfer] Imported %d document(s), %d fact(s), %d observation(s) into bank %s "
@@ -463,6 +533,9 @@ async def _replay_documents(
     ops: Any,
     outbox_callback_factory: Any,
     keep_unit_ids: set[str],
+    check_alive: Callable[[], Awaitable[bool]] | None = None,
+    checkpoint: ImportCheckpoint | None = None,
+    on_checkpoint: CheckpointSaver | None = None,
 ) -> ImportResult:
     """Replay the archive's documents, then its observations, one bounded batch at a time.
 
@@ -471,13 +544,54 @@ async def _replay_documents(
     ``keep_unit_ids`` names the source unit ids whose new id the caller will ask for.
     """
     result = ImportResult()
+    # Mutated as batches commit and handed whole to ``on_checkpoint``; a fresh one when the
+    # caller does not persist progress.
+    progress = checkpoint if checkpoint is not None else ImportCheckpoint()
+    for source_id, unit_id in progress.remapped_unit_ids.items():
+        if source_id in keep_unit_ids:
+            result.remapped_unit_ids[source_id] = unit_id
+
+    def restore_from_checkpoint(document: TransferDocument) -> None:
+        restored_ids = list(progress.fact_unit_ids.get(document.id, []))
+        result.fact_unit_ids[document.id] = restored_ids
+        for ordinal, unit_id in enumerate(restored_ids):
+            if ordinal < len(document.facts):
+                source_id = document.facts[ordinal].source_id
+                if source_id is not None and source_id in keep_unit_ids and unit_id is not None:
+                    result.remapped_unit_ids[source_id] = unit_id
+
     for batch in _document_batches(_iter_documents(zf)):
+        if await _check_cancelled(check_alive):
+            logger.info(
+                "[transfer] Import cancelled for bank %s after %d document(s)",
+                bank_id,
+                result.documents_imported,
+            )
+            result.cancelled = True
+            return result
+        await assert_job_bank_alive_on_pool(backend, bank_id)
+
         to_import: list[tuple[TransferDocument, str]] = []
         for document in batch:
+            written_as = progress.document_targets.get(document.id)
+            if written_as is not None:
+                # An earlier attempt of this operation committed it: reuse what it wrote
+                # rather than resolving the conflict again (which, under new-id, would
+                # import it a second time under yet another id).
+                restore_from_checkpoint(document)
+                result.documents_imported += 1
+                result.facts_imported += sum(1 for u in result.fact_unit_ids[document.id] if u is not None)
+                if written_as != document.id:
+                    result.remapped_document_ids[document.id] = written_as
+                continue
             target_id = await _resolve_target_id(backend, bank_id, document.id, on_conflict)
             if target_id is None:
                 result.documents_skipped += 1
                 result.skipped_document_ids.append(document.id)
+                if document.id in progress.fact_unit_ids:
+                    # Checkpoints written before document_targets existed only carry the
+                    # facts; under skip, that is still enough to resolve observations.
+                    restore_from_checkpoint(document)
                 continue
             if target_id != document.id:
                 result.remapped_document_ids[document.id] = target_id
@@ -493,7 +607,7 @@ async def _replay_documents(
             ops=ops,
             outbox_callback_factory=outbox_callback_factory,
         )
-        for (document, _target_id), imported_facts in zip(to_import, imported_batch, strict=True):
+        for (document, target_id), imported_facts in zip(to_import, imported_batch, strict=True):
             result.documents_imported += 1
             result.facts_imported += len(imported_facts.unit_ids)
             unit_ids: list[str | None] = [None] * len(document.facts)
@@ -502,7 +616,21 @@ async def _replay_documents(
                 source_id = document.facts[ordinal].source_id
                 if source_id is not None and source_id in keep_unit_ids:
                     result.remapped_unit_ids[source_id] = unit_id
+                    progress.remapped_unit_ids[source_id] = unit_id
             result.fact_unit_ids[document.id] = unit_ids
+            progress.fact_unit_ids[document.id] = unit_ids
+            progress.document_targets[document.id] = target_id
+        if on_checkpoint is not None:
+            await on_checkpoint(progress)
+
+    if await _check_cancelled(check_alive):
+        logger.info(
+            "[transfer] Import cancelled for bank %s after %d document(s) before observations",
+            bank_id,
+            result.documents_imported,
+        )
+        result.cancelled = True
+        return result
 
     outcome = await _import_observations(
         backend=backend,
@@ -512,10 +640,14 @@ async def _replay_documents(
         fact_unit_ids=result.fact_unit_ids,
         keep_unit_ids=keep_unit_ids,
         ops=ops,
+        check_alive=check_alive,
+        progress=progress,
+        on_checkpoint=on_checkpoint,
     )
     result.observations_imported = outcome.imported
     result.observations_skipped = outcome.skipped
     result.remapped_unit_ids.update(outcome.remapped_unit_ids)
+    result.cancelled = outcome.cancelled
     return result
 
 
@@ -567,6 +699,7 @@ class BankImportResult:
     invalidated_memories_imported: int = 0
     #: Source document id -> new unit id per fact ordinal, for the post-retain hook (as on ImportResult).
     fact_unit_ids: dict[str, list[str | None]] = field(default_factory=dict)
+    cancelled: bool = False
 
 
 @dataclass
@@ -1013,8 +1146,12 @@ async def _restore_attachments(
     zf: zipfile.ZipFile,
     file_storage: Any,
     document_id_map: dict[str, str],
+    written_keys: list[str] | None = None,
 ) -> int:
     """Write attachment bytes into the target's file storage and record the rows.
+
+    ``written_keys`` collects every storage key written, so the caller can delete the
+    blobs if the transaction holding the rows rolls back (file storage is not part of it).
 
     The storage key is recomputed rather than carried: it encodes the tenant, the
     bank (``bank_storage_prefix``) and the owning document, so the source's key
@@ -1040,6 +1177,8 @@ async def _restore_attachments(
             key=key,
             metadata={"content_type": attachment.media_type, "bank_id": bank_id},
         )
+        if written_keys is not None:
+            written_keys.append(key)
         await conn.execute(
             f"""
             INSERT INTO {fq_table("attachments")}
@@ -1061,6 +1200,15 @@ async def _restore_attachments(
         )
         restored += 1
     return restored
+
+
+async def _discard_stored_keys(file_storage: Any, keys: list[str]) -> None:
+    """Best-effort delete of blobs a rolled-back restore wrote; never masks the original error."""
+    for key in dict.fromkeys(keys):
+        try:
+            await file_storage.delete(key)
+        except Exception:
+            logger.warning("[transfer] Failed to delete orphaned attachment blob %s", key, exc_info=True)
 
 
 async def _restore_operational_rows(
@@ -1201,6 +1349,7 @@ async def import_bank(
     file_storage: Any = None,
     ops: Any = None,
     on_bank_created: Callable[[Any], Awaitable[None]] | None = None,
+    check_alive: Callable[[], Awaitable[bool]] | None = None,
 ) -> BankImportResult:
     """Restore a whole bank from a ``export_bank`` archive into the target instance.
 
@@ -1244,6 +1393,7 @@ async def import_bank(
             file_storage=file_storage,
             ops=ops if ops is not None else backend.ops,
             on_bank_created=on_bank_created,
+            check_alive=check_alive,
         )
 
 
@@ -1260,6 +1410,7 @@ async def _restore_bank(
     file_storage: Any,
     ops: Any,
     on_bank_created: Callable[[Any], Awaitable[None]] | None,
+    check_alive: Callable[[], Awaitable[bool]] | None = None,
 ) -> BankImportResult:
     """:func:`import_bank`, reading the archive from the open ``zf``."""
     parsed = parse_bank_archive(zf)
@@ -1315,6 +1466,9 @@ async def _restore_bank(
     # so no connection is held across the store's round trip; idempotent, so ensuring for a bank
     # that turns out to exist already (refused just below) changes nothing.
     from ..memories import get_memories
+
+    if await _check_cancelled(check_alive):
+        return BankImportResult(bank_id=bank_id, cancelled=True)
 
     await get_memories().ensure_bank_storage(bank_id)
 
@@ -1393,124 +1547,182 @@ async def _restore_bank(
     unit_id_map: dict[str, str] = {}
     document_id_map: dict[str, str] = {}
 
-    if restoring.data:
-        doc_result = await _replay_documents(
-            zf,
-            backend=backend,
-            embeddings_model=embeddings_model,
-            entity_resolver=entity_resolver,
-            config=config,
-            format_date_fn=format_date_fn,
-            bank_id=bank_id,
-            on_conflict="skip",
-            ops=ops,
-            outbox_callback_factory=None,
-            # Every unit id the rows restored below can cite, so only those are remapped.
-            keep_unit_ids=_referenced_ids(
-                parsed.bank_rows.get("mental_models", []),
-                _iter_json_array(zf, "mental_model_history.json"),
-                _iter_json_array(zf, "data/graph_maintenance_queue.json"),
-                _iter_json_array(zf, "data/invalidated_memory_units.json"),
-            ),
-        )
-        result.documents_imported = doc_result.documents_imported
-        result.facts_imported = doc_result.facts_imported
-        result.observations_imported = doc_result.observations_imported
-        result.fact_unit_ids = doc_result.fact_unit_ids
-        unit_id_map = doc_result.remapped_unit_ids
-        document_id_map = doc_result.remapped_document_ids
-
-    # Facts and observations are replayed with fresh ids, but mental-model rows
-    # keep their ids and are restored verbatim below. Repair their grounding
-    # references before insertion so current and historical based_on data points
-    # at the target bank's units rather than the source bank's units.
-    _remap_mental_model_evidence(parsed.bank_rows.get("mental_models", []), unit_id_map)
-
-    # Re-embed restored mental models off-connection (the source embedding was
-    # stripped on export), so no DB connection is held across the embedding call.
-    mm_rows = parsed.bank_rows.get("mental_models", []) if restoring.data else []
-    mm_embeddings = await _regenerate_mental_model_embeddings(embeddings_model, mm_rows)
-
-    async with acquire_with_retry(backend) as conn:
+    with bind_job_bank_internal_id(bank_id, str(internal_id)):
         if restoring.data:
-            # After the documents: an attachment row names the document that owns
-            # it, and the queue/curation rows are keyed by units the replay has
-            # just written.
-            result.attachments_imported = await _restore_attachments(
-                conn, bank_id, parsed.attachments, zf, file_storage, document_id_map
-            )
-            operational = await _restore_operational_rows(
-                conn,
+            doc_result = await _replay_documents(
                 zf,
-                bank_id,
-                drop_operation_ids=bank_id != source_bank_id,
-                unit_id_map=unit_id_map,
-                bank_rows_json_encoding=bank_rows_json_encoding,
-            )
-            result.operations_imported = operational.operations
-            result.maintenance_queue_rows_imported = operational.queue_rows
-            result.invalidated_memories_imported = await _restore_invalidated_units(
-                conn,
-                bank_id,
-                _iter_data_rows(zf, "invalidated_memory_units", bank_id),
-                unit_id_map=unit_id_map,
-                document_id_map=document_id_map,
-                bank_rows_json_encoding=bank_rows_json_encoding,
-            )
-
-            # Synthesized knowledge rides with the memories: the evidence remapped
-            # just above points at the facts the replay has now written, so these
-            # rows are only coherent alongside them.
-            result.mental_models_imported = await _restore_mental_models(
-                conn, mm_rows, parsed.knowledge_pages, bank_rows_json_encoding=bank_rows_json_encoding
-            )
-            # Apply the regenerated embedding + backend-specific lexical state onto the
-            # restored rows (native search_vector already repopulated on insert).
-            await _apply_mental_model_derived_state(conn, bank_id, mm_embeddings, config)
-            # Restored after mental_models so the (mental_model_id, bank_id) FK resolves.
-            # Streamed: every refresh stores a full snapshot, so the history can run to
-            # gigabytes (#6259).
-            result.mental_model_history_imported = await _restore_rows(
-                conn,
-                "mental_model_history",
-                _remapped_evidence(
-                    _retargeted_history(_iter_json_array(zf, "mental_model_history.json"), bank_id), unit_id_map
+                backend=backend,
+                embeddings_model=embeddings_model,
+                entity_resolver=entity_resolver,
+                config=config,
+                format_date_fn=format_date_fn,
+                bank_id=bank_id,
+                on_conflict="skip",
+                ops=ops,
+                outbox_callback_factory=None,
+                # Every unit id the rows restored below can cite, so only those are remapped.
+                keep_unit_ids=_referenced_ids(
+                    parsed.bank_rows.get("mental_models", []),
+                    _iter_json_array(zf, "mental_model_history.json"),
+                    _iter_json_array(zf, "data/graph_maintenance_queue.json"),
+                    _iter_json_array(zf, "data/invalidated_memory_units.json"),
                 ),
-                bank_rows_json_encoding=bank_rows_json_encoding,
+                check_alive=check_alive,
             )
-            # Page tree after its backing mental models exist (page FK) and
-            # parents-first (self-referential parent_id FK).
-            result.knowledge_pages_imported = await _restore_pages(conn, bank_id, parsed.knowledge_pages)
-            # After the tree AND its mental models exist: the index is derived from rows that
-            # must already be there, and is read back from them rather than from the archive.
-            result.knowledge_pages_indexed = await _index_restored_pages(
-                conn, bank_id, parsed.knowledge_pages, mm_embeddings
-            )
+            result.documents_imported = doc_result.documents_imported
+            result.facts_imported = doc_result.facts_imported
+            result.observations_imported = doc_result.observations_imported
+            result.fact_unit_ids = doc_result.fact_unit_ids
+            unit_id_map = doc_result.remapped_unit_ids
+            document_id_map = doc_result.remapped_document_ids
+            if doc_result.cancelled:
+                result.cancelled = True
+                logger.info("[transfer] Bank import cancelled for %s after replay", bank_id)
+                return result
 
-        if restoring.bank_config:
-            result.directives_imported = await _restore_rows(
-                conn,
-                "directives",
-                parsed.bank_rows.get("directives", []),
-                bank_rows_json_encoding=bank_rows_json_encoding,
-            )
-            result.webhooks_imported = await _restore_rows(
-                conn,
-                "webhooks",
-                parsed.bank_rows.get("webhooks", []),
-                bank_rows_json_encoding=bank_rows_json_encoding,
-            )
+        if await _check_cancelled(check_alive):
+            result.cancelled = True
+            logger.info("[transfer] Bank import cancelled for %s before post-replay restore", bank_id)
+            return result
+        await assert_job_bank_alive_on_pool(backend, bank_id)
 
-        if restoring.history:
-            for table in HISTORY_TABLES:
-                rows: Iterable[dict] = _iter_json_array(zf, f"history/{table}.json")
-                rows = _retargeted_history(rows, bank_id) if bank_id != source_bank_id else _pinned(rows, bank_id)
-                result.history_rows_imported += await _restore_rows(
-                    conn,
-                    table,
-                    rows,
-                    bank_rows_json_encoding=bank_rows_json_encoding,
-                )
+        # Facts and observations are replayed with fresh ids, but mental-model rows
+        # keep their ids and are restored verbatim below. Repair their grounding
+        # references before insertion so current and historical based_on data points
+        # at the target bank's units rather than the source bank's units.
+        _remap_mental_model_evidence(parsed.bank_rows.get("mental_models", []), unit_id_map)
+
+        # Re-embed restored mental models off-connection (the source embedding was
+        # stripped on export), so no DB connection is held across the embedding call.
+        mm_rows = parsed.bank_rows.get("mental_models", []) if restoring.data else []
+        mm_embeddings = await _regenerate_mental_model_embeddings(embeddings_model, mm_rows)
+
+        if await _check_cancelled(check_alive):
+            result.cancelled = True
+            logger.info("[transfer] Bank import cancelled for %s after mental-model embeddings", bank_id)
+            return result
+
+        # Attachment blobs go to file storage, outside the transaction below. If it rolls back
+        # (cancellation, a deleted target, any restore error) the rows naming them are gone and
+        # the blobs would stay orphaned, so they are deleted again. Every key is under this
+        # restore's own bank prefix (a bank this call created), so none belongs to anyone else.
+        written_attachment_keys: list[str] = []
+        try:
+            try:
+                async with acquire_with_retry(backend) as conn:
+                    async with conn.transaction():
+
+                        async def _guard_restore_step() -> None:
+                            if await _check_cancelled(check_alive):
+                                raise _RestoreCancelled()
+                            await assert_job_bank_alive(conn, bank_id)
+
+                        if restoring.data:
+                            await _guard_restore_step()
+                            # After the documents: an attachment row names the document that owns
+                            # it, and the queue/curation rows are keyed by units the replay has
+                            # just written.
+                            result.attachments_imported = await _restore_attachments(
+                                conn,
+                                bank_id,
+                                parsed.attachments,
+                                zf,
+                                file_storage,
+                                document_id_map,
+                                written_keys=written_attachment_keys,
+                            )
+                            await _guard_restore_step()
+                            operational = await _restore_operational_rows(
+                                conn,
+                                zf,
+                                bank_id,
+                                drop_operation_ids=bank_id != source_bank_id,
+                                unit_id_map=unit_id_map,
+                                bank_rows_json_encoding=bank_rows_json_encoding,
+                            )
+                            result.operations_imported = operational.operations
+                            result.maintenance_queue_rows_imported = operational.queue_rows
+                            result.invalidated_memories_imported = await _restore_invalidated_units(
+                                conn,
+                                bank_id,
+                                _iter_data_rows(zf, "invalidated_memory_units", bank_id),
+                                unit_id_map=unit_id_map,
+                                document_id_map=document_id_map,
+                                bank_rows_json_encoding=bank_rows_json_encoding,
+                            )
+
+                            await _guard_restore_step()
+                            # Synthesized knowledge rides with the memories: the evidence remapped
+                            # just above points at the facts the replay has now written, so these
+                            # rows are only coherent alongside them.
+                            result.mental_models_imported = await _restore_mental_models(
+                                conn, mm_rows, parsed.knowledge_pages, bank_rows_json_encoding=bank_rows_json_encoding
+                            )
+                            # Apply the regenerated embedding + backend-specific lexical state onto the
+                            # restored rows (native search_vector already repopulated on insert).
+                            await _apply_mental_model_derived_state(conn, bank_id, mm_embeddings, config)
+                            await _guard_restore_step()
+                            # Restored after mental_models so the (mental_model_id, bank_id) FK resolves.
+                            # Streamed: every refresh stores a full snapshot, so the history can run to
+                            # gigabytes (#6259).
+                            result.mental_model_history_imported = await _restore_rows(
+                                conn,
+                                "mental_model_history",
+                                _remapped_evidence(
+                                    _retargeted_history(_iter_json_array(zf, "mental_model_history.json"), bank_id),
+                                    unit_id_map,
+                                ),
+                                bank_rows_json_encoding=bank_rows_json_encoding,
+                            )
+                            await _guard_restore_step()
+                            # Page tree after its backing mental models exist (page FK) and
+                            # parents-first (self-referential parent_id FK).
+                            result.knowledge_pages_imported = await _restore_pages(
+                                conn, bank_id, parsed.knowledge_pages
+                            )
+                            # After the tree AND its mental models exist: the index is derived from rows that
+                            # must already be there, and is read back from them rather than from the archive.
+                            result.knowledge_pages_indexed = await _index_restored_pages(
+                                conn, bank_id, parsed.knowledge_pages, mm_embeddings
+                            )
+
+                        if restoring.bank_config:
+                            await _guard_restore_step()
+                            result.directives_imported = await _restore_rows(
+                                conn,
+                                "directives",
+                                parsed.bank_rows.get("directives", []),
+                                bank_rows_json_encoding=bank_rows_json_encoding,
+                            )
+                            result.webhooks_imported = await _restore_rows(
+                                conn,
+                                "webhooks",
+                                parsed.bank_rows.get("webhooks", []),
+                                bank_rows_json_encoding=bank_rows_json_encoding,
+                            )
+
+                        if restoring.history:
+                            for table in HISTORY_TABLES:
+                                await _guard_restore_step()
+                                rows: Iterable[dict] = _iter_json_array(zf, f"history/{table}.json")
+                                rows = (
+                                    _retargeted_history(rows, bank_id)
+                                    if bank_id != source_bank_id
+                                    else _pinned(rows, bank_id)
+                                )
+                                result.history_rows_imported += await _restore_rows(
+                                    conn,
+                                    table,
+                                    rows,
+                                    bank_rows_json_encoding=bank_rows_json_encoding,
+                                )
+            except BaseException:
+                await _discard_stored_keys(file_storage, written_attachment_keys)
+                raise
+        except _RestoreCancelled:
+            result.cancelled = True
+            logger.info("[transfer] Bank import cancelled for %s during final restore", bank_id)
+            return result
 
     logger.info(
         "[transfer] Imported bank %s (data=%s, bank_config=%s, history=%s): %d doc(s), %d fact(s), "
@@ -1640,6 +1852,7 @@ async def _import_document_batch(
         # A store's retain session is per document, so a store-owned bank keeps one write each.
         imported: list[_ImportedFactBatch] = []
         for doc in prepared:
+            await assert_job_bank_alive_on_pool(backend, bank_id)
             # Fire the same retain.completed webhook retain emits. Factory returns None when no
             # webhook manager exists.
             outbox_callback = (
@@ -1714,6 +1927,7 @@ async def _import_document_batch(
 
     async with acquire_with_retry(backend) as conn:
         async with conn.transaction():
+            await assert_job_bank_alive(conn, bank_id)
             for doc in prepared:
                 document = doc.document
                 # is_first_batch=True: cascade-delete any existing data for this id
@@ -1905,6 +2119,9 @@ async def _write_document_to_store(
             entity_resolver=entity_resolver,
             log_buffer=log_buffer,
         )
+        # Revalidate bank identity right before committing to an external store so a concurrent
+        # delete+recreate during retention/extraction never lands in a replacement bank.
+        await assert_job_bank_alive_on_pool(backend, bank_id)
         await session.commit()
     except BaseException:
         await session.abort()
@@ -1977,6 +2194,9 @@ async def _import_observations(
     fact_unit_ids: dict[str, list[str | None]],
     keep_unit_ids: set[str],
     ops: Any,
+    check_alive: Callable[[], Awaitable[bool]] | None = None,
+    progress: ImportCheckpoint | None = None,
+    on_checkpoint: CheckpointSaver | None = None,
 ) -> _ObservationOutcome:
     """Insert observations whose source facts were all imported in this run.
 
@@ -1998,6 +2218,11 @@ async def _import_observations(
 
     store = get_memories()
     outcome = _ObservationOutcome()
+    # Resume after the observations an earlier attempt already handled (see ImportCheckpoint).
+    already_done = progress.observations_done if progress is not None else 0
+    if progress is not None:
+        outcome.imported = progress.observations_imported
+        outcome.skipped = progress.observations_skipped
 
     def source_unit_id(source: TransferObservationSource) -> str | None:
         unit_ids = fact_unit_ids.get(source.document_id)
@@ -2005,10 +2230,15 @@ async def _import_observations(
             return None
         return unit_ids[source.fact_index]
 
-    async def write(batch: list[tuple[TransferObservation, list[str]]]) -> None:
+    async def write(batch: list[tuple[TransferObservation, list[str]]], done_through: int) -> bool:
+        if await _check_cancelled(check_alive):
+            outcome.cancelled = True
+            return False
+        await assert_job_bank_alive_on_pool(backend, bank_id)
         # Observations embed the raw text (matching consolidation), not the
         # date-augmented text used for facts.
         embeddings = await _embed_in_batches(embeddings_model, [obs.text for obs, _ in batch])
+        await assert_job_bank_alive_on_pool(backend, bank_id)
         processed = [
             ProcessedFact(
                 fact_text=obs.text,
@@ -2037,18 +2267,29 @@ async def _import_observations(
         )
         outcome.imported += written.imported
         outcome.skipped += written.skipped
-        outcome.remapped_unit_ids.update(
-            (source_id, unit_id)
-            for source_id, unit_id in written.remapped_unit_ids.items()
-            if source_id in keep_unit_ids
-        )
+        kept = {
+            source_id: unit_id for source_id, unit_id in written.remapped_unit_ids.items() if source_id in keep_unit_ids
+        }
+        outcome.remapped_unit_ids.update(kept)
+        if progress is not None:
+            # Everything before ``done_through`` is now written or was skipped.
+            progress.observations_done = done_through
+            progress.observations_imported = outcome.imported
+            progress.observations_skipped = outcome.skipped
+            progress.remapped_unit_ids.update(kept)
+            if on_checkpoint is not None:
+                await on_checkpoint(progress)
+        return True
 
     # One transaction per batch: the source facts are already committed, so a batch only
     # needs its own sources, and a whole-set insert outgrew PostgreSQL's 1 GB message (#5418).
     # A failure midway leaves the earlier batches in place, as a failed document batch does;
     # an import-bank retry discards the half-restored bank and starts over.
     batch: list[tuple[TransferObservation, list[str]]] = []
-    for obs in observations:
+    position = 0
+    for position, obs in enumerate(observations, start=1):
+        if position <= already_done:
+            continue
         # Drop any observation whose sources weren't all imported (e.g. a subset/skip import).
         source_ids = [source_unit_id(s) for s in obs.sources]
         if not source_ids or any(sid is None for sid in source_ids):
@@ -2056,10 +2297,11 @@ async def _import_observations(
             continue
         batch.append((obs, [sid for sid in source_ids if sid is not None]))
         if len(batch) >= _OBSERVATION_BATCH_SIZE:
-            await write(batch)
+            if not await write(batch, position):
+                return outcome
             batch = []
     if batch:
-        await write(batch)
+        await write(batch, position)
     return outcome
 
 
