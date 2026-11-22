@@ -1,0 +1,19 @@
+name: PR review bot
+
+# Posts a first-look review comment on each opened/reopened PR.
+on:
+  pull_request:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/pr_review_bot.py ${{ github.event.pull_request.number }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
