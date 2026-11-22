@@ -1,0 +1,19 @@
+name: PR label bot
+
+# Labels each new PR by the areas its diff touches ("core", "docs").
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/pr_labels.py ${{ github.event.pull_request.number }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
