@@ -1188,13 +1188,18 @@ class OracleConnection(DatabaseConnection):
         try:
             yield self
         except BaseException:
-            rb_cursor = self._conn.cursor()
+            rb_cursor = None
             try:
+                rb_cursor = self._conn.cursor()
                 await rb_cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
             except BaseException as rb_err:
                 logger.debug(f"ROLLBACK TO SAVEPOINT {sp_name} failed during unwind: {rb_err!r}")
             finally:
-                rb_cursor.close()
+                if rb_cursor is not None:
+                    try:
+                        rb_cursor.close()
+                    except BaseException as close_err:
+                        logger.debug(f"Closing rollback cursor for {sp_name} failed: {close_err!r}")
             raise
 
     # -- DML methods ------------------------------------------------------
@@ -1717,13 +1722,23 @@ class OracleBackend(DatabaseBackend):
             return None
 
     async def _release_or_drop_conn(self, pool: Any, conn: Any, *, broken: bool) -> None:
-        """Return a healthy connection to the pool or drop a broken/unclean one."""
-        if broken and hasattr(pool, "drop"):
-            try:
-                await pool.drop(conn)
-                return
-            except Exception as drop_err:
-                logger.debug(f"Oracle pool.drop failed; falling back to release: {drop_err!r}")
+        """Return a healthy connection to the pool or drop/close a broken/unclean one."""
+        if broken:
+            if hasattr(pool, "drop"):
+                try:
+                    await pool.drop(conn)
+                    return
+                except BaseException as drop_err:
+                    logger.warning(f"Oracle pool.drop failed; closing connection without releasing: {drop_err!r}")
+            close_fn = getattr(conn, "close", None)
+            if callable(close_fn):
+                try:
+                    res = close_fn()
+                    if inspect.isawaitable(res):
+                        await res
+                except BaseException as close_err:
+                    logger.debug(f"Oracle conn.close failed while discarding broken connection: {close_err!r}")
+            return
         await pool.release(conn)
 
     @asynccontextmanager
@@ -1734,6 +1749,8 @@ class OracleBackend(DatabaseBackend):
             pool.acquire(), pool_stats=self._pool_stats, warn_threshold_s=self._acquire_warn_threshold_s
         )
         broken = False
+        committed = False
+        unwinding = False
         try:
             await self._set_session_schema(conn)
             wrapper = OracleConnection(conn)
@@ -1742,10 +1759,12 @@ class OracleBackend(DatabaseBackend):
             # Auto-commit on clean exit (asyncpg uses autocommit by default;
             # oracledb does not, so we must commit explicitly)
             await conn.commit()
+            committed = True
         except BaseException:
             # Roll back on cancellation (BaseException) as well as Exception so
             # an aborted task never hands an open transaction or held row locks
             # back to another caller from the pool.
+            unwinding = True
             try:
                 await conn.rollback()
             except BaseException as rb_err:
@@ -1753,7 +1772,19 @@ class OracleBackend(DatabaseBackend):
                 logger.debug(f"Oracle rollback failed during session unwind; dropping connection: {rb_err!r}")
             raise
         finally:
-            await self._release_or_drop_conn(pool, conn, broken=broken)
+            if broken:
+                await self._release_or_drop_conn(pool, conn, broken=True)
+            elif committed or unwinding:
+                try:
+                    await self._release_or_drop_conn(pool, conn, broken=False)
+                except BaseException as rel_err:
+                    logger.warning(
+                        f"Oracle pool.release failed after {'commit' if committed else 'unwind'}; "
+                        f"discarding connection: {rel_err!r}"
+                    )
+                    await self._release_or_drop_conn(pool, conn, broken=True)
+            else:
+                await self._release_or_drop_conn(pool, conn, broken=False)
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[OracleConnection]:
