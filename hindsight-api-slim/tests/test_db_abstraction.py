@@ -2012,6 +2012,40 @@ class TestOracleSessionAndClobBinding:
 
         await purge_bank_rows(conn=FakeConn(), fq_table=lambda t: t, bank_id="b1")
         links_idx = next(i for i, q in enumerate(executed) if "DELETE FROM memory_links" in q)
+        docs_idx = next(i for i, q in enumerate(executed) if "DELETE FROM documents" in q)
         units_idx = next(i for i, q in enumerate(executed) if "DELETE FROM memory_units" in q)
         entities_idx = next(i for i, q in enumerate(executed) if "DELETE FROM entities" in q)
-        assert links_idx < units_idx < entities_idx
+        assert links_idx < docs_idx < units_idx < entities_idx
+
+    @pytest.mark.asyncio
+    async def test_purge_bank_rows_oracle_locks_links_in_canonical_order_before_documents(self):
+        from hindsight_api.engine.memories.pg.engine_curation import purge_bank_rows
+
+        events: list[tuple[str, str]] = []
+
+        class FakeOracleConn:
+            backend_type = "oracle"
+
+            async def fetch(self, query, *args):
+                events.append(("fetch", " ".join(query.split())))
+                return []
+
+            async def execute(self, query, *args):
+                events.append(("execute", " ".join(query.split())))
+                return "DELETE 0"
+
+        await purge_bank_rows(conn=FakeOracleConn(), fq_table=lambda t: t, bank_id="b1")
+        lock_idx = next(
+            i
+            for i, (kind, q) in enumerate(events)
+            if kind == "fetch"
+            and "FROM memory_links" in q
+            and "ORDER BY from_unit_id, to_unit_id, link_type, entity_id FOR UPDATE" in q
+        )
+        del_links_idx = next(
+            i for i, (kind, q) in enumerate(events) if kind == "execute" and "DELETE FROM memory_links" in q
+        )
+        del_docs_idx = next(
+            i for i, (kind, q) in enumerate(events) if kind == "execute" and "DELETE FROM documents" in q
+        )
+        assert lock_idx < del_links_idx < del_docs_idx

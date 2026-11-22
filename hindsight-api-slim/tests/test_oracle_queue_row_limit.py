@@ -148,34 +148,49 @@ async def test_fetch_applies_detected_capability_to_executed_sql(version: str) -
 @pytest.mark.parametrize("already_claimed", [False, True])
 async def test_actual_queue_queries_keep_guards_and_native_limit(kind: str, already_claimed: bool) -> None:
     ops = OracleOps()
-    conn = MagicMock()
-    conn.fetch = AsyncMock(return_value=[])
+    cursor = MagicMock()
+    cursor.execute = AsyncMock()
+    cursor.fetchall = AsyncMock(return_value=[])
+    cursor.description = None
+    raw = MagicMock()
+    raw.version = "23.26.4.1.0"
+    raw.cursor.return_value = cursor
+    conn = OracleConnection(raw)
     table = "HS_QUEUE_TEST.async_operations"
     claimed = ["00000000-0000-0000-0000-000000000001"] if already_claimed else []
 
-    if kind == "reserved":
-        await ops._claim_reserved_tasks(conn, table, 3, "retain")
-    elif kind == "shared":
-        await ops._claim_shared_tasks(conn, table, claimed, 3)
-    elif kind == "consolidation":
-        await ops._claim_consolidation_plain(conn, table, claimed, 3)
-    elif kind == "like":
-        await ops._claim_consolidation_like(conn, table, claimed, 3, ["test-%"])
-    elif kind == "not_like":
-        await ops._claim_consolidation_not_like(conn, table, claimed, 3, ["test-%"])
-    else:
-        await ops.fetch_foldable_retain_peers(conn, table, "test-bank", "test-key", 3)
+    with patch("hindsight_api.engine.db.oracle._import_oracledb"):
+        if kind == "reserved":
+            await ops._claim_reserved_tasks(conn, table, 3, "retain")
+        elif kind == "shared":
+            await ops._claim_shared_tasks(conn, table, claimed, 3)
+        elif kind == "consolidation":
+            await ops._claim_consolidation_plain(conn, table, claimed, 3)
+        elif kind == "like":
+            await ops._claim_consolidation_like(conn, table, claimed, 3, ["test-%"])
+        elif kind == "not_like":
+            await ops._claim_consolidation_not_like(conn, table, claimed, 3, ["test-%"])
+        else:
+            await ops.fetch_foldable_retain_peers(conn, table, "test-bank", "test-key", 3)
 
-    original = conn.fetch.await_args.args[0]
-    query = _normalized(_rewrite_pg_to_oracle(original, supports_for_update_row_limit=True).query)
+    query = _normalized(cursor.execute.await_args.args[0])
+    params = cursor.execute.await_args.args[1]
 
     assert "LIMIT" not in query
     assert "ROWNUM" not in query
+    assert "ANY(" not in query
+    assert "ALL(" not in query
     assert "FETCH FIRST :" in query
     assert query.index("ORDER BY") < query.index("FETCH FIRST") < query.index("FOR UPDATE SKIP LOCKED")
     assert "status = 'pending'" in query
     assert "task_payload IS NOT NULL" in query
     assert "SYSTIMESTAMP" in query
+    if kind in ("like", "not_like"):
+        assert any(str(v) == "test-%" for v in params.values())
+        if kind == "like":
+            assert "LIKE :lk0_0" in query
+        else:
+            assert "NOT LIKE :nlk0_0" in query
     if kind == "fold":
         assert "bank_id = :1" in query
         assert "serialization_key = :2" in query
@@ -184,3 +199,4 @@ async def test_actual_queue_queries_keep_guards_and_native_limit(kind: str, alre
         assert "WHERE bank_peer.bank_id = o.bank_id" in query
         if kind in ("shared", "reserved"):
             assert "WHERE doc_peer.bank_id = o.bank_id" in query
+    cursor.close.assert_called_once_with()

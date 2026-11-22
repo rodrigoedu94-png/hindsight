@@ -142,16 +142,22 @@ async def purge_bank_rows(*, conn, fq_table: Callable[[str], str], bank_id: str)
         )
     ]
 
+    # Lock and delete memory_links BEFORE documents / memory_units / entities
+    # so cascading deletes never remove bidirectional links in arbitrary endpoint
+    # order and deadlock against concurrent link writers (#4251, PI-96).
+    if getattr(conn, "backend_type", None) == "oracle":
+        await conn.fetch(
+            f"SELECT ROWID FROM {fq_table('memory_links')} "
+            f"WHERE bank_id = $1 ORDER BY from_unit_id, to_unit_id, link_type, entity_id FOR UPDATE",
+            bank_id,
+        )
+    await conn.execute(f"DELETE FROM {fq_table('memory_links')} WHERE bank_id = $1", bank_id)
+
     # Delete documents (cascades to chunks)
     await conn.execute(f"DELETE FROM {fq_table('documents')} WHERE bank_id = $1", bank_id)
     # Attachments hang off the bank, not a document, so clearing a bank
     # that stays would otherwise keep every one of them.
     await conn.execute(f"DELETE FROM {fq_table('attachments')} WHERE bank_id = $1", bank_id)
-
-    # Delete memory_links before memory_units / entities so the FK cascade does
-    # not remove bidirectional links in arbitrary endpoint order and deadlock
-    # against concurrent link writers (#4251, PI-96).
-    await conn.execute(f"DELETE FROM {fq_table('memory_links')} WHERE bank_id = $1", bank_id)
 
     # Delete memory units (cascades to unit_entities, memory_links)
     await conn.execute(f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1", bank_id)

@@ -197,3 +197,32 @@ class TestStripReasoningTags:
         extracted = _message_content(msg)
         assert extracted == '{"facts": []}'
         assert _strip_reasoning_tags(extracted) == '{"facts": []}'
+
+        all_thinking = {"content": [{"type": "thinking", "thinking": "only thinking"}]}
+        assert _message_content(all_thinking) == ""
+
+    def test_batch_result_from_chat_completion_normalizes_typed_blocks(self):
+        from hindsight_api.engine.providers.openai_compatible_llm import batch_result_from_chat_completion
+
+        mixed = batch_result_from_chat_completion(
+            "req-1",
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "thinking", "thinking": "internal"},
+                                {"type": "text", "text": '{"facts": ["ok"]}'},
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+        assert mixed.content == '{"facts": ["ok"]}'
+
+        thinking_only = batch_result_from_chat_completion(
+            "req-2",
+            {"choices": [{"message": {"content": [{"type": "thinking", "thinking": "internal"}]}}]},
+        )
+        assert thinking_only.content == ""

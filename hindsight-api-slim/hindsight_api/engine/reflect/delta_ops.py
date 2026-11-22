@@ -233,6 +233,18 @@ Operation = Annotated[
 
 _OPERATION_ADAPTER: TypeAdapter[Operation] = TypeAdapter(Operation)
 
+RetractionOperation = Annotated[
+    Union[
+        ReplaceBlockOp,
+        RemoveBlockOp,
+        RemoveSectionOp,
+        ReplaceSectionBlocksOp,
+    ],
+    Field(discriminator="op"),
+]
+
+_RETRACTION_OPERATION_ADAPTER: TypeAdapter[RetractionOperation] = TypeAdapter(RetractionOperation)
+
 # Payload fields carrying markdown; kept out of the audit summary so a refresh's
 # operation log stays readable (and small enough to store in reflect_response).
 _BODY_FIELDS = ("text", "blocks")
@@ -252,7 +264,7 @@ class RejectedOperation:
     error: str
 
 
-def _validate_operations_list(raw_ops: Any) -> list[Operation]:
+def _validate_operations_list(raw_ops: Any, *, adapter: TypeAdapter[Any] = _OPERATION_ADAPTER) -> list[Operation]:
     """Validate every operation, and refuse the batch if any one of them fails.
 
     Strict by decision (#4443), where this used to drop the bad op and keep the
@@ -268,7 +280,7 @@ def _validate_operations_list(raw_ops: Any) -> list[Operation]:
     rejected: list[RejectedOperation] = []
     for i, item in enumerate(raw_ops):
         try:
-            operations.append(_OPERATION_ADAPTER.validate_python(item))
+            operations.append(adapter.validate_python(item))
         except ValidationError as exc:
             # One line per pydantic error, in the words the model needs to fix it.
             error = "; ".join(
@@ -290,6 +302,13 @@ class DeltaOperationList(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     operations: list[Operation] = Field(default_factory=list)
+
+
+class RetractionOperationList(BaseModel):
+    """Subtraction-only operations permitted during mental-model retraction."""
+
+    model_config = ConfigDict(extra="forbid")
+    operations: list[RetractionOperation] = Field(default_factory=list)
 
 
 class DeltaOperationsInvalidError(ValueError):
@@ -361,17 +380,27 @@ def _operations_of(payload: dict[str, Any]) -> Any:
     return payload.get("operations", [])
 
 
-def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
+def parse_delta_operation_list(
+    raw: Any, *, operation_adapter: TypeAdapter[Any] = _OPERATION_ADAPTER
+) -> DeltaOperationList:
     """Parse structured-delta LLM output into a validated operation list."""
+    if isinstance(raw, RetractionOperationList):
+        return DeltaOperationList(operations=list(raw.operations))
     if isinstance(raw, DeltaOperationList):
+        if operation_adapter is not _OPERATION_ADAPTER:
+            return DeltaOperationList(
+                operations=_validate_operations_list(
+                    [op.model_dump() for op in raw.operations], adapter=operation_adapter
+                )
+            )
         return raw
     if isinstance(raw, dict):
-        return DeltaOperationList(operations=_validate_operations_list(_operations_of(raw)))
+        return DeltaOperationList(operations=_validate_operations_list(_operations_of(raw), adapter=operation_adapter))
     # A bare array reaches here parsed for the same reason the dict above does: the
     # delta call sets a ``response_format`` under ``skip_validation``, so the provider
     # returns the JSON it parsed. It is the same delta as the text-form array (#3820).
     if isinstance(raw, list):
-        return DeltaOperationList(operations=_validate_operations_list(raw))
+        return DeltaOperationList(operations=_validate_operations_list(raw, adapter=operation_adapter))
     if raw is not None and not isinstance(raw, str):
         # A TypeError, not the AttributeError ``.strip()`` would raise, so the
         # caller's ask-again path still applies.
@@ -399,7 +428,7 @@ def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
             last_error = ValueError("delta payload must be an object with an operations array")
             continue
         try:
-            operations = _validate_operations_list(_operations_of(payload))
+            operations = _validate_operations_list(_operations_of(payload), adapter=operation_adapter)
         except TypeError as exc:
             last_error = exc
             continue
@@ -536,10 +565,15 @@ async def request_delta_operations(
     block ids. Only the refresh's edit pass passes it — for the retraction pass,
     touching nothing is a legitimate answer.
     """
+    op_adapter = (
+        _RETRACTION_OPERATION_ADAPTER
+        if call_kwargs.get("response_format") is RetractionOperationList
+        else _OPERATION_ADAPTER
+    )
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
     first = await llm.call(messages=messages, scope=scope, **call_kwargs)
     try:
-        op_list = parse_delta_operation_list(first.content)
+        op_list = parse_delta_operation_list(first.content, operation_adapter=op_adapter)
     except (ValueError, TypeError) as exc:  # DeltaOperationsInvalidError and JSON errors are ValueErrors
         rejected = exc.rejected if isinstance(exc, DeltaOperationsInvalidError) else []
         logger.warning("[STRUCTURED_DELTA] %s reply refused (%s); asking again with the errors", scope, exc)
@@ -563,7 +597,7 @@ async def request_delta_operations(
         )
         correction = _unreachable_correction_prompt(unreachable, document, any_applied=bool(outcome.applied))
     second = await llm.call(messages=reask_messages(messages, first.content, correction), scope=scope, **call_kwargs)
-    return parse_delta_operation_list(second.content)
+    return parse_delta_operation_list(second.content, operation_adapter=op_adapter)
 
 
 # Application ---------------------------------------------------------------

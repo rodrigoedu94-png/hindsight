@@ -19223,6 +19223,7 @@ class MemoryEngine(MemoryEngineInterface):
         # markdown if either the structuring or the LLM op call fails.
         from .reflect.delta_ops import (
             DeltaOperationList,
+            RetractionOperationList,
             apply_operations,
             request_delta_operations,
         )
@@ -19313,7 +19314,7 @@ class MemoryEngine(MemoryEngineInterface):
                             system_prompt=STRUCTURED_RETRACTION_SYSTEM_PROMPT,
                             user_prompt=unsay_prompt,
                             scope="mental_model_retraction_ops",
-                            response_format=DeltaOperationList,
+                            response_format=RetractionOperationList,
                             strict_schema=get_config().llm_strict_schema_reflect,
                             skip_validation=True,
                             max_completion_tokens=get_config().reflect_max_completion_tokens,
@@ -19901,6 +19902,7 @@ class MemoryEngine(MemoryEngineInterface):
                     reason="empty_candidate",
                     outcome="refresh_failed_empty_candidate",
                     detail="the refresh produced empty content (likely an upstream LLM failure).",
+                    pause_automatic=not run.delta_ops_transient_failure,
                 )
 
             if run.outcome == "refresh_failed_delta_not_applied":
