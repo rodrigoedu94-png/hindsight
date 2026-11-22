@@ -200,8 +200,9 @@ def _make_stub_engine_for_delete() -> MemoryEngine:
 
 
 class _StubDeleteConn:
-    def __init__(self, *, fail_on_bank_lock: list[BaseException] | None = None) -> None:
+    def __init__(self, *, fail_on_bank_lock: list[BaseException] | None = None, internal_id: str | None = None) -> None:
         self.fail_on_bank_lock = fail_on_bank_lock if fail_on_bank_lock is not None else []
+        self.internal_id = internal_id or str(uuid.uuid4())
         self.queries: list[str] = []
 
     @asynccontextmanager
@@ -214,9 +215,9 @@ class _StubDeleteConn:
 
     async def fetchrow(self, query: str, *args, **kwargs):
         self.queries.append(query)
-        if "SELECT bank_id FROM" in query and "banks" in query and self.fail_on_bank_lock:
+        if "SELECT bank_id" in query and "banks" in query and self.fail_on_bank_lock:
             raise self.fail_on_bank_lock.pop(0)
-        return {"bank_id": args[0]}
+        return {"bank_id": args[0], "internal_id": self.internal_id}
 
     async def fetch(self, query: str, *args, **kwargs):
         self.queries.append(query)
@@ -232,15 +233,19 @@ class _StubDeleteConn:
 class _StubDeleteBackend:
     _wraps_backend = True
 
-    def __init__(self, failures: list[BaseException]) -> None:
+    def __init__(self, failures: list[BaseException], *, internal_id: str | None = None) -> None:
         self.failures = failures
+        self.internal_id = internal_id
         self.acquires = 0
+        self.conns: list[_StubDeleteConn] = []
         self.ops = SimpleNamespace(drop_bank_vector_indexes=AsyncMock())
 
     @asynccontextmanager
     async def acquire(self):
         self.acquires += 1
-        yield _StubDeleteConn(fail_on_bank_lock=self.failures)
+        conn = _StubDeleteConn(fail_on_bank_lock=self.failures, internal_id=self.internal_id)
+        self.conns.append(conn)
+        yield conn
 
 
 @pytest.mark.asyncio
@@ -1374,7 +1379,7 @@ async def test_restore_bank_tracks_target_deletes_stops_final_phases_and_cleans_
     imp_engine._get_backend = AsyncMock(return_value=_ImportCleanupBackend())
     imp_engine._file_storage = SimpleNamespace()
     imp_engine._config_resolver = SimpleNamespace(resolve_full_config=AsyncMock())
-    imp_engine.delete_bank = AsyncMock()
+    imp_engine.delete_bank = AsyncMock(return_value={"bank_deleted": True})
     imp_engine.embeddings = MagicMock()
     imp_engine.entity_resolver = MagicMock()
     imp_engine._format_readable_date = lambda d: ""
@@ -1401,15 +1406,24 @@ async def test_restore_bank_tracks_target_deletes_stops_final_phases_and_cleans_
             buf.getvalue(), RequestContext(internal=True), target_bank_id=dst_bank, operation_id=op_id
         )
     assert res.cancelled is True
+    # The internal_id guard is handed to delete_bank, which checks it under the bank-row lock
+    # (see test_delete_bank_with_expected_internal_id_skips_a_replaced_bank).
     imp_engine.delete_bank.assert_awaited_once_with(
-        dst_bank, request_context=RequestContext(internal=True), _signal_in_flight=False
+        dst_bank,
+        request_context=RequestContext(internal=True),
+        _signal_in_flight=False,
+        _expected_internal_id=dst_internal_id,
     )
 
-    # Replacement bank with different internal_id must NOT be deleted!
+    # A replaced/gone bank: delete_bank reports nothing deleted, so the operation's
+    # restored_bank_* metadata is left alone rather than cleared as if it had been discarded.
     imp_engine.delete_bank.reset_mock()
+    imp_engine.delete_bank.return_value = {}
+    meta_store.update({"restored_bank_id": dst_bank, "restored_bank_internal_id": dst_internal_id})
     current_bank_id_val[0] = str(uuid.uuid4())
     await imp_engine._cleanup_partial_restored_bank(dst_bank, dst_internal_id, RequestContext(internal=True), op_id)
-    imp_engine.delete_bank.assert_not_called()
+    imp_engine.delete_bank.assert_awaited_once()
+    assert meta_store["restored_bank_internal_id"] == dst_internal_id
 
     # Part D: _restore_bank checks cancellation in final restore phase and rolls back transaction.
     rolled_back = False
@@ -1686,7 +1700,10 @@ async def test_delete_operation_and_purge_expired_clean_import_zip_and_partial_b
     await engine.delete_operation("src", op_bank, request_context=RequestContext(internal=True))
 
     engine.delete_bank.assert_awaited_once_with(
-        "partial-b", request_context=RequestContext(internal=True), _signal_in_flight=False
+        "partial-b",
+        request_context=RequestContext(internal=True),
+        _signal_in_flight=False,
+        _expected_internal_id=partial_bank_internal,
     )
 
     purge_conn = SimpleNamespace(
@@ -2043,3 +2060,311 @@ async def test_poller_reconcile_matches_folded_peer_against_its_own_claim_timest
     assert rows[op_primary]["status"] == "cancelled"
     # The guarded UPDATE carries the peer's own claim timestamp, not the primary's.
     assert [a[2] for a in requeue_args] == [peer_claim]
+
+
+@pytest.mark.asyncio
+async def test_delete_bank_with_expected_internal_id_skips_a_replaced_bank() -> None:
+    """The guard is checked under the bank-row lock and a mismatch deletes nothing at all."""
+    engine = _make_stub_engine_for_delete()
+    engine._delete_files_quietly = AsyncMock()
+    backend = _StubDeleteBackend([], internal_id="replacement-internal-id")
+    engine._backend = backend
+    engine._get_backend = AsyncMock(return_value=backend)
+    store = SimpleNamespace(
+        store_owned_for=MagicMock(return_value=True),
+        count_bank_contents=AsyncMock(),
+        purge_bank_rows=AsyncMock(return_value=[]),
+        drop_bank_storage=AsyncMock(),
+    )
+
+    with (
+        patch("hindsight_api.engine.retain.bank_utils.bank_kind", AsyncMock(return_value="memory")),
+        patch("hindsight_api.engine.memories.get_memories", return_value=store),
+    ):
+        result = await engine.delete_bank(
+            "b-replaced",
+            request_context=RequestContext(internal=True),
+            _expected_internal_id="partial-restore-internal-id",
+        )
+
+    assert result == {}
+    queries = [q for conn in backend.conns for q in conn.queries]
+    assert any("FOR NO KEY UPDATE" in q for q in queries)
+    assert not any(q.lstrip().upper().startswith("DELETE") for q in queries)
+    store.purge_bank_rows.assert_not_called()
+    store.drop_bank_storage.assert_not_called()
+    engine._delete_files_quietly.assert_not_called()
+
+    # Matching internal_id: the delete proceeds as usual.
+    backend_ok = _StubDeleteBackend([], internal_id="partial-restore-internal-id")
+    engine._backend = backend_ok
+    engine._get_backend = AsyncMock(return_value=backend_ok)
+    with (
+        patch("hindsight_api.engine.retain.bank_utils.bank_kind", AsyncMock(return_value="memory")),
+        patch("hindsight_api.engine.retain.bank_utils.drop_bank_vector_indexes", AsyncMock()),
+        patch(
+            "hindsight_api.engine.memories.get_memories",
+            return_value=SimpleNamespace(
+                store_owned_for=MagicMock(return_value=False),
+                count_bank_contents=AsyncMock(return_value=SimpleNamespace(memory_units=0, entities=0, documents=0)),
+                purge_bank_rows=AsyncMock(return_value=[]),
+            ),
+        ),
+    ):
+        result_ok = await engine.delete_bank(
+            "b-partial",
+            request_context=RequestContext(internal=True),
+            _expected_internal_id="partial-restore-internal-id",
+        )
+    assert result_ok["bank_deleted"] is True
+
+
+def _replay_harness(existing_docs: set[str], written_docs: list[str], written_obs: list[str]):
+    """Fakes for _replay_documents: a store that knows ``existing_docs`` and records writes."""
+
+    async def fake_prepare(_emb, _fmt, batch):
+        return batch
+
+    async def fake_doc_batch(**kwargs):
+        out = []
+        for _doc, target_id in kwargs["prepared"]:
+            existing_docs.add(target_id)
+            written_docs.append(target_id)
+            out.append(SimpleNamespace(unit_ids=[str(uuid.uuid4())], original_ordinals=[0]))
+        return out
+
+    async def fake_obs_import(**kwargs):
+        for obs, _source_ids in kwargs["resolved"]:
+            written_obs.append(obs.text)
+        return importer._ObservationOutcome(imported=len(kwargs["resolved"]))
+
+    store = SimpleNamespace(
+        transfer_document_exists=AsyncMock(side_effect=lambda **kw: kw["document_id"] in existing_docs),
+        import_transfer_observations=AsyncMock(side_effect=fake_obs_import),
+    )
+    return (
+        patch("hindsight_api.engine.memories.get_memories", return_value=store),
+        patch.object(importer, "_prepare_documents", side_effect=fake_prepare),
+        patch.object(importer, "_import_document_batch", side_effect=fake_doc_batch),
+        patch.object(importer, "_embed_in_batches", AsyncMock(side_effect=lambda _m, texts: [[0.1]] * len(texts))),
+        patch.object(importer, "assert_job_bank_alive_on_pool", AsyncMock()),
+    )
+
+
+async def _replay(zf_bytes: bytes, *, on_conflict: str, check_alive, checkpoint, saved: list[dict]):
+    async def save(progress: importer.ImportCheckpoint) -> None:
+        saved.append(progress.model_dump(mode="json"))
+
+    with zipfile.ZipFile(io.BytesIO(zf_bytes)) as zf:
+        return await importer._replay_documents(
+            zf,
+            backend=SimpleNamespace(),
+            embeddings_model=MagicMock(),
+            entity_resolver=MagicMock(),
+            config=SimpleNamespace(),
+            format_date_fn=lambda d: "",
+            bank_id="b-retry",
+            on_conflict=on_conflict,
+            ops=SimpleNamespace(),
+            outbox_callback_factory=None,
+            keep_unit_ids=set(),
+            check_alive=check_alive,
+            checkpoint=checkpoint,
+            on_checkpoint=save,
+        )
+
+
+def _alive_for(n_calls: int):
+    calls = 0
+
+    async def check() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls <= n_calls
+
+    return check
+
+
+@pytest.mark.asyncio
+async def test_import_retry_with_new_id_does_not_import_the_document_again(monkeypatch) -> None:
+    """A retry reuses the id an earlier attempt wrote the document under (cubic: new-id retries).
+
+    Before document_targets, the retry re-resolved the conflict: new-id generated another id
+    and imported the document and its facts a second time.
+    """
+    monkeypatch.setattr(importer, "_DOCUMENT_BATCH_SIZE", 1)
+    archive = _build_transfer_zip(["doc-1"], with_observations=True)
+    existing_docs = {"doc-1"}  # conflicts with a document already in the target bank
+    written_docs: list[str] = []
+    written_obs: list[str] = []
+    saved: list[dict] = []
+
+    patches = _replay_harness(existing_docs, written_docs, written_obs)
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        # Attempt 1: the document batch commits, then the operation is cancelled before observations.
+        first = await _replay(archive, on_conflict="new-id", check_alive=_alive_for(1), checkpoint=None, saved=saved)
+        assert first.cancelled is True
+        assert len(written_docs) == 1
+        new_id = written_docs[0]
+        assert new_id != "doc-1"
+
+        # Attempt 2 resumes from the persisted checkpoint.
+        resumed = importer.ImportCheckpoint.model_validate(saved[-1])
+        second = await _replay(
+            archive, on_conflict="new-id", check_alive=_alive_for(100), checkpoint=resumed, saved=saved
+        )
+
+    assert written_docs == [new_id]  # not imported a second time
+    assert second.cancelled is False
+    assert second.remapped_document_ids == {"doc-1": new_id}
+    assert second.documents_imported == 1
+    assert written_obs == ["Obs 1"]  # resolved through the checkpointed fact ids
+
+
+@pytest.mark.asyncio
+async def test_import_retry_does_not_reinsert_committed_observation_batches(monkeypatch) -> None:
+    """A retry skips observations an earlier attempt already committed (cubic: observation checkpoint)."""
+    monkeypatch.setattr(importer, "_DOCUMENT_BATCH_SIZE", 1)
+    monkeypatch.setattr(importer, "_OBSERVATION_BATCH_SIZE", 1)
+    base = _build_transfer_zip(["doc-1", "doc-2"])
+    buf = io.BytesIO(base)
+    with zipfile.ZipFile(buf, "a") as zf:
+        zf.writestr(
+            "observations.json",
+            json.dumps(
+                [
+                    {"text": "Obs 1", "sources": [{"document_id": "doc-1", "fact_index": 0}], "tags": []},
+                    {"text": "Obs 2", "sources": [{"document_id": "doc-2", "fact_index": 0}], "tags": []},
+                ]
+            ),
+        )
+    archive = buf.getvalue()
+    existing_docs: set[str] = set()
+    written_docs: list[str] = []
+    written_obs: list[str] = []
+    saved: list[dict] = []
+
+    patches = _replay_harness(existing_docs, written_docs, written_obs)
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        # check_alive calls: 2 document batches, 1 before observations, 1 per observation batch.
+        # Alive for 4 -> observation batch 1 commits, batch 2 is cancelled.
+        first = await _replay(archive, on_conflict="skip", check_alive=_alive_for(4), checkpoint=None, saved=saved)
+        assert first.cancelled is True
+        assert written_obs == ["Obs 1"]
+
+        resumed = importer.ImportCheckpoint.model_validate(saved[-1])
+        assert resumed.observations_done == 1
+        second = await _replay(
+            archive, on_conflict="skip", check_alive=_alive_for(100), checkpoint=resumed, saved=saved
+        )
+
+    assert written_obs == ["Obs 1", "Obs 2"]  # Obs 1 not inserted twice
+    assert len(written_docs) == 2
+    assert second.observations_imported == 2
+    assert second.documents_imported == 2
+
+
+@pytest.mark.asyncio
+async def test_restore_rollback_deletes_attachment_blobs_it_wrote() -> None:
+    """Blobs written inside the restore transaction are deleted when it rolls back (cubic: orphaned blobs)."""
+    src_bank, dst_bank = "src-att", "dst-att"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf_w:
+        zf_w.writestr(
+            "manifest.json",
+            json.dumps({"schema_version": 1, "source_bank_id": src_bank, "archive_type": "bank"}),
+        )
+        zf_w.writestr("banks.json", json.dumps([{"bank_id": src_bank, "name": src_bank}]))
+        for name in ("mental_models", "directives", "webhooks", "knowledge_pages"):
+            zf_w.writestr(f"{name}.json", "[]")
+        zf_w.writestr(
+            "attachments.json",
+            json.dumps(
+                [
+                    {
+                        "bank_id": src_bank,
+                        "document_id": "doc-1",
+                        "attachment_hash": "h1",
+                        "short_id": "a1",
+                        "media_type": "image/png",
+                        "byte_size": 3,
+                        "entry": "attachments/0000",
+                    }
+                ]
+            ),
+        )
+        zf_w.writestr("attachments/0000", b"png")
+
+    rolled_back = False
+    restored_internal_id: str | None = None
+
+    class _TxConn:
+        @asynccontextmanager
+        async def transaction(self):
+            nonlocal rolled_back
+            try:
+                yield self
+            except BaseException:
+                rolled_back = True
+                raise
+
+        async def fetchval(self, query: str, *_args):
+            if "SELECT internal_id FROM" in query:
+                return restored_internal_id
+            return None
+
+        async def execute(self, query: str, *_args):
+            return "INSERT 0 1"
+
+    class _RestoreBackend:
+        _wraps_backend = True
+        ops = SimpleNamespace()
+
+        @asynccontextmanager
+        async def acquire(self):
+            yield _TxConn()
+
+    file_storage = SimpleNamespace(store=AsyncMock(), delete=AsyncMock())
+    fake_store = SimpleNamespace(ensure_bank_storage=AsyncMock())
+
+    async def fake_restore_rows(_conn, table, rows, **_kwargs):
+        nonlocal restored_internal_id
+        rows_list = list(rows)
+        if table == "banks" and rows_list and "internal_id" in rows_list[0]:
+            restored_internal_id = str(rows_list[0]["internal_id"])
+        return len(rows_list)
+
+    # _restore_bank probes: start, after replay, after mm embeddings, then one per guarded step.
+    # Alive for 4 -> attachments are written, the next guarded step cancels and rolls back.
+    with (
+        zipfile.ZipFile(io.BytesIO(buf.getvalue()), "r") as zf,
+        patch("hindsight_api.engine.memories.get_memories", return_value=fake_store),
+        patch("hindsight_api.engine.bank_aliases.refuse_alias_as_bank_id_on_conn", AsyncMock()),
+        patch("hindsight_api.engine.retain.bank_utils.create_bank_row_on_conn", AsyncMock(return_value=True)),
+        patch("hindsight_api.engine.retain.bank_utils.create_bank_vector_indexes", AsyncMock()),
+        patch.object(importer, "_restore_rows", side_effect=fake_restore_rows),
+        patch.object(importer, "_regenerate_mental_model_embeddings", AsyncMock(return_value={})),
+        patch.object(importer, "_replay_documents", AsyncMock(return_value=importer.ImportResult())),
+        patch.object(importer, "assert_job_bank_alive", AsyncMock()),
+        patch.object(importer, "assert_job_bank_alive_on_pool", AsyncMock()),
+    ):
+        result = await importer._restore_bank(
+            zf,
+            backend=_RestoreBackend(),
+            embeddings_model=MagicMock(),
+            entity_resolver=MagicMock(),
+            resolve_config=AsyncMock(return_value=SimpleNamespace()),
+            format_date_fn=lambda d: "",
+            target_bank_id=dst_bank,
+            scope=None,
+            file_storage=file_storage,
+            ops=SimpleNamespace(),
+            on_bank_created=None,
+            check_alive=_alive_for(4),
+        )
+
+    assert result.cancelled is True
+    assert rolled_back is True
+    file_storage.store.assert_awaited_once()
+    stored_key = file_storage.store.await_args.kwargs["key"]
+    file_storage.delete.assert_awaited_once_with(stored_key)

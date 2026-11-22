@@ -9494,27 +9494,29 @@ class MemoryEngine(MemoryEngineInterface):
         request_context: "RequestContext",
         operation_id: str | None,
     ) -> None:
-        """Delete a partially restored bank only if it still carries ``expected_internal_id``."""
+        """Delete a partially restored bank only if it still carries ``expected_internal_id``.
+
+        The internal_id check runs inside delete_bank's transaction, under the bank-row lock.
+        It used to be a separate SELECT before the delete, so a bank recreated under the same
+        name in between could be deleted as if it were the partial restore.
+        """
         try:
             backend = await self._get_backend()
-            async with acquire_with_retry(backend) as conn:
-                current_internal_id = await conn.fetchval(
-                    f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1",
-                    bank_id,
-                )
-            if current_internal_id is None:
-                return
-            if expected_internal_id is not None and str(current_internal_id) != str(expected_internal_id):
+            logger.info("[transfer] Discarding partial restored bank %s after cancellation", bank_id)
+            deleted = await self.delete_bank(
+                bank_id,
+                request_context=request_context,
+                _signal_in_flight=False,
+                _expected_internal_id=expected_internal_id,
+            )
+            if not deleted.get("bank_deleted"):
                 logger.info(
-                    "[transfer] Partial restored bank %s already replaced (expected internal_id=%s, found=%s); "
-                    "skipping cleanup",
+                    "[transfer] Partial restored bank %s is gone or was replaced (expected internal_id=%s); "
+                    "nothing discarded",
                     bank_id,
                     expected_internal_id,
-                    current_internal_id,
                 )
                 return
-            logger.info("[transfer] Discarding partial restored bank %s after cancellation", bank_id)
-            await self.delete_bank(bank_id, request_context=request_context, _signal_in_flight=False)
             if operation_id:
                 async with acquire_with_retry(backend) as conn:
                     raw_meta = await conn.fetchval(
@@ -9840,10 +9842,9 @@ class MemoryEngine(MemoryEngineInterface):
         outbox_factory = self._build_retain_outbox_callback_factory(
             bank_id=bank_id, operation_id=None, schema=_current_schema.get()
         )
-        initial_fact_unit_ids: dict[str, list[str | None]] | None = None
-        initial_remapped_unit_ids: dict[str, str] | None = None
-        checkpoint_facts: dict[str, list[str | None]] = {}
-        checkpoint_remapped: dict[str, str] = {}
+        from .transfer.importer import ImportCheckpoint
+
+        checkpoint: ImportCheckpoint | None = None
         if operation_id:
             try:
                 async with acquire_with_retry(backend) as conn:
@@ -9851,26 +9852,18 @@ class MemoryEngine(MemoryEngineInterface):
                         f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1",
                         uuid.UUID(operation_id),
                     )
-                checkpoint = _parse_json_dict(_parse_json_dict(raw_meta).get("_import_checkpoint"))
-                raw_facts = checkpoint.get("fact_unit_ids")
-                if isinstance(raw_facts, dict):
-                    checkpoint_facts = dict(raw_facts)
-                    initial_fact_unit_ids = checkpoint_facts
-                raw_remapped = checkpoint.get("remapped_unit_ids")
-                if isinstance(raw_remapped, dict):
-                    checkpoint_remapped = {str(k): str(v) for k, v in raw_remapped.items()}
-                    initial_remapped_unit_ids = checkpoint_remapped
+                raw_checkpoint = _parse_json_dict(raw_meta).get("_import_checkpoint")
+                # A checkpoint from before document_targets existed still parses (missing fields
+                # default), so an operation started on the older build resumes as it did then.
+                checkpoint = ImportCheckpoint.model_validate(_parse_json_dict(raw_checkpoint))
             except Exception:
                 logger.debug("Failed to load import checkpoint for operation %s", operation_id, exc_info=True)
+            if checkpoint is None:
+                checkpoint = ImportCheckpoint()
 
-        async def _save_import_checkpoint(
-            batch_facts: dict[str, list[str | None]],
-            batch_remapped: dict[str, str],
-        ) -> None:
+        async def _save_import_checkpoint(progress: ImportCheckpoint) -> None:
             if not operation_id:
                 return
-            checkpoint_facts.update(batch_facts)
-            checkpoint_remapped.update(batch_remapped)
             op_uuid = uuid.UUID(operation_id)
             async with acquire_with_retry(backend) as conn:
                 raw_meta = await conn.fetchval(
@@ -9878,10 +9871,7 @@ class MemoryEngine(MemoryEngineInterface):
                     op_uuid,
                 )
                 merged_meta = _parse_json_dict(raw_meta)
-                merged_meta["_import_checkpoint"] = {
-                    "fact_unit_ids": checkpoint_facts,
-                    "remapped_unit_ids": checkpoint_remapped,
-                }
+                merged_meta["_import_checkpoint"] = progress.model_dump(mode="json")
                 await conn.execute(
                     f"UPDATE {fq_table('async_operations')} SET result_metadata = $1::jsonb WHERE operation_id = $2",
                     json.dumps(merged_meta, default=_json_default),
@@ -9899,9 +9889,8 @@ class MemoryEngine(MemoryEngineInterface):
             on_conflict=on_conflict,
             outbox_callback_factory=outbox_factory,
             check_alive=(lambda: self._check_op_alive(operation_id)) if operation_id else None,
-            initial_fact_unit_ids=initial_fact_unit_ids,
-            initial_remapped_unit_ids=initial_remapped_unit_ids,
-            on_batch_committed=_save_import_checkpoint if operation_id else None,
+            checkpoint=checkpoint,
+            on_checkpoint=_save_import_checkpoint if operation_id else None,
         )
 
         if result.cancelled:
@@ -12819,6 +12808,11 @@ class MemoryEngine(MemoryEngineInterface):
         # knowledge-bank hooks (run by the knowledge service), never to the memory-bank ones.
         _knowledge_bank: bool = False,
         _signal_in_flight: bool = True,
+        # Delete only if the bank row still carries this internal_id. Checked under the bank-row
+        # lock inside the delete transaction, so a bank recreated under the same name between a
+        # caller's own check and this call is never mistaken for the one it meant (the partial
+        # restore cleanup). A mismatch deletes nothing and returns without "bank_deleted".
+        _expected_internal_id: str | None = None,
     ) -> dict[str, int]:
         """
         Delete all data for a specific agent (multi-tenant cleanup).
@@ -12890,9 +12884,11 @@ class MemoryEngine(MemoryEngineInterface):
         bank_present = False
         freed_aliases: list[str] = []
         committed = False
+        replaced_or_gone = False
 
         async def _delete_tx() -> None:
             nonlocal invalidated_obs, result, bank_internal_id, legacy_files, bank_present, freed_aliases, committed
+            nonlocal replaced_or_gone
             if committed:
                 return
             attempt_invalidated_obs = 0
@@ -12910,9 +12906,17 @@ class MemoryEngine(MemoryEngineInterface):
                         # bank delete could hold its documents while waiting for the
                         # bank row held by a concurrent document delete.
                         bank_row = await conn.fetchrow(
-                            f"SELECT bank_id FROM {fq_table('banks')} WHERE bank_id = $1 FOR NO KEY UPDATE",
+                            f"SELECT bank_id, internal_id FROM {fq_table('banks')} "
+                            f"WHERE bank_id = $1 FOR NO KEY UPDATE",
                             bank_id,
                         )
+                        if _expected_internal_id is not None and (
+                            bank_row is None or str(bank_row["internal_id"]) != str(_expected_internal_id)
+                        ):
+                            # Nothing written yet: committing here only releases the row lock.
+                            replaced_or_gone = True
+                            committed = True
+                            return
                         attempt_bank_present = bank_row is not None
                         from .memories import get_memories as _get_memories_for_delete
                         from .memories.base import BankContentCounts, TypedMemoryScope
@@ -13080,6 +13084,14 @@ class MemoryEngine(MemoryEngineInterface):
                     self._finish_bank_delete(bank_id, delete_schema)
                 except Exception as e:
                     logger.debug(f"Failed to release bank-delete gate for {bank_id}: {e}")
+
+        if replaced_or_gone:
+            # Skip every post-commit step: the prefix sweep and store drop below would otherwise
+            # remove the files and storage of the bank that now holds this name.
+            logger.info(
+                f"delete_bank({bank_id}) skipped: bank is gone or no longer has internal_id {_expected_internal_id}"
+            )
+            return {}
 
         # Drop per-bank vector indexes AFTER the transaction commits: the
         # drop runs CONCURRENTLY (see ops.drop_bank_vector_indexes), which
