@@ -2068,3 +2068,6 @@ class TestOracleSessionAndClobBinding:
 
         update_sql = "UPDATE memory_units SET embedding = TO_VECTOR(:3) WHERE id = :1"
         assert OracleConnection._vector_bind_keys(update_sql) == {"3"}
+
+        literal_sql = "SELECT 'embedding = TO_VECTOR(:9)', :9 FROM DUAL WHERE text = 'VECTOR_DISTANCE(embedding, :8)'"
+        assert OracleConnection._vector_bind_keys(literal_sql) == set()

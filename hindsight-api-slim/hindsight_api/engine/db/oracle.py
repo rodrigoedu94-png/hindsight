@@ -967,12 +967,20 @@ class OracleConnection(DatabaseConnection):
                 params[key] = lob
 
     @staticmethod
+    def _mask_sql_string_literals(query: str) -> str:
+        """Replace single-quoted SQL string literal contents with spaces so regex scans skip them."""
+        if "'" not in query:
+            return query
+        return re.sub(r"'(?:''|[^'])*'", "''", query)
+
+    @staticmethod
     def _vector_bind_keys(query: str) -> set[str]:
         """Names of the bind parameters that carry an embedding in ``query`` (see _bind_vectors_natively)."""
+        unquoted = OracleConnection._mask_sql_string_literals(query)
         keys = (
-            set(_VECTOR_DISTANCE_PARAM_RE.findall(query))
-            | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(query))
-            | set(_MERGE_SOURCE_EMBEDDING_RE.findall(query))
+            set(_VECTOR_DISTANCE_PARAM_RE.findall(unquoted))
+            | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(unquoted))
+            | set(_MERGE_SOURCE_EMBEDDING_RE.findall(unquoted))
         )
         # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...) [, (...)]: pair each
         # row group's column/value lists by position (one list per row on multi-row inserts).
