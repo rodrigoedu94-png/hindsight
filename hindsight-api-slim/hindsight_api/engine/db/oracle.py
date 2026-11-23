@@ -139,7 +139,7 @@ _EQ_FALSE_RE = re.compile(r"\b=\s*FALSE\b", re.IGNORECASE)
 _FOR_NO_KEY_UPDATE_RE = re.compile(r"\bFOR\s+NO\s+KEY\s+UPDATE\b", re.IGNORECASE)
 _FOR_SHARE_RE = re.compile(r"\bFOR\s+SHARE\b", re.IGNORECASE)
 _TRIGGER_COL_RE = re.compile(r'(?<!")\btrigger\b(?!")')
-_DATE_TRUNC_RE = re.compile(r"date_trunc\(\s*'(\w+)'\s*,\s*(.+?)\s*\)", re.IGNORECASE)
+_DATE_TRUNC_START_RE = re.compile(r"\bdate_trunc\s*\(", re.IGNORECASE)
 _AT_TIME_ZONE_RE = re.compile(r"\s+AT\s+TIME\s+ZONE\s+'[^']*'", re.IGNORECASE)
 _INTERVAL_RE = re.compile(r"interval\s+'(\d+)\s+(\w+)'", re.IGNORECASE)
 _VECTOR_OP_RE = re.compile(r"([\w.]+)\s*<=>\s*(:\w+)")
@@ -490,11 +490,56 @@ def _rewrite_not_jsonb_is_parent(m: re.Match) -> str:
     )
 
 
-def _rewrite_date_trunc(m: re.Match) -> str:
-    interval = m.group(1).lower()
-    expr = _AT_TIME_ZONE_RE.sub("", m.group(2).strip())
-    fmt = _DATE_TRUNC_MAP.get(interval, "DD")
-    return f"TRUNC(CAST({expr} AS DATE), '{fmt}')"
+def _rewrite_date_trunc_calls(query: str) -> str:
+    """Rewrite PostgreSQL ``date_trunc('interval', expr)`` calls with balanced parentheses."""
+    out: list[str] = []
+    pos = 0
+    n = len(query)
+    while pos < n:
+        m = _DATE_TRUNC_START_RE.search(query, pos)
+        if not m:
+            out.append(query[pos:])
+            break
+        out.append(query[pos : m.start()])
+        i = m.end()
+        depth = 1
+        in_quote = False
+        comma_idx: int | None = None
+        while i < n and depth > 0:
+            ch = query[i]
+            if in_quote:
+                if ch == "'":
+                    if i + 1 < n and query[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_quote = False
+            else:
+                if ch == "'":
+                    in_quote = True
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif ch == "," and depth == 1 and comma_idx is None:
+                    comma_idx = i
+            i += 1
+        if depth != 0 or comma_idx is None:
+            out.append(query[m.start() : m.end()])
+            pos = m.end()
+            continue
+        interval_raw = query[m.end() : comma_idx].strip()
+        if not (len(interval_raw) >= 2 and interval_raw[0] == "'" and interval_raw[-1] == "'"):
+            out.append(query[m.start() : i + 1])
+            pos = i + 1
+            continue
+        interval = interval_raw[1:-1].lower()
+        expr = _AT_TIME_ZONE_RE.sub("", query[comma_idx + 1 : i].strip())
+        fmt = _DATE_TRUNC_MAP.get(interval, "DD")
+        out.append(f"TRUNC(CAST({expr} AS DATE), '{fmt}')")
+        pos = i + 1
+    return "".join(out)
 
 
 def _rewrite_interval(m: re.Match) -> str:
@@ -590,7 +635,7 @@ def _rewrite_pg_to_oracle_cached(query: str, supports_for_update_row_limit: bool
     query = _TRIGGER_COL_RE.sub('"trigger"', query)
 
     # date_trunc('interval', expr) → TRUNC(CAST(expr AS DATE), 'fmt')
-    query = _DATE_TRUNC_RE.sub(_rewrite_date_trunc, query)
+    query = _rewrite_date_trunc_calls(query)
 
     # interval 'N units' → NUMTODSINTERVAL(N, 'UNIT')
     query = _INTERVAL_RE.sub(_rewrite_interval, query)
