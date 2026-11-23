@@ -1600,6 +1600,7 @@ class LLMProvider:
         max_backoff: float | None = None,
         tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_REQUIRED,
         declared_tools: list[dict[str, Any]] | None = None,
+        strict_schema: bool = True,
     ) -> "LLMToolCallResult":
         """One turn of a tool-using conversation: the call the model makes next.
 
@@ -1613,6 +1614,9 @@ class LLMProvider:
         not just ``tools`` (the ones this turn may call): declaring the same functions on
         every turn of a conversation keeps its prompt prefix, and the provider's cache of
         it, the same while a turn narrows what it may call.
+
+        ``strict_schema`` holds the reply to the schema with the provider's grammar; ``False``
+        sends it the soft way (in the prompt), for models that run away under the grammar.
         """
         from .llm_trace import SchemaToolTurn, reset_schema_tool_turn, set_schema_tool_turn
         from .providers import tools_via_schema
@@ -1672,7 +1676,7 @@ class LLMProvider:
                             initial_backoff=initial_backoff,
                             max_backoff=max_backoff,
                             skip_validation=True,
-                            strict_schema=True,
+                            strict_schema=strict_schema,
                         )
                         break
                     except OutputTooLongError:
