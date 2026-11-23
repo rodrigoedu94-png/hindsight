@@ -80,6 +80,19 @@ class SentrySetupTests(unittest.TestCase):
             with self.assertLogs("hindsight_api.sentry_setup", level="WARNING"):
                 self.assertFalse(sentry_setup.install())
 
+    def test_init_failure_degrades_without_raising(self):
+        sdk = _fake_sdk()
+
+        def boom(**kwargs):
+            raise ValueError("BadDsn")
+
+        sdk.init = boom
+        env = {"SENTRY_DSN": "not-a-dsn"}
+        with patch.dict(os.environ, env, clear=True), patch.dict(sys.modules, {"sentry_sdk": sdk}):
+            with self.assertLogs("hindsight_api.sentry_setup", level="WARNING"):
+                self.assertFalse(sentry_setup.install())
+        self.assertFalse(sentry_setup._installed)
+
     def test_before_send_scrubs_credentials(self):
         event = {
             "request": {

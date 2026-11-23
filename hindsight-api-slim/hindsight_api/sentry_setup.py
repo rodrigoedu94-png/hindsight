@@ -80,21 +80,25 @@ def install() -> bool:
     release = os.getenv(ENV_SENTRY_RELEASE, "").strip() or f"hindsight-oracle@{__version__}"
     traces_sample_rate = _parse_sample_rate(os.getenv(ENV_SENTRY_TRACES_SAMPLE_RATE), default=0.1)
 
-    sentry_sdk.init(
-        dsn=dsn,
-        environment=environment,
-        release=release,
-        traces_sample_rate=traces_sample_rate,
-        data_collection={
-            "user_info": False,
-            "cookies": {"mode": "off"},
-            "http_bodies": [],
-            "gen_ai": {"inputs": False, "outputs": False},
-            "mcp": {"inputs": False, "outputs": False},
-            "stack_frame_variables": False,
-        },
-        before_send=_before_send,
-    )
+    try:
+        sentry_sdk.init(
+            dsn=dsn,
+            environment=environment,
+            release=release,
+            traces_sample_rate=traces_sample_rate,
+            data_collection={
+                "user_info": False,
+                "cookies": {"mode": "off"},
+                "http_bodies": [],
+                "gen_ai": {"inputs": False, "outputs": False},
+                "mcp": {"inputs": False, "outputs": False},
+                "stack_frame_variables": False,
+            },
+            before_send=_before_send,
+        )
+    except Exception:  # noqa: BLE001 - bad DSN / incompatible SDK must never break startup
+        logger.warning("Sentry initialisation failed; reporting disabled", exc_info=True)
+        return False
     _installed = True
     logger.info(
         "Sentry enabled (environment=%s, release=%s, traces_sample_rate=%s)",
