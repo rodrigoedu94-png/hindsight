@@ -20826,25 +20826,15 @@ class MemoryEngine(MemoryEngineInterface):
                 else f"(content->>'kind' IS NULL OR content->>'kind' <> '{_MM_HISTORY_KIND_FAILURE}')"
             )
             if getattr(conn, "backend_type", None) == "oracle":
-                # Oracle: avoid O(N^2) correlated NOT IN CLOB re-evaluation and order by
-                # SYS_EXTRACT_UTC(changed_at) DESC to hit IDX_MM_HISTORY_MODEL directly.
-                await conn.execute(
-                    f"""
-                    DELETE FROM {fq_table("mental_model_history")}
-                    WHERE id IN (
-                        SELECT id FROM (
-                            SELECT id,
-                                   ROW_NUMBER() OVER (ORDER BY SYS_EXTRACT_UTC(changed_at) DESC, id DESC) AS rn
-                            FROM {fq_table("mental_model_history")}
-                            WHERE mental_model_id = $1 AND bank_id = $2
-                              AND {kind_predicate}
-                        )
-                        WHERE rn > $3
-                    )
-                    """,
-                    mental_model_id,
-                    bank_id,
-                    max_entries,
+                from .memories.ora import engine_queries as oracle_engine_queries
+
+                await oracle_engine_queries.trim_mental_model_history(
+                    conn=conn,
+                    fq_table=fq_table,
+                    mental_model_id=mental_model_id,
+                    bank_id=bank_id,
+                    kind_predicate=kind_predicate,
+                    max_entries=max_entries,
                 )
             else:
                 await conn.execute(
@@ -23089,13 +23079,14 @@ class MemoryEngine(MemoryEngineInterface):
             total = total_row["total"] if total_row else 0
 
             # Get operations with pagination (include result_metadata to check for parent operations)
-            is_oracle = getattr(conn, "backend_type", None) == "oracle"
-            op_hint = (
-                "/*+ INDEX(ao idx_async_operations_bank_created_desc) */ "
-                if is_oracle and len(where_conditions) == 1
-                else ""
-            )
-            op_order = "SYS_EXTRACT_UTC(ao.created_at) DESC" if is_oracle else "ao.created_at DESC"
+            if getattr(conn, "backend_type", None) == "oracle":
+                from .memories.ora import engine_queries as oracle_engine_queries
+
+                op_hint, op_order = oracle_engine_queries.async_operations_list_clauses(
+                    single_condition=len(where_conditions) == 1
+                )
+            else:
+                op_hint, op_order = "", "ao.created_at DESC"
             operations = await conn.fetch(
                 f"""
                 SELECT {op_hint}ao.operation_id, ao.operation_type, ao.created_at, ao.updated_at, ao.status,

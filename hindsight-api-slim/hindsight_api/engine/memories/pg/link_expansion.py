@@ -331,23 +331,7 @@ class LinkExpansionRetriever(GraphRetriever):
         # $1 seeds, $2 fact_type, $3 budget — the window binds after them.
         window = UpdatedWindow(after=created_after, before=created_before, first_param_index=4)
         entity_cte = ops.build_entity_expansion_cte(mu, ue, per_entity_limit, window)
-
-        use_pgq = (
-            getattr(conn, "backend_type", None) == "oracle"
-            and callable(getattr(ops, "has_property_graph", None))
-            and callable(getattr(ops, "build_pgq_semantic_causal_cte", None))
-            and await ops.has_property_graph(conn)
-        )
-        relational_semantic_causal_cte = ops.build_semantic_causal_cte(ml, mu, window)
-        if use_pgq:
-            semantic_causal_cte = ops.build_pgq_semantic_causal_cte(
-                fq_table("hindsight_memory_graph"),
-                mu,
-                window,
-                max_causal_hops=getattr(config, "oracle_pgq_max_hops", 2),
-            )
-        else:
-            semantic_causal_cte = relational_semantic_causal_cte
+        semantic_causal_cte = ops.build_semantic_causal_cte(ml, mu, window)
 
         full_query = f"""
             WITH {entity_cte},
@@ -379,40 +363,6 @@ class LinkExpansionRetriever(GraphRetriever):
                 LIMIT $3
                 """
             all_rows = await conn.fetch(fallback_query, *params)
-        except Exception as pgq_err:
-            if not use_pgq:
-                raise
-            logger.warning(
-                "[LinkExpansion] Oracle SQL/PGQ query failed (%s), falling back to relational expansion",
-                pgq_err,
-            )
-            relational_full_query = f"""
-                WITH {entity_cte},
-                {relational_semantic_causal_cte}
-                SELECT * FROM entity_expanded
-                UNION ALL
-                SELECT * FROM semantic_expanded
-                UNION ALL
-                SELECT * FROM causal_expanded
-                """
-            try:
-                all_rows = await asyncio.wait_for(
-                    conn.fetch(relational_full_query, *params),
-                    timeout=config.link_expansion_timeout,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[LinkExpansion] Entity expansion timed out after {config.link_expansion_timeout}s "
-                    f"for fact_type={fact_type} after PGQ fallback, falling back to semantic+causal only"
-                )
-                relational_fallback_query = f"""
-                    WITH {relational_semantic_causal_cte}
-                    SELECT * FROM semantic_expanded
-                    UNION ALL
-                    SELECT * FROM causal_expanded
-                    LIMIT $3
-                    """
-                all_rows = await conn.fetch(relational_fallback_query, *params)
 
         return LinkExpansionRows(
             entity=[r for r in all_rows if r["source"] == "entity"],

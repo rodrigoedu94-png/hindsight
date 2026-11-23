@@ -2019,7 +2019,7 @@ class TestOracleSessionAndClobBinding:
 
     @pytest.mark.asyncio
     async def test_purge_bank_rows_oracle_locks_links_in_canonical_order_before_documents(self):
-        from hindsight_api.engine.memories.pg.engine_curation import purge_bank_rows
+        from hindsight_api.engine.memories.postgres import PostgresMemories
 
         events: list[tuple[str, str]] = []
 
@@ -2034,7 +2034,10 @@ class TestOracleSessionAndClobBinding:
                 events.append(("execute", " ".join(query.split())))
                 return "DELETE 0"
 
-        await purge_bank_rows(conn=FakeOracleConn(), fq_table=lambda t: t, bank_id="b1")
+        from unittest.mock import patch
+
+        with patch("hindsight_api.engine.memories.postgres.fq_store_table", side_effect=lambda t: t):
+            await PostgresMemories({}).purge_bank_rows(conn=FakeOracleConn(), fq_table=lambda t: t, bank_id="b1")
         lock_idx = next(
             i
             for i, (kind, q) in enumerate(events)

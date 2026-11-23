@@ -27,6 +27,7 @@ PKG = Path(__file__).resolve().parent.parent / "hindsight_api"
 # Where the store's own SQL lives, plus schema management.
 ALLOWED = (
     "engine/memories/pg/",
+    "engine/memories/ora/",
     "engine/memories/postgres.py",
     "alembic/",
     "migrations.py",
@@ -89,8 +90,8 @@ def test_no_store_table_sql_outside_the_store() -> None:
     )
 
 
-# Only the Postgres store itself may import its SQL modules.
-_PG_IMPORTERS = ("engine/memories/pg/", "engine/memories/postgres.py")
+# Only the Postgres (and Oracle-SQL) store itself may import its SQL modules.
+_PG_IMPORTERS = ("engine/memories/pg/", "engine/memories/ora/", "engine/memories/postgres.py")
 _PG_MODULE = "hindsight_api.engine.memories.pg"
 
 

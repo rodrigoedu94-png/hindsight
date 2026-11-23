@@ -58,6 +58,7 @@ from .base import (
     StoredMemory,
     TypedMemoryScope,
 )
+from .ora import is_oracle_conn
 from .pg import admin as pg_admin
 from .pg import banks as pg_banks
 from .pg import consolidation as pg_consolidation
@@ -254,13 +255,17 @@ class PostgresMemories(MemoriesExtension):
 
     def graph_retriever(self) -> GraphRetriever:
         from ...config import get_config
+        from .ora.link_expansion import OracleLinkExpansionRetriever
         from .pg.link_expansion import LinkExpansionRetriever
 
-        retriever_type = get_config().graph_retriever.lower()
+        config = get_config()
+        retriever_type = config.graph_retriever.lower()
         if retriever_type == "link_expansion":
             logger.info("Using LinkExpansion graph retriever")
         else:
             logger.warning(f"Unknown graph retriever '{retriever_type}', falling back to link_expansion")
+        if config.database_backend == "oracle":
+            return OracleLinkExpansionRetriever()
         return LinkExpansionRetriever()
 
     # ---- per-arm SQL helpers, private to Postgres (called only by recall_unified) ----
@@ -294,6 +299,27 @@ class PostgresMemories(MemoriesExtension):
         """
         # Imported here: recall imports search.retrieval, which imports this package, so a
         # module-level import would close the cycle.
+        if is_oracle_conn(conn):
+            from .ora.recall import retrieve_semantic_bm25_combined_sql as ora_retrieve_semantic_bm25_combined_sql
+
+            return await ora_retrieve_semantic_bm25_combined_sql(
+                conn,
+                query_embedding,
+                query_text,
+                bank_id,
+                fact_types,
+                limit,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=tag_groups,
+                created_after=created_after,
+                created_before=created_before,
+                min_semantic=min_semantic,
+                min_keyword=min_keyword,
+                graph_seed_min_similarity=graph_seed_min_similarity,
+                enable_text_search=enable_text_search,
+            )
+
         from .pg.recall import retrieve_semantic_bm25_combined_sql
 
         return await retrieve_semantic_bm25_combined_sql(
@@ -506,6 +532,20 @@ class PostgresMemories(MemoriesExtension):
         tags_match: TagsMatch = "any",
         tag_groups: list | None = None,
     ) -> datetime | None:
+        if is_oracle_conn(conn):
+            from .ora import reads as oracle_reads
+
+            return await oracle_reads.newest_memory_updated_at(
+                conn=conn,
+                fq_table=fq_store_table,
+                bank_id=bank_id,
+                until=until,
+                since=since,
+                fact_types=fact_types,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=tag_groups,
+            )
         return await reads.newest_memory_updated_at(
             conn=conn,
             fq_table=fq_store_table,
@@ -532,6 +572,21 @@ class PostgresMemories(MemoriesExtension):
         tags_match: TagsMatch = "any",
         tag_groups: list | None = None,
     ) -> list[StoredMemory] | None:
+        if is_oracle_conn(conn):
+            from .ora import reads as oracle_reads
+
+            return await oracle_reads.memories_updated_between(
+                conn=conn,
+                fq_table=fq_store_table,
+                bank_id=bank_id,
+                until=until,
+                since=since,
+                limit=limit,
+                fact_types=fact_types,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=tag_groups,
+            )
         return await reads.memories_updated_between(
             conn=conn,
             fq_table=fq_store_table,
@@ -546,6 +601,10 @@ class PostgresMemories(MemoriesExtension):
         )
 
     async def latest_memory_write_at(self, *, conn, fq_table, bank_id: str) -> datetime | None:
+        if is_oracle_conn(conn):
+            from .ora import reads as oracle_reads
+
+            return await oracle_reads.latest_memory_write_at(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
         return await reads.latest_memory_write_at(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
 
     async def live_memory_ids(self, *, conn, fq_table, bank_id: str, unit_ids: list[Any]) -> set[str]:
@@ -1113,6 +1172,10 @@ class PostgresMemories(MemoriesExtension):
         return await engine_curation.count_bank_contents(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
 
     async def purge_bank_rows(self, *, conn, fq_table, bank_id: str) -> list[str]:
+        if is_oracle_conn(conn):
+            from .ora import engine_curation as oracle_engine_curation
+
+            return await oracle_engine_curation.purge_bank_rows(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
         return await engine_curation.purge_bank_rows(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
 
     async def clear_observations_and_requeue(self, *, conn, fq_table, bank_id: str) -> int:
@@ -1373,11 +1436,23 @@ class PostgresMemories(MemoriesExtension):
         )
 
     async def list_bank_rows(self, *, conn, fq_table, where_clause: str, params: list[str]) -> list:
+        if is_oracle_conn(conn):
+            from .ora import banks as oracle_banks
+
+            return await oracle_banks.list_bank_rows(
+                conn=conn, fq_table=fq_store_table, where_clause=where_clause, params=params
+            )
         return await pg_banks.list_bank_rows(
             conn=conn, fq_table=fq_store_table, where_clause=where_clause, params=params
         )
 
     async def bank_page_rows(self, *, conn, fq_table, bank_ids: list[str], sql_owned: list[str]) -> list:
+        if is_oracle_conn(conn):
+            from .ora import banks as oracle_banks
+
+            return await oracle_banks.bank_page_rows(
+                conn=conn, fq_table=fq_store_table, bank_ids=bank_ids, sql_owned=sql_owned
+            )
         return await pg_banks.bank_page_rows(conn=conn, fq_table=fq_store_table, bank_ids=bank_ids, sql_owned=sql_owned)
 
     async def bank_fact_counts(self, *, conn, fq_table, bank_ids: list[str]) -> dict[str, int]:
