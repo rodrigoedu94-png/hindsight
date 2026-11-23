@@ -4472,6 +4472,12 @@ def create_app(
     from hindsight_api.profiling import install as _install_profiling
 
     _install_profiling()
+
+    # Optional Sentry reporting (no-op unless SENTRY_DSN is set); armed here for the same
+    # reason as profiling: spawned uvicorn workers import the app but never run main().
+    from hindsight_api.sentry_setup import install as _install_sentry
+
+    _install_sentry()
     # Load HTTP extension from environment if not provided
     if http_extension is None:
         http_extension = load_extension("HTTP", HttpExtension)
