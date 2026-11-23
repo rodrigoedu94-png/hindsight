@@ -386,7 +386,7 @@ Measured on the live OCI Always Free `HINDSIGHT26` instance (Oracle AI Database 
 | `multilingual_e5_base` (768d) | 1,063.45 MB | +1,089.87 MB | 19.21 s | 5,265.51 ms | 36.08 ms | 880.40 ms/row (`1.14/s`) | ~5.9 h | 611.28 MB (`1,551.9 MB` sess / `2,074.6 MB` total / 4 workers) | 0.45 |
 
 - **Why NO-GO:** (1) embedding space and dimension mismatch against existing 1536d Cohere vectors (`0.29–0.46` Overlap@10); (2) `DBMS_VECTOR.INMEMORY_ONNX_MODEL` fails with `ORA-54485` on precompiled `BLOB` models (shared memory requires external initializers exported via OML4Py on x86_64 and loaded from `DATA_PUMP_DIR`), causing per-session PGA multiplication under concurrent workers; (3) 2-OCPU batch throughput is orders of magnitude slower than external embedding APIs.
-- **Re-evaluation trigger:** only for a greenfield bank/schema provisioned from scratch for local 384d/768d/1024d embeddings, or a separate future evaluation of ONNX cross-encoder reranking (`MiningFunction.REGRESSION`) restricted to top-K candidates.
+- **Re-evaluation trigger:** only for a greenfield schema/instance provisioned from scratch (not a new `bank_id` in an existing schema, since `HINDSIGHT_API_EMBEDDINGS_*` is instance-wide and Oracle validates embedding dimensions table-wide) for local 384d/768d/1024d embeddings, or a separate future evaluation of ONNX cross-encoder reranking (`MiningFunction.REGRESSION`) restricted to top-K candidates.
 
 ### 2. Hybrid Vector Index (`CREATE HYBRID VECTOR INDEX` / `DBMS_HYBRID_VECTOR.SEARCH`) — NO-GO
 
@@ -397,7 +397,7 @@ Measured on the live OCI Always Free `HINDSIGHT26` instance (Oracle AI Database 
 
 ### 3. JSON Relational Duality Views — NO-GO
 
-- Reading `documents` + `chunks` via a Duality View (`0.99 ms` p50 / `5.63 ms` p95) ties with relational `JOIN` (`1.99 ms` p50 / `10.13 ms` p95).
+- Reading `documents` + `chunks` via a Duality View (`0.99 ms` p50 / `5.63 ms` p95) is only ~1 ms p50 / ~4.5 ms p95 faster than a relational `JOIN` (`1.99 ms` p50 / `10.13 ms` p95) — too small to justify Oracle-specific schema divergence.
 - `CLOB` JSON columns (`tags`) double-encode as JSON strings, and Hindsight has no document/REST consumer that justifies Oracle-specific schema divergence.
 
 ### References
