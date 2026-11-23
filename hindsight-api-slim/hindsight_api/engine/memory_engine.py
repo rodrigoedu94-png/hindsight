@@ -23082,9 +23082,10 @@ class MemoryEngine(MemoryEngineInterface):
             if getattr(conn, "backend_type", None) == "oracle":
                 from .memories.ora import engine_queries as oracle_engine_queries
 
-                op_hint, op_order = oracle_engine_queries.async_operations_list_clauses(
+                op_clauses = oracle_engine_queries.async_operations_list_clauses(
                     single_condition=len(where_conditions) == 1
                 )
+                op_hint, op_order = op_clauses.hint, op_clauses.order_by
             else:
                 op_hint, op_order = "", "ao.created_at DESC"
             operations = await conn.fetch(

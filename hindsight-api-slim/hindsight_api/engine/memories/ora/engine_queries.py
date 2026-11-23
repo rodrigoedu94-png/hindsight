@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class AsyncOperationsClauses:
+    """Oracle optimizer hint and ``ORDER BY`` clause for ``async_operations``."""
+
+    hint: str
+    order_by: str
 
 
 async def trim_mental_model_history(
@@ -35,7 +44,7 @@ async def trim_mental_model_history(
     )
 
 
-def async_operations_list_clauses(*, single_condition: bool) -> tuple[str, str]:
-    """Return ``(optimizer_hint, order_by_expr)`` for listing ``async_operations`` on Oracle."""
+def async_operations_list_clauses(*, single_condition: bool) -> AsyncOperationsClauses:
+    """Return optimizer hint and ``ORDER BY`` expression for listing ``async_operations`` on Oracle."""
     hint = "/*+ INDEX(ao idx_async_operations_bank_created_desc) */ " if single_condition else ""
-    return hint, "SYS_EXTRACT_UTC(ao.created_at) DESC"
+    return AsyncOperationsClauses(hint=hint, order_by="SYS_EXTRACT_UTC(ao.created_at) DESC")

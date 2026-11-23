@@ -191,6 +191,41 @@ class TestOracleQueryPlansAndRecall:
             monkeypatch.delenv("HINDSIGHT_API_ORACLE_VECTOR_SEARCH", raising=False)
             clear_config_cache()
 
+        # Verify DRG-10599 Oracle Text fallback renumbers tags + created_after/created_before params cleanly.
+        fb_calls: list[tuple[str, tuple]] = []
+
+        class _OracleDrgConn:
+            backend_type = "oracle"
+
+            async def fetch(self, query, *args):
+                fb_calls.append((query, args))
+                if len(fb_calls) == 1:
+                    raise RuntimeError("DRG-10599: column is not indexed")
+                return []
+
+        monkeypatch.setattr(ora_recall, "tokenize_query", lambda _: ["oracle"])
+        monkeypatch.setattr(
+            ora_recall,
+            "build_bm25_query_text",
+            AsyncMock(return_value="oracle"),
+        )
+        t_after = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        await store.search(
+            conn=_OracleDrgConn(),
+            query_embedding="[0.1]",
+            query_text="oracle",
+            bank_id="bank-1",
+            fact_types=["world", "experience"],
+            limit=10,
+            tags=["tag-a"],
+            created_after=t_after,
+            enable_text_search=True,
+        )
+        assert len(fb_calls) == 2
+        fb_sql, fb_args = fb_calls[1]
+        assert "CONTAINS(" not in fb_sql
+        assert fb_args == ("[0.1]", "bank-1", ["tag-a"], t_after)
+
         # PG path stays untouched in pg/recall.py and emits per-fact-type arms.
         pg_captured: list[str] = []
 
@@ -391,7 +426,7 @@ class TestOracleOpsAndPropertyGraph:
         assert res_fb is fallback_rows
 
     def test_graph_retriever_dispatch_and_ora_importable_without_oracledb(self, monkeypatch):
-        import importlib
+        import subprocess
         import sys
 
         from hindsight_api.engine.memories.ora.link_expansion import OracleLinkExpansionRetriever
@@ -414,18 +449,20 @@ class TestOracleOpsAndPropertyGraph:
             monkeypatch.delenv("HINDSIGHT_API_DATABASE_BACKEND", raising=False)
             clear_config_cache()
 
-        # Verify all ora/* modules import cleanly without oracledb installed.
-        monkeypatch.setitem(sys.modules, "oracledb", None)
-        for mod_name in (
-            "hindsight_api.engine.memories.ora",
-            "hindsight_api.engine.memories.ora.banks",
-            "hindsight_api.engine.memories.ora.consolidation",
-            "hindsight_api.engine.memories.ora.counts",
-            "hindsight_api.engine.memories.ora.engine_curation",
-            "hindsight_api.engine.memories.ora.engine_queries",
-            "hindsight_api.engine.memories.ora.link_expansion",
-            "hindsight_api.engine.memories.ora.reads",
-            "hindsight_api.engine.memories.ora.recall",
-        ):
-            mod = importlib.reload(importlib.import_module(mod_name))
-            assert mod is not None
+        # Verify all ora/* modules import cleanly in a fresh process without oracledb.
+        probe = (
+            "import importlib, sys\n"
+            "class BlockOracle:\n"
+            "    def find_spec(self, name, path, target=None):\n"
+            "        if name == 'oracledb' or name.startswith('oracledb.'):\n"
+            "            raise ImportError('blocked')\n"
+            "sys.meta_path.insert(0, BlockOracle())\n"
+            "for m in ('hindsight_api.engine.memories.ora', 'hindsight_api.engine.memories.ora.banks', "
+            "'hindsight_api.engine.memories.ora.consolidation', 'hindsight_api.engine.memories.ora.counts', "
+            "'hindsight_api.engine.memories.ora.engine_curation', 'hindsight_api.engine.memories.ora.engine_queries', "
+            "'hindsight_api.engine.memories.ora.link_expansion', 'hindsight_api.engine.memories.ora.reads', "
+            "'hindsight_api.engine.memories.ora.recall'):\n"
+            "    assert importlib.import_module(m) is not None\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stderr
