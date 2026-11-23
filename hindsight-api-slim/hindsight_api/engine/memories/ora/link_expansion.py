@@ -92,7 +92,7 @@ class OracleLinkExpansionRetriever(LinkExpansionRetriever):
                 )
             except Exception as fb_err:
                 logger.warning(
-                    "[LinkExpansion] Oracle SQL/PGQ timeout fallback failed (%s), falling back to relational expansion",
+                    "[LinkExpansion] Oracle SQL/PGQ timeout fallback failed (%r), falling back to relational expansion",
                     fb_err,
                 )
                 return await super()._expand_combined(
