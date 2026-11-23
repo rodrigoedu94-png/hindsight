@@ -1,5 +1,6 @@
 """Unit tests for Oracle 26ai optimizations and native SQL/PGQ property graph support."""
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -11,8 +12,9 @@ from hindsight_api.config import HindsightConfig, clear_config_cache
 from hindsight_api.engine.db.ops import MEMORY_UNIT_COLUMNS, UpdatedWindow
 from hindsight_api.engine.db.ops_oracle import OracleOps
 from hindsight_api.engine.db.oracle import OracleConnection, _rewrite_pg_to_oracle
-from hindsight_api.engine.memories.pg import banks as pg_banks
+from hindsight_api.engine.memories.ora import recall as ora_recall
 from hindsight_api.engine.memories.pg import recall as pg_recall
+from hindsight_api.engine.memories.postgres import PostgresMemories
 from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.search.retrieval import tokenize_query
 from hindsight_api.engine.sql.oracle import OracleDialect
@@ -125,7 +127,7 @@ class TestOracleQueryPlansAndRecall:
                 return []
 
         monkeypatch.setattr(
-            pg_recall,
+            ora_recall,
             "get_config",
             lambda: SimpleNamespace(
                 semantic_min_similarity=0.3,
@@ -139,16 +141,17 @@ class TestOracleQueryPlansAndRecall:
                 bm25_max_query_terms=16,
             ),
         )
-        monkeypatch.setattr(pg_recall, "tokenize_query", lambda _: [])
-        monkeypatch.setattr(pg_recall, "fq_table", lambda t: t)
+        monkeypatch.setattr(ora_recall, "tokenize_query", lambda _: [])
+        monkeypatch.setattr(ora_recall, "fq_table", lambda t: t)
 
-        await pg_recall.retrieve_semantic_bm25_combined_sql(
-            _OracleConn(),
-            "[0.1]",
-            "",
-            "bank-1",
-            ["world", "experience", "observation"],
-            20,
+        store = PostgresMemories({})
+        await store.search(
+            conn=_OracleConn(),
+            query_embedding="[0.1]",
+            query_text="",
+            bank_id="bank-1",
+            fact_types=["world", "experience", "observation"],
+            limit=20,
             enable_text_search=False,
         )
         assert len(captured) == 1
@@ -161,7 +164,7 @@ class TestOracleQueryPlansAndRecall:
         clear_config_cache()
         try:
             monkeypatch.setattr(
-                pg_recall,
+                ora_recall,
                 "get_config",
                 lambda: SimpleNamespace(
                     semantic_min_similarity=0.3,
@@ -175,40 +178,101 @@ class TestOracleQueryPlansAndRecall:
                     bm25_max_query_terms=16,
                 ),
             )
-            await pg_recall.retrieve_semantic_bm25_combined_sql(
-                _OracleConn(),
-                "[0.1]",
-                "",
-                "bank-1",
-                ["world", "experience", "observation"],
-                20,
+            await store.search(
+                conn=_OracleConn(),
+                query_embedding="[0.1]",
+                query_text="",
+                bank_id="bank-1",
+                fact_types=["world", "experience", "observation"],
+                limit=20,
                 enable_text_search=False,
             )
             assert captured[0].count("FETCH APPROX FIRST") == 3
         finally:
             monkeypatch.delenv("HINDSIGHT_API_ORACLE_VECTOR_SEARCH", raising=False)
             clear_config_cache()
+
+        # Verify DRG-10599 Oracle Text fallback renumbers tags + created_after/created_before params cleanly.
+        fb_calls: list[tuple[str, tuple]] = []
+
+        class _OracleDrgConn:
+            backend_type = "oracle"
+
+            async def fetch(self, query, *args):
+                fb_calls.append((query, args))
+                if len(fb_calls) == 1:
+                    raise RuntimeError("DRG-10599: column is not indexed")
+                return []
+
+        monkeypatch.setattr(ora_recall, "tokenize_query", lambda _: ["oracle"])
+        monkeypatch.setattr(
+            ora_recall,
+            "build_bm25_query_text",
+            AsyncMock(return_value="oracle"),
+        )
+        t_after = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        await store.search(
+            conn=_OracleDrgConn(),
+            query_embedding="[0.1]",
+            query_text="oracle",
+            bank_id="bank-1",
+            fact_types=["world", "experience"],
+            limit=10,
+            tags=["tag-a"],
+            created_after=t_after,
+            enable_text_search=True,
+        )
+        assert len(fb_calls) == 2
+        fb_sql, fb_args = fb_calls[1]
+        assert "CONTAINS(" not in fb_sql
+        assert fb_args == ("[0.1]", "bank-1", ["tag-a"], t_after)
+
+        # PG path stays untouched in pg/recall.py and emits per-fact-type arms.
+        pg_captured: list[str] = []
+
+        class _PgConn:
+            backend_type = "postgresql"
+
+            async def fetch(self, query, *_args):
+                pg_captured.append(query)
+                return []
+
+        monkeypatch.setattr(pg_recall, "tokenize_query", lambda _: [])
+        monkeypatch.setattr(pg_recall, "fq_table", lambda t: t)
+        await store.search(
+            conn=_PgConn(),
+            query_embedding="[0.1]",
+            query_text="",
+            bank_id="bank-1",
+            fact_types=["world", "experience"],
+            limit=20,
+            enable_text_search=False,
+        )
+        assert len(pg_captured) == 1
+        assert "PARTITION BY fact_type" not in pg_captured[0]
+        assert pg_captured[0].count("UNION ALL") == 1
         # Avoid unused import lint failure if tokenize_query wasn't called directly
         assert tokenize_query("hello") == ["hello"]
 
     @pytest.mark.asyncio
     async def test_bank_watermark_queries_use_index_hint_on_oracle_only(self):
+        store = PostgresMemories({})
         oracle_conn = MagicMock()
         oracle_conn.backend_type = "oracle"
         oracle_conn.fetch = AsyncMock(return_value=[])
-        await pg_banks.list_bank_rows(conn=oracle_conn, fq_table=lambda t: t, where_clause="", params=[])
+        await store.list_bank_rows(conn=oracle_conn, fq_table=lambda t: t, where_clause="", params=[])
         q_list = oracle_conn.fetch.await_args.args[0]
         assert "/*+ INDEX(m idx_mu_bank_updated_at) */" in q_list
         assert "ORDER BY SYS_EXTRACT_UTC(m.updated_at) DESC FETCH FIRST 1 ROW ONLY" in q_list
 
-        await pg_banks.bank_page_rows(conn=oracle_conn, fq_table=lambda t: t, bank_ids=["b1"], sql_owned=["b1"])
+        await store.bank_page_rows(conn=oracle_conn, fq_table=lambda t: t, bank_ids=["b1"], sql_owned=["b1"])
         q_page = oracle_conn.fetch.await_args.args[0]
         assert "/*+ INDEX(m idx_mu_bank_updated_at) */" in q_page
 
         pg_conn = MagicMock()
         pg_conn.backend_type = "postgresql"
         pg_conn.fetch = AsyncMock(return_value=[])
-        await pg_banks.list_bank_rows(conn=pg_conn, fq_table=lambda t: t, where_clause="", params=[])
+        await store.list_bank_rows(conn=pg_conn, fq_table=lambda t: t, where_clause="", params=[])
         assert "MAX(m.updated_at)" in pg_conn.fetch.await_args.args[0]
 
     @pytest.mark.asyncio
@@ -335,3 +399,114 @@ class TestOracleOpsAndPropertyGraph:
         finally:
             monkeypatch.delenv("HINDSIGHT_API_ORACLE_USE_PROPERTY_GRAPH", raising=False)
             monkeypatch.delenv("HINDSIGHT_API_ORACLE_PGQ_MAX_HOPS", raising=False)
+
+    @pytest.mark.asyncio
+    async def test_oracle_link_expansion_retriever_uses_pgq_and_falls_back(self, monkeypatch):
+        from hindsight_api.engine.memories.ora import link_expansion as ora_le
+        from hindsight_api.engine.memories.ora.link_expansion import OracleLinkExpansionRetriever
+        from hindsight_api.engine.memories.pg.link_expansion import LinkExpansionRetriever
+
+        monkeypatch.setattr(ora_le, "fq_table", lambda t: t)
+        ops = OracleOps()
+        monkeypatch.setattr(ops, "has_property_graph", AsyncMock(return_value=True))
+
+        conn = MagicMock()
+        conn.backend_type = "oracle"
+        conn.fetch = AsyncMock(return_value=[{"source": "semantic", "id": "u1"}])
+
+        retriever = OracleLinkExpansionRetriever()
+        res = await retriever._expand_combined(conn, ["seed-1"], "world", 20, ops=ops)
+        assert len(res.semantic) == 1
+        assert "GRAPH_TABLE (" in conn.fetch.await_args.args[0]
+
+        # When PGQ query raises, it delegates cleanly to LinkExpansionRetriever._expand_combined.
+        conn.fetch = AsyncMock(side_effect=RuntimeError("ORA-49022: graph unavailable"))
+        fallback_rows = MagicMock()
+        monkeypatch.setattr(LinkExpansionRetriever, "_expand_combined", AsyncMock(return_value=fallback_rows))
+        res_fb = await retriever._expand_combined(conn, ["seed-1"], "world", 20, ops=ops)
+        assert res_fb is fallback_rows
+
+        # When PGQ times out, semantic+causal fallback runs with bounded timeout.
+        conn.fetch = AsyncMock(
+            side_effect=[
+                asyncio.TimeoutError(),
+                [{"source": "causal", "id": "u2"}],
+            ]
+        )
+        res_to = await retriever._expand_combined(conn, ["seed-1"], "world", 20, ops=ops)
+        assert len(res_to.causal) == 1
+        assert conn.fetch.await_count == 2
+
+        # When both PGQ and its timeout fallback fail/timeout, degrade to relational super()._expand_combined.
+        conn.fetch = AsyncMock(side_effect=[asyncio.TimeoutError(), asyncio.TimeoutError()])
+        res_to_fb = await retriever._expand_combined(conn, ["seed-1"], "world", 20, ops=ops)
+        assert res_to_fb is fallback_rows
+
+    @pytest.mark.asyncio
+    async def test_uuid_shaped_bank_ids_stay_str_in_ora_modules(self):
+        from hindsight_api.engine.db.oracle import OracleLiteralStr, _convert_arg
+        from hindsight_api.engine.memories.ora import banks as ora_banks
+        from hindsight_api.engine.memories.ora import engine_curation as ora_curation
+        from hindsight_api.engine.memories.ora import recall as ora_recall
+
+        uuid_bank = "11111111-2222-3333-4444-555555555555"
+        conn = MagicMock()
+        conn.backend_type = "oracle"
+        conn.fetch = AsyncMock(return_value=[])
+        conn.execute = AsyncMock(return_value="DELETE 0")
+
+        await ora_banks.bank_page_rows(conn=conn, fq_table=lambda t: t, bank_ids=[uuid_bank], sql_owned=[uuid_bank])
+        assert all(
+            isinstance(b, OracleLiteralStr) and isinstance(_convert_arg(b), str) for b in conn.fetch.await_args.args[1]
+        )
+
+        conn.fetch.reset_mock()
+        await ora_curation.purge_bank_rows(conn=conn, fq_table=lambda t: t, bank_id=uuid_bank)
+        assert isinstance(conn.fetch.await_args_list[0].args[1], OracleLiteralStr)
+        assert isinstance(_convert_arg(conn.fetch.await_args_list[0].args[1]), str)
+
+        conn.fetch.reset_mock()
+        await ora_recall.retrieve_semantic_bm25_combined_sql(
+            conn, "[0.1]", "", uuid_bank, ["world"], 5, enable_text_search=False
+        )
+        assert isinstance(conn.fetch.await_args.args[2], OracleLiteralStr)
+        assert isinstance(_convert_arg(conn.fetch.await_args.args[2]), str)
+
+    def test_graph_retriever_dispatch_and_ora_importable_without_oracledb(self, monkeypatch):
+        import subprocess
+        import sys
+
+        from hindsight_api.engine.memories.ora.link_expansion import OracleLinkExpansionRetriever
+        from hindsight_api.engine.memories.pg.link_expansion import LinkExpansionRetriever
+
+        store = PostgresMemories({})
+        monkeypatch.setenv("HINDSIGHT_API_DATABASE_BACKEND", "oracle")
+        clear_config_cache()
+        try:
+            assert isinstance(store.graph_retriever(), OracleLinkExpansionRetriever)
+        finally:
+            monkeypatch.delenv("HINDSIGHT_API_DATABASE_BACKEND", raising=False)
+            clear_config_cache()
+
+        monkeypatch.setenv("HINDSIGHT_API_DATABASE_BACKEND", "postgresql")
+        clear_config_cache()
+        try:
+            assert type(store.graph_retriever()) is LinkExpansionRetriever
+        finally:
+            monkeypatch.delenv("HINDSIGHT_API_DATABASE_BACKEND", raising=False)
+            clear_config_cache()
+
+        # Verify all ora/* modules import cleanly in a fresh process without oracledb.
+        probe = (
+            "import importlib, pkgutil, sys\n"
+            "class BlockOracle:\n"
+            "    def find_spec(self, name, path, target=None):\n"
+            "        if name == 'oracledb' or name.startswith('oracledb.'):\n"
+            "            raise ImportError('blocked')\n"
+            "sys.meta_path.insert(0, BlockOracle())\n"
+            "ora_pkg = importlib.import_module('hindsight_api.engine.memories.ora')\n"
+            "for mod in pkgutil.iter_modules(ora_pkg.__path__, ora_pkg.__name__ + '.'):\n"
+            "    assert importlib.import_module(mod.name) is not None\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stderr

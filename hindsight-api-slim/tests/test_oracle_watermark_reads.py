@@ -1,14 +1,29 @@
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from hindsight_api.engine.db.oracle import _convert_row_from_oracle, _rewrite_pg_to_oracle
-from hindsight_api.engine.memories.pg.reads import (
-    latest_memory_write_at,
-    memories_updated_between,
-    newest_memory_updated_at,
-)
+from hindsight_api.engine.memories.postgres import PostgresMemories
+
+
+async def newest_memory_updated_at(*, conn, fq_table, bank_id, until, since=None):
+    with patch("hindsight_api.engine.memories.postgres.fq_store_table", side_effect=fq_table):
+        return await PostgresMemories({}).newest_memory_updated_at(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, until=until, since=since
+        )
+
+
+async def memories_updated_between(*, conn, fq_table, bank_id, until, since, limit):
+    with patch("hindsight_api.engine.memories.postgres.fq_store_table", side_effect=fq_table):
+        return await PostgresMemories({}).memories_updated_between(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, until=until, since=since, limit=limit
+        )
+
+
+async def latest_memory_write_at(*, conn, fq_table, bank_id):
+    with patch("hindsight_api.engine.memories.postgres.fq_store_table", side_effect=fq_table):
+        return await PostgresMemories({}).latest_memory_write_at(conn=conn, fq_table=fq_table, bank_id=bank_id)
 
 
 def _make_conn(backend_type: str, result: datetime | None) -> MagicMock:
