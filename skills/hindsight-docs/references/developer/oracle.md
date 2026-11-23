@@ -371,6 +371,43 @@ in-database ONNX model (or a provider called from the database), and queries it
 with a `search_vector` must use that same model — a second vector space alongside
 the embeddings Hindsight produces with its configured provider.
 
+## Oracle 26ai advanced feature assessment (ADR — LIN-258)
+
+**Status: NO-GO on adopting Hybrid Vector Index, in-database ONNX embeddings, or JSON Relational Duality Views for the current Oracle 26ai backend.**
+
+Measured on the live OCI Always Free `HINDSIGHT26` instance (Oracle AI Database 26ai EE `23.26.4.1.0`, `20 GB` disk quota, `2 OCPUs`, `sga_target=8000M`, `pga_aggregate_target=3000M`, `24,154` Cohere `embed-v4.0` 1536d `FLOAT32` vectors, baseline `USER_SEGMENTS = 2,310.81 MB`):
+
+### 1. In-database ONNX embeddings (`DBMS_VECTOR.LOAD_ONNX_MODEL` / `VECTOR_EMBEDDING`) — NO-GO
+
+| Official Oracle OML text model | `.onnx` size | Disk (`USER_SEGMENTS`) | Load (`BLOB`) | Cold call | Warm `p50` | Batch throughput (2 OCPUs) | Projected 24,154-row backfill | Peak 1-session PGA | Overlap@10 vs Cohere 1536d |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `multilingual_e5_small` (384d) | 117.32 MB | +121.88 MB | 3.45 s | 889.89 ms | 5.85 ms | 111.56 ms/row (`8.96/s`) | ~44.9 min | 212.76 MB | 0.46 |
+| `all_MiniLM_L12_v2` (384d) | 127.15 MB | +137.87 MB | 3.11 s | 1,582.69 ms | 11.94 ms | 132.28 ms/row (`7.56/s`) | ~53.3 min | 263.53 MB (`955.1 MB` / 4 workers) | 0.29 |
+| `multilingual_e5_base` (768d) | 1,063.45 MB | +1,089.87 MB | 19.21 s | 5,265.51 ms | 36.08 ms | 880.40 ms/row (`1.14/s`) | ~5.9 h | 611.28 MB (`1,551.9 MB` sess / `2,074.6 MB` total / 4 workers) | 0.45 |
+
+- **Why NO-GO:** (1) embedding space and dimension mismatch against existing 1536d Cohere vectors (`0.29–0.46` Overlap@10); (2) `DBMS_VECTOR.INMEMORY_ONNX_MODEL` fails with `ORA-54485` on precompiled `BLOB` models (shared memory requires external initializers exported via OML4Py on x86_64 and loaded from `DATA_PUMP_DIR`), causing per-session PGA multiplication under concurrent workers; (3) 2-OCPU batch throughput is orders of magnitude slower than external embedding APIs.
+- **Re-evaluation trigger:** only for a greenfield bank/schema provisioned from scratch for local 384d/768d/1024d embeddings, or a separate future evaluation of ONNX cross-encoder reranking (`MiningFunction.REGRESSION`) restricted to top-K candidates.
+
+### 2. Hybrid Vector Index (`CREATE HYBRID VECTOR INDEX` / `DBMS_HYBRID_VECTOR.SEARCH`) — NO-GO
+
+- **No external vector reuse:** generates its own internal ONNX embeddings (`$VR` + internal IVF index, `0 MB` vector pool) rather than reusing `memory_units.embedding` (1536d).
+- **Footprint (500 real rows):** consumes `13.25 MB` (`~640.1 MB` projected for 24,154 rows + `121.88 MB` ONNX ≈ `762 MB`, vs `71.93 MB` for the existing `CTXSYS.CONTEXT` index).
+- **Commit vs visibility trade-off:** `MAINTENANCE AUTO` keeps commits fast (`3.86 ms` p50) but returns `0` hits immediately post-`COMMIT` (breaking synchronous retain visibility); `SYNC (ON COMMIT)` restores immediate visibility at ~10× write latency (`38.35 ms` p50 / `97.57 ms` p95; `110.81 ms` for a 10-row batch).
+- **Multi-tenant filtering & pipeline fit:** `filter_by` on `bank_id` raises `ORA-20000` without explicit `INCLUDE`/`SDATA` configuration, and `25.41 ms` p50 hybrid search only replaces two arms already fused by Hindsight RRF and reranked.
+
+### 3. JSON Relational Duality Views — NO-GO
+
+- Reading `documents` + `chunks` via a Duality View (`0.99 ms` p50 / `5.63 ms` p95) ties with relational `JOIN` (`1.99 ms` p50 / `10.13 ms` p95).
+- `CLOB` JSON columns (`tags`) double-encode as JSON strings, and Hindsight has no document/REST consumer that justifies Oracle-specific schema divergence.
+
+### References
+
+- [Oracle: Understand Hybrid Vector Indexes](https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/understand-hybrid-vector-indexes.html)
+- [Oracle: `CREATE HYBRID VECTOR INDEX`](https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/create-hybrid-vector-index.html)
+- [Oracle: Import Pretrained Models in ONNX Format](https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/import-pretrained-models-onnx-format-vector-generation-database.html)
+- [Oracle: `DBMS_VECTOR.INMEMORY_ONNX_MODEL`](https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/inmemory_onnx_model-dbms_vector.html)
+- [Oracle: Always Free Autonomous AI Database](https://docs.oracle.com/en-us/iaas/autonomous-database-serverless/doc/autonomous-always-free.html)
+
 ## Limitations vs PostgreSQL
 
 Memory operations behave identically on Oracle, but a few operational and
