@@ -834,7 +834,7 @@ from .search.tags import (
 from .search.types import ScoredResult
 from .source_facts import select_source_facts_within_budget
 from .source_scope import visible_document_ids
-from .stored_dates import is_placeholder_date
+from .stored_dates import bank_timezone, is_placeholder_date
 from .task_backend import TaskBackend
 from .time_filter import DOCUMENT_TIME_FIELDS, validate_time_window
 
@@ -4646,6 +4646,23 @@ class MemoryEngine(MemoryEngineInterface):
             retry_count=task_dict.get("_retry_count", 0),
             operation_id=task_dict.get("_operation_id"),
         )
+        if operation_id and not any(item.get("update_mode") == "append" for item in contents):
+            newer = await self._supersede_by_newer_retain_of_same_document(operation_id)
+            if newer:
+                # A replace carries the whole document, so one SENT later and already finished holds
+                # a newer version. This one can only reach here after it by being retried: the claim
+                # predicate runs a document's retains in submission order, but a peer waiting out
+                # its retry delay does not hold the line. Running it would roll the document back
+                # and re-extract the older body (#6763). The orchestrator's own stale check cannot
+                # see this: it compares against when this run STARTED, which is after the newer
+                # version committed. Checked before `retain_batch_async` on purpose: nothing runs,
+                # so the retain's validator hooks and its retain.completed event (written only with
+                # stored memories, like the orchestrator's stale skip) have nothing to report.
+                logger.info(
+                    f"[BATCH_RETAIN_TASK] Skipping retain {operation_id} for bank_id={bank_id}: "
+                    f"retain {newer}, sent after it, already replaced the document"
+                )
+                return
         await self.retain_batch_async(
             bank_id=bank_id,
             contents=contents,
@@ -10665,6 +10682,7 @@ class MemoryEngine(MemoryEngineInterface):
                     recency_decay_function=get_config().recency_decay_function,
                     recency_decay_linear_window_days=get_config().recency_decay_linear_window_days,
                     recency_decay_halflife_days=get_config().recency_decay_halflife_days,
+                    recency_alpha=get_config().recency_alpha,
                     # Resolved here, not in the store: `question_date` overrides "now", and two
                     # clocks would make an identical request score differently on the two paths.
                     now=_recall_scoring_now(request.question_date),
@@ -11262,6 +11280,7 @@ class MemoryEngine(MemoryEngineInterface):
                     recency_decay_function=scoring_config.recency_decay_function,
                     recency_decay_linear_window_days=scoring_config.recency_decay_linear_window_days,
                     recency_decay_halflife_days=scoring_config.recency_decay_halflife_days,
+                    recency_alpha=scoring_config.recency_alpha,
                 )
                 # Per-strategy bump after combined scoring. Passthrough recalls
                 # (explicit rrf, an rrf provider, or a chain that failed over to
@@ -11274,7 +11293,9 @@ class MemoryEngine(MemoryEngineInterface):
 
                     stage2 = apply_post_rerank_boost(scored_results, strategy_boosts, passthrough=is_passthrough)
                 scored_results.sort(key=lambda x: x.weight, reverse=True)
-                log_buffer.append("  [4.6] Combined scoring: ce * recency_boost(0.2) * temporal_boost(0.2)")
+                log_buffer.append(
+                    f"  [4.6] Combined scoring: ce * recency_boost({scoring_config.recency_alpha}) * temporal_boost(0.2)"
+                )
                 if strategy_boosts:
                     log_buffer.append(f"  [4.7] Strategy boosts applied: {strategy_boosts} {stage2}")
 
@@ -17093,6 +17114,7 @@ class MemoryEngine(MemoryEngineInterface):
                             evidence_is_sufficient_fn=decision_model.evidence_is_sufficient if decision_model else None,
                             prune_evidence_fn=self._prune_reflect_evidence if decision_model else None,
                             reflect_id=reflect_id,
+                            tz=bank_timezone(resolved_reflect_config),
                         )
             except (asyncio.CancelledError, OperationCancelledError):
                 # Logged here, under this reflect's id, because the HTTP layer's
@@ -17471,7 +17493,8 @@ class MemoryEngine(MemoryEngineInterface):
             for u in units
         ]
         # CPU-bound (~0.1s per few thousand observations): off the event loop, like the entity graph.
-        return await asyncio.to_thread(build_observation_tree, observations, bank_id)
+        tz = bank_timezone(await self._config_resolver.resolve_full_config(bank_id, request_context))
+        return await asyncio.to_thread(build_observation_tree, observations, bank_id, tz)
 
     async def get_entity_graph(
         self,
@@ -19838,6 +19861,12 @@ class MemoryEngine(MemoryEngineInterface):
                                 "operations for the reason each was dropped."
                             )
                 except Exception as exc:
+                    # A provider that is rate-limited or down answers later: let it escape
+                    # as itself, so the refresh fails as temporary and does not pause
+                    # automatic refresh — the same verdict the reflect loop gets (#6674).
+                    # Turned into ``delta_ops_failed`` it lost its type and paused the model.
+                    if is_transient_remote_error(exc) or isinstance(exc, ProviderRateLimitResetError):
+                        raise
                     logger.warning(
                         f"[MENTAL_MODELS] Structured delta failed for {mental_model_id} "
                         f"({exc}); delta operations were not applied"
@@ -20207,6 +20236,9 @@ class MemoryEngine(MemoryEngineInterface):
                 logger.warning(f"[MENTAL_MODELS] Refresh for {mental_model_id} failed ({reason}); {detail}")
                 reflect_response_payload["refresh_skipped"] = reason
                 reflect_response_payload["outcome"] = outcome
+                # The content stays, so its structured view must stay too (#6499).
+                if prev_structured_output is not None:
+                    reflect_response_payload["structured_output"] = prev_structured_output
                 await self.update_mental_model(
                     bank_id,
                     mental_model_id,
@@ -24040,6 +24072,40 @@ class MemoryEngine(MemoryEngineInterface):
         except Exception as e:
             logger.warning(f"Failed to check for other pending consolidation ops for bank {bank_id}: {e}")
             return None
+
+    async def _supersede_by_newer_retain_of_same_document(self, operation_id: str) -> str | None:
+        """The completed retain of the same document submitted after ``operation_id``, if any.
+
+        When there is one, records it as ``result_metadata.superseded_by`` on ``operation_id``,
+        which then completes normally: nothing is left for it to do, so it is neither a failure
+        nor a cancellation (a cancelled child would also turn its whole batch 'cancelled').
+
+        Keyed on ``serialization_key``, which a retain carries exactly when it targets one
+        document; a multi-document retain has none and never matches.
+        """
+        table = fq_table("async_operations")
+        backend = await self._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            newer = await conn.fetchval(
+                f"SELECT newer.operation_id FROM {table} me "
+                f"JOIN {table} newer "
+                f"ON newer.bank_id = me.bank_id AND newer.serialization_key = me.serialization_key "
+                f"AND newer.operation_type = me.operation_type "
+                f"WHERE me.operation_id = $1 AND newer.status = 'completed' "
+                f"AND (newer.created_at > me.created_at "
+                f"OR (newer.created_at = me.created_at AND newer.operation_id > me.operation_id)) "
+                f"LIMIT 1",
+                uuid.UUID(operation_id),
+            )
+            if newer is None:
+                return None
+            await conn.execute(
+                f"UPDATE {table} SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb "
+                f"WHERE operation_id = $1",
+                uuid.UUID(operation_id),
+                json.dumps({"superseded_by": str(newer)}),
+            )
+        return str(newer)
 
     async def _mark_operation_superseded(self, operation_id: str, superseded_by: str, error_message: str) -> None:
         """Close an op whose work another pending op will do, without calling it a failure.

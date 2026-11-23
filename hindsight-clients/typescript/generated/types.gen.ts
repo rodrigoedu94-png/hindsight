@@ -721,6 +721,12 @@ export type BankTemplateConfig = {
    */
   mcp_enabled_tools?: Array<string> | null;
   /**
+   * Mcp Server Instructions
+   *
+   * Instructions sent to MCP clients in the initialize response when they connect to this bank
+   */
+  mcp_server_instructions?: string | null;
+  /**
    * Knowledge Banks
    *
    * Knowledge banks whose passages this bank's reflect reads
@@ -901,7 +907,7 @@ export type BankTemplateConfig = {
   /**
    * Default Timezone
    *
-   * IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, is read in when it carries no UTC offset.
+   * IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, is read in when it carries no UTC offset, and the zone the LLM reads memory times in.
    */
   default_timezone?: string | null;
   /**

@@ -485,7 +485,7 @@
     "auditEnabledDescription": "Registrar las operaciones de retain, recall y reflect de este banco. Anula el valor predeterminado del servidor solo para este banco.",
     "auditServerDefault": "Valor predeterminado del servidor ({state})",
     "defaultTimezoneLabel": "Zona horaria predeterminada",
-    "defaultTimezoneDescription": "Zona usada para una marca de tiempo de retain, o una hora del contenido, sin desfase UTC. Nombre IANA como Europe/Rome.",
+    "defaultTimezoneDescription": "Zona usada para una marca de tiempo de retain, o una hora del contenido, sin desfase UTC, y la zona en la que el LLM lee las horas de los recuerdos. Nombre IANA como Europe/Rome.",
     "docStorageEnabledLabel": "Almacenar texto del documento",
     "docStorageEnabledDescription": "Conservar el texto original (documentos originales y fragmentos). Desactívelo para conservar únicamente los hechos derivados. Invalida el valor predeterminado del servidor solo para este banco.",
     "docStorageServerDefault": "Valor predeterminado del servidor ({state})",
@@ -494,6 +494,9 @@
     "securityPrivacyFailedToSave": "Error al guardar la configuración de seguridad y privacidad",
     "restrictToolsLabel": "Restringir herramientas",
     "restrictToolsDescription": "Cuando está desactivado, todas las herramientas están disponibles. Cuando está activado, solo las herramientas seleccionadas pueden invocarse para este banco.",
+    "mcpServerInstructionsLabel": "Instrucciones del servidor MCP",
+    "mcpServerInstructionsDescription": "Se envían a las herramientas de IA cuando se conectan a la URL MCP de este banco, para que sepan cómo usarlo: por ejemplo, qué documento leer primero o con qué etiquetas guardar los hechos nuevos. Hasta 4000 caracteres.",
+    "mcpServerInstructionsPlaceholder": "Lee primero el documento 'house-rules'. Guarda los hechos nuevos con la etiqueta 'inbox'.",
     "modelsTitle": "Modelos",
     "modelsDescription": "Configuración de modelos específica del proveedor",
     "geminiFailedToSave": "Error al guardar la configuración de Gemini",
@@ -662,6 +665,7 @@
     "promptBlock": {
       "instructions": "Instrucciones",
       "field": {
+        "default_timezone": "Zona horaria",
         "entities_allow_free_form": "Entidades de forma libre",
         "entity_labels": "Etiquetas de entidad",
         "llm_output_language": "Regla de idioma",

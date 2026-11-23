@@ -10550,6 +10550,18 @@
             "title": "Mcp Enabled Tools",
             "description": "MCP tool allowlist for this bank (None = all tools)"
           },
+          "mcp_server_instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Server Instructions",
+            "description": "Instructions sent to MCP clients in the initialize response when they connect to this bank"
+          },
           "knowledge_banks": {
             "anyOf": [
               {
@@ -10925,7 +10937,7 @@
               }
             ],
             "title": "Default Timezone",
-            "description": "IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, is read in when it carries no UTC offset."
+            "description": "IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, is read in when it carries no UTC offset, and the zone the LLM reads memory times in."
           },
           "enable_auto_consolidation": {
             "anyOf": [

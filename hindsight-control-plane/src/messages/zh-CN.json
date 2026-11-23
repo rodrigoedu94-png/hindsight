@@ -485,7 +485,7 @@
     "auditEnabledDescription": "记录该记忆库的 retain、recall 和 reflect 操作。仅对该记忆库覆盖服务器默认值。",
     "auditServerDefault": "服务器默认值（{state}）",
     "defaultTimezoneLabel": "默认时区",
-    "defaultTimezoneDescription": "没有 UTC 偏移的 retain 时间戳或内容中的时间按此时区解读。IANA 名称，如 Europe/Rome。",
+    "defaultTimezoneDescription": "没有 UTC 偏移的 retain 时间戳或内容中的时间按此时区解读，LLM 读取记忆时间时也使用此时区。IANA 名称，如 Europe/Rome。",
     "docStorageEnabledLabel": "存储文档原文",
     "docStorageEnabledDescription": "持久化原始文本（文档原文及分块）。关闭则仅保留派生的事实。仅覆盖当前记忆库的服务器默认值。",
     "docStorageServerDefault": "服务器默认值（{state}）",
@@ -494,6 +494,9 @@
     "securityPrivacyFailedToSave": "保存安全与隐私设置失败",
     "restrictToolsLabel": "限制工具",
     "restrictToolsDescription": "关闭时，所有工具均可用。开启时，此库只能调用所选工具。",
+    "mcpServerInstructionsLabel": "MCP 服务器指令",
+    "mcpServerInstructionsDescription": "当 AI 工具连接到此库的 MCP URL 时发送给它们，让它们知道如何使用此库：例如先读取哪个文档，或用哪些标签保存新事实。最多 4,000 个字符。",
+    "mcpServerInstructionsPlaceholder": "请先阅读文档“house-rules”。保存新事实时使用标签“inbox”。",
     "modelsTitle": "模型",
     "modelsDescription": "特定提供商的模型设置",
     "geminiFailedToSave": "无法保存 Gemini 设置",
@@ -662,6 +665,7 @@
     "promptBlock": {
       "instructions": "说明",
       "field": {
+        "default_timezone": "时区",
         "entities_allow_free_form": "自由形式实体",
         "entity_labels": "实体标签",
         "llm_output_language": "语言规则",

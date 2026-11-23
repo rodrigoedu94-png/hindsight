@@ -485,7 +485,7 @@
     "auditEnabledDescription": "Record retain, recall and reflect operations for this bank. Overrides the server default for this bank only.",
     "auditServerDefault": "Server Default ({state})",
     "defaultTimezoneLabel": "Default Timezone",
-    "defaultTimezoneDescription": "Zone used for a retain timestamp, or a clock time found in the content, that has no UTC offset. IANA name such as Europe/Rome.",
+    "defaultTimezoneDescription": "Zone used for a retain timestamp, or a clock time found in the content, that has no UTC offset, and the zone the LLM reads memory times in. IANA name such as Europe/Rome.",
     "docStorageEnabledLabel": "Store Document Text",
     "docStorageEnabledDescription": "Persist the raw source text (document originals and chunks). Disable to keep only derived facts. Overrides the server default for this bank only.",
     "docStorageServerDefault": "Server Default ({state})",
@@ -494,6 +494,9 @@
     "securityPrivacyFailedToSave": "Failed to save security & privacy settings",
     "restrictToolsLabel": "Restrict tools",
     "restrictToolsDescription": "When off, all tools are available. When on, only the selected tools can be invoked for this bank.",
+    "mcpServerInstructionsLabel": "MCP server instructions",
+    "mcpServerInstructionsDescription": "Sent to AI tools when they connect to this bank's MCP URL, so they know how to use the bank: for example, which document to read first or which tags to save new facts with. Up to 4,000 characters.",
+    "mcpServerInstructionsPlaceholder": "Read the document 'house-rules' before anything else. Save new facts with the tag 'inbox'.",
     "modelsTitle": "Models",
     "modelsDescription": "Provider-specific model settings",
     "geminiFailedToSave": "Failed to save Gemini settings",
@@ -662,6 +665,7 @@
     "promptBlock": {
       "instructions": "Instructions",
       "field": {
+        "default_timezone": "Timezone",
         "entities_allow_free_form": "Free-form entities",
         "entity_labels": "Entity labels",
         "llm_output_language": "Language rule",

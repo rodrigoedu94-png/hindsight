@@ -485,7 +485,7 @@
     "auditEnabledDescription": "Enregistrer les opérations retain, recall et reflect de cette banque. Remplace la valeur par défaut du serveur pour cette banque uniquement.",
     "auditServerDefault": "Valeur par défaut du serveur ({state})",
     "defaultTimezoneLabel": "Fuseau horaire par défaut",
-    "defaultTimezoneDescription": "Fuseau utilisé pour un horodatage de retain, ou une heure du contenu, sans décalage UTC. Nom IANA comme Europe/Rome.",
+    "defaultTimezoneDescription": "Fuseau utilisé pour un horodatage de retain, ou une heure du contenu, sans décalage UTC, et le fuseau dans lequel le LLM lit les heures des souvenirs. Nom IANA comme Europe/Rome.",
     "docStorageEnabledLabel": "Stocker le texte des documents",
     "docStorageEnabledDescription": "Conserver le texte source brut (documents originaux et fragments). Désactivez pour ne conserver que les faits dérivés. Remplace la valeur par défaut du serveur pour cette banque uniquement.",
     "docStorageServerDefault": "Valeur par défaut du serveur ({state})",
@@ -494,6 +494,9 @@
     "securityPrivacyFailedToSave": "Échec de l'enregistrement des paramètres de sécurité et confidentialité",
     "restrictToolsLabel": "Restreindre les outils",
     "restrictToolsDescription": "Lorsque désactivé, tous les outils sont disponibles. Lorsqu'activé, seuls les outils sélectionnés peuvent être invoqués pour cette banque.",
+    "mcpServerInstructionsLabel": "Instructions du serveur MCP",
+    "mcpServerInstructionsDescription": "Envoyées aux outils d'IA lorsqu'ils se connectent à l'URL MCP de cette banque, pour qu'ils sachent comment l'utiliser : par exemple, quel document lire en premier ou avec quels tags enregistrer les nouveaux faits. Jusqu'à 4 000 caractères.",
+    "mcpServerInstructionsPlaceholder": "Lis d'abord le document 'house-rules'. Enregistre les nouveaux faits avec le tag 'inbox'.",
     "modelsTitle": "Modèles",
     "modelsDescription": "Paramètres de modèles spécifiques au fournisseur",
     "geminiFailedToSave": "Échec de l'enregistrement des paramètres Gemini",
@@ -662,6 +665,7 @@
     "promptBlock": {
       "instructions": "Instructions",
       "field": {
+        "default_timezone": "Fuseau horaire",
         "entities_allow_free_form": "Entités libres",
         "entity_labels": "Étiquettes d'entité",
         "llm_output_language": "Règle de langue",

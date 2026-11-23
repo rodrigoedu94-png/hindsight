@@ -846,6 +846,7 @@ ENV_MCP_ENABLED = "HINDSIGHT_API_MCP_ENABLED"
 ENV_MCP_ENABLED_TOOLS = "HINDSIGHT_API_MCP_ENABLED_TOOLS"
 ENV_MCP_STATELESS = "HINDSIGHT_API_MCP_STATELESS"
 ENV_MCP_INSTRUCTIONS = "HINDSIGHT_API_MCP_INSTRUCTIONS"
+ENV_MCP_SERVER_INSTRUCTIONS = "HINDSIGHT_API_MCP_SERVER_INSTRUCTIONS"
 ENV_MCP_AUTH_TOKEN = "HINDSIGHT_API_MCP_AUTH_TOKEN"
 ENV_ENABLE_BANK_CONFIG_API = "HINDSIGHT_API_ENABLE_BANK_CONFIG_API"
 ENV_ENABLE_BANK_LLM_HEALTH = "HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH"
@@ -1285,6 +1286,7 @@ ENV_RECALL_STRATEGY_BOOSTS = "HINDSIGHT_API_RECALL_STRATEGY_BOOSTS"
 ENV_RECENCY_DECAY_FUNCTION = "HINDSIGHT_API_RECENCY_DECAY_FUNCTION"
 ENV_RECENCY_DECAY_LINEAR_WINDOW_DAYS = "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS"
 ENV_RECENCY_DECAY_HALFLIFE_DAYS = "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS"
+ENV_RECENCY_ALPHA = "HINDSIGHT_API_RECENCY_ALPHA"
 
 # Audit log settings
 # AUDIT_LOG_ENABLED is the deployment-wide default and is overridable per bank
@@ -1348,6 +1350,7 @@ PROVIDER_DEFAULT_MODELS = {
     "chatgpt": "gpt-6-luna",
     "claude-code": "claude-sonnet-5-5",
     "cursor": "auto",
+    "antigravity": "gemini-3.8-flash-low",
     "github-copilot": "gpt-5.6-terra",
     "mock": "mock-model",
     "none": "none",
@@ -1586,6 +1589,8 @@ DEFAULT_RECENCY_DECAY_FUNCTION = "linear"
 DEFAULT_RECENCY_DECAY_LINEAR_WINDOW_DAYS = 365.0
 # Exponential: age (days) at which the recency signal is neutral (0.5).
 DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS = 90.0
+# How much recency can move a recall score: at most ±(alpha/2). 0.2 → ±10%.
+DEFAULT_RECENCY_ALPHA = 0.2
 # Retrieval arms that can be boosted; mirrors fusion.py source_names.
 RECALL_STRATEGY_NAMES = ("semantic", "bm25", "graph", "temporal")
 # User-facing priority levels. Kept in sync with recall_boost.BOOST_LEVELS by a
@@ -1928,6 +1933,12 @@ DEFAULT_MCP_ENABLED = True
 DEFAULT_MCP_ENABLED_TOOLS: list[str] | None = None  # None = all tools enabled
 DEFAULT_MCP_STATELESS = False  # False = stateful (supports SSE/GET); True = stateless (POST-only)
 DEFAULT_MCP_INSTRUCTIONS = None
+# Text sent to MCP clients as the server instructions of the initialize response, so a
+# connecting agent learns how to use the bank without a hand-pasted prompt. Per bank.
+DEFAULT_MCP_SERVER_INSTRUCTIONS = None
+# Upper bound on mcp_server_instructions. Clients place the text in the model's context on
+# every connection, so it is kept to a size a system prompt can carry.
+MCP_SERVER_INSTRUCTIONS_MAX_CHARS = 4000
 DEFAULT_ENABLE_BANK_CONFIG_API = True
 # Dry-run extraction is a preview tool that makes a real LLM call but stores nothing. Enabled by
 # default; set HINDSIGHT_API_ENABLE_DRY_RUN_EXTRACT=false to remove the endpoint (e.g. to cap
@@ -3689,6 +3700,11 @@ class HindsightConfig:
     llm_strict_schema_retain: bool
     llm_strict_schema_reflect: bool
     llm_strict_schema_consolidation: bool
+    # Reflect's tool turns (every loop turn and the closing ``done``). Held to the schema
+    # unless HINDSIGHT_API_LLM_STRICT_SCHEMA_REFLECT says false: they always were, and small
+    # models need it to follow a forced turn, so the global default (false) does not reach
+    # them. A model that runs away under the grammar is taken off it with that flag (#6673).
+    llm_strict_schema_reflect_tool_turns: bool = field(default=True, kw_only=True)
     llm_supports_string_pattern: bool = field(
         default=DEFAULT_LLM_SUPPORTS_STRING_PATTERN,
         kw_only=True,
@@ -3937,6 +3953,7 @@ class HindsightConfig:
     recency_decay_function: str
     recency_decay_linear_window_days: float
     recency_decay_halflife_days: float
+    recency_alpha: float
     reranker_cohere_api_key: str | None
     reranker_cohere_model: str
     reranker_cohere_base_url: str | None
@@ -4095,7 +4112,7 @@ class HindsightConfig:
     enable_file_upload_api: bool
     file_delete_after_retain: bool
     store_document_text: bool  # When False, store NULL original_text / empty chunk_text
-    default_timezone: str  # IANA zone for retain times that carry no UTC offset
+    default_timezone: str  # IANA zone for retain times with no UTC offset, and for times shown to the LLM
     enable_document_export_api: bool
     enable_document_import_api: bool
     enable_kb: bool
@@ -4483,6 +4500,8 @@ class HindsightConfig:
     reflect_kb_search_images: bool = DEFAULT_REFLECT_KB_SEARCH_IMAGES
     reflect_kb_search_max_images: int = DEFAULT_REFLECT_KB_SEARCH_MAX_IMAGES
     reflect_kb_search_budget: str = DEFAULT_REFLECT_KB_SEARCH_BUDGET
+    # Per bank: the instructions an MCP client receives in the initialize response (None = none)
+    mcp_server_instructions: str | None = DEFAULT_MCP_SERVER_INSTRUCTIONS
 
     # Class-level sets for configuration categorization
 
@@ -4576,6 +4595,8 @@ class HindsightConfig:
     _CONFIGURABLE_FIELDS = {
         # MCP tool access control
         "mcp_enabled_tools",
+        # Instructions sent to MCP clients when they connect to the bank
+        "mcp_server_instructions",
         # Audit logging on/off, per bank. The actions allowlist and retention
         # window remain server-level and are deliberately not configurable.
         "audit_log_enabled",
@@ -4841,6 +4862,8 @@ class HindsightConfig:
                 f"Invalid entity_trgm_similarity_threshold: {self.entity_trgm_similarity_threshold}. "
                 "Must be greater than 0 and at most 1."
             )
+        if not (0.0 <= self.recency_alpha <= 1.0):
+            raise ValueError(f"Invalid recency_alpha: {self.recency_alpha}. Must be between 0 and 1.")
         if not (0.0 < self.entity_intrabatch_merge_similarity <= 1.0):
             raise ValueError(
                 f"Invalid entity_intrabatch_merge_similarity: {self.entity_intrabatch_merge_similarity}. "
@@ -5157,6 +5180,8 @@ class HindsightConfig:
             llm_strict_schema_retain=_resolve_operation_strict_schema(ENV_LLM_STRICT_SCHEMA_RETAIN),
             llm_strict_schema_reflect=_resolve_operation_strict_schema(ENV_LLM_STRICT_SCHEMA_REFLECT),
             llm_strict_schema_consolidation=_resolve_operation_strict_schema(ENV_LLM_STRICT_SCHEMA_CONSOLIDATION),
+            llm_strict_schema_reflect_tool_turns=os.getenv(ENV_LLM_STRICT_SCHEMA_REFLECT, "true").strip().lower()
+            in ("true", "1"),
             llm_supports_string_pattern=_parse_boolean_env(
                 ENV_LLM_SUPPORTS_STRING_PATTERN,
                 DEFAULT_LLM_SUPPORTS_STRING_PATTERN,
@@ -5646,6 +5671,7 @@ class HindsightConfig:
             recency_decay_halflife_days=float(
                 os.getenv(ENV_RECENCY_DECAY_HALFLIFE_DAYS, str(DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS))
             ),
+            recency_alpha=float(os.getenv(ENV_RECENCY_ALPHA, str(DEFAULT_RECENCY_ALPHA))),
             # Cohere reranker (with backward-compatible fallback to shared API key)
             reranker_cohere_api_key=os.getenv(ENV_RERANKER_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
             reranker_cohere_model=os.getenv(ENV_RERANKER_COHERE_MODEL, DEFAULT_RERANKER_COHERE_MODEL),
@@ -6045,6 +6071,7 @@ class HindsightConfig:
             ).lower()
             == "true",
             reflect_kb_search_budget=_parse_reflect_kb_search_budget(os.getenv(ENV_REFLECT_KB_SEARCH_BUDGET)),
+            mcp_server_instructions=os.getenv(ENV_MCP_SERVER_INSTRUCTIONS) or DEFAULT_MCP_SERVER_INSTRUCTIONS,
             reflect_kb_search_max_images=int(
                 os.getenv(ENV_REFLECT_KB_SEARCH_MAX_IMAGES, str(DEFAULT_REFLECT_KB_SEARCH_MAX_IMAGES))
             ),
