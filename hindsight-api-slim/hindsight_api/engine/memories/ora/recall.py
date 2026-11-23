@@ -157,7 +157,18 @@ async def retrieve_semantic_bm25_combined_sql(
     table = fq_table("memory_units")
     dialect = create_sql_dialect(getattr(conn, "backend_type", "oracle"))
 
-    _include_bm25 = bool(tokens)
+    bm25_text_param = ""
+    if tokens:
+        bm25_text_param = await build_bm25_query_text(
+            conn,
+            dialect,
+            tokens=tokens,
+            query_text=query_text,
+            table="memory_units",
+            language=config.text_search_extension_native_language,
+            config=config,
+        )
+    _include_bm25 = bool(bm25_text_param)
     filters = _build_filter_clauses(
         tags=tags,
         tags_match=tags_match,
@@ -179,15 +190,6 @@ async def retrieve_semantic_bm25_combined_sql(
 
     if _include_bm25:
         text_ext = config.text_search_extension
-        bm25_text_param: str = await build_bm25_query_text(
-            conn,
-            dialect,
-            tokens=tokens,
-            query_text=query_text,
-            table="memory_units",
-            language=config.text_search_extension_native_language,
-            config=config,
-        )
         for i, ft in enumerate(fact_types):
             arms.append(
                 dialect.build_bm25_arm(

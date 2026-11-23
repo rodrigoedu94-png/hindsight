@@ -791,18 +791,40 @@ class OracleKnowledgeStore(KnowledgeStore):
                         or 0.0
                     )
                     df_map: dict[str, float] = {}
-                    for term in raw_terms:
-                        escaped = _escape_oracle_text_term(term)
+                    batched_df_ok = False
+                    if len(raw_terms) > 1 and hasattr(conn, "fetchrow"):
+                        escaped_terms = [_escape_oracle_text_term(t) for t in raw_terms]
+                        select_exprs = ", ".join(
+                            f"SUM(CASE WHEN CONTAINS(text, ${i + 2}, {i + 1}) > 0 THEN 1 ELSE 0 END) AS df_{i}"
+                            for i in range(len(escaped_terms))
+                        )
                         try:
-                            df = await conn.fetchval(
-                                f"SELECT COUNT(*) FROM {passages_table} WHERE bank_id = $1 AND CONTAINS(text, $2) > 0",
+                            df_row = await conn.fetchrow(
+                                f"SELECT {select_exprs} FROM {passages_table} WHERE bank_id = $1",
                                 _lit(bank_id),
-                                escaped,
+                                *escaped_terms,
                             )
-                            if df and float(df) > 0:
-                                df_map[term] = float(df)
+                            if df_row is not None:
+                                for i, term in enumerate(raw_terms):
+                                    val = df_row[f"df_{i}"]
+                                    if val and float(val) > 0:
+                                        df_map[term] = float(val)
+                                batched_df_ok = True
                         except Exception:
-                            logger.debug("Oracle Text term df probe skipped for %r", term, exc_info=True)
+                            logger.debug("Batched Oracle Text df probe failed; falling back to per-term probes", exc_info=True)
+                    if not batched_df_ok:
+                        for term in raw_terms:
+                            escaped = _escape_oracle_text_term(term)
+                            try:
+                                df = await conn.fetchval(
+                                    f"SELECT COUNT(*) FROM {passages_table} WHERE bank_id = $1 AND CONTAINS(text, $2) > 0",
+                                    _lit(bank_id),
+                                    escaped,
+                                )
+                                if df and float(df) > 0:
+                                    df_map[term] = float(df)
+                            except Exception:
+                                logger.debug("Oracle Text term df probe skipped for %r", term, exc_info=True)
                     if df_map:
                         raw_idf = {
                             t: math.log(1.0 + max(total_n - df, 0.0) / (df + 0.5) + 0.5 / (df + 0.5))
@@ -811,7 +833,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                         max_idf = max(raw_idf.values())
                         terms_idf = {t: val for t, val in raw_idf.items() if val >= KEYWORD_IDF_SHARE * max_idf}
                     if terms_idf:
-                        or_expr = " OR ".join(_escape_oracle_text_term(t) for t in terms_idf)
+                        or_expr = " ACCUM ".join(_escape_oracle_text_term(t) for t in terms_idf)
                         kw_params = [*filter_params, or_expr]
                         kw_pos = len(kw_params)
                         try:

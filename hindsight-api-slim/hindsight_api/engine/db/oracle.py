@@ -367,25 +367,42 @@ _UPSERT_RE = re.compile(
 
 
 def _split_respecting_parens(s: str) -> list[str]:
-    """Split a comma-separated string while respecting parenthesised groups.
+    """Split a comma-separated string while respecting parenthesised groups and string literals.
 
     e.g. "$1, COALESCE($2, NOW()), $3" → ["$1", "COALESCE($2, NOW())", "$3"]
     """
     parts: list[str] = []
     depth = 0
+    in_quote = False
     current: list[str] = []
-    for ch in s:
-        if ch == "(":
-            depth += 1
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_quote:
             current.append(ch)
-        elif ch == ")":
-            depth -= 1
-            current.append(ch)
-        elif ch == "," and depth == 0:
-            parts.append("".join(current).strip())
-            current = []
+            if ch == "'":
+                if i + 1 < n and s[i + 1] == "'":
+                    current.append(s[i + 1])
+                    i += 2
+                    continue
+                in_quote = False
         else:
-            current.append(ch)
+            if ch == "'":
+                in_quote = True
+                current.append(ch)
+            elif ch == "(":
+                depth += 1
+                current.append(ch)
+            elif ch == ")":
+                depth -= 1
+                current.append(ch)
+            elif ch == "," and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        i += 1
     if current:
         parts.append("".join(current).strip())
     return parts
@@ -396,20 +413,35 @@ def _top_level_paren_contents(s: str) -> list[str]:
 
     e.g. "(:1, :2), (:3, :4)" → [":1, :2", ":3, :4"] — the row groups of a
     multi-row VALUES list, which naive splitting mispairs against the columns.
+    Ignores parentheses inside single-quoted SQL string literals.
     """
     groups: list[str] = []
     depth = 0
     start = -1
-    for i, ch in enumerate(s):
-        if ch == "(":
-            if depth == 0:
-                start = i + 1
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0 and start >= 0:
-                groups.append(s[start:i])
-                start = -1
+    in_quote = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_quote:
+            if ch == "'":
+                if i + 1 < n and s[i + 1] == "'":
+                    i += 2
+                    continue
+                in_quote = False
+        else:
+            if ch == "'":
+                in_quote = True
+            elif ch == "(":
+                if depth == 0:
+                    start = i + 1
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    groups.append(s[start:i])
+                    start = -1
+        i += 1
     return groups
 
 
@@ -946,8 +978,10 @@ class OracleConnection(DatabaseConnection):
             for group in _top_level_paren_contents(insert.group(2)):
                 values = _split_respecting_parens(group)
                 for column, value in zip(columns, values, strict=False):
-                    if column == "embedding" and value.startswith(":"):
-                        keys.add(value[1:])
+                    if column == "embedding":
+                        m_val = re.fullmatch(r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?", value.strip(), re.IGNORECASE)
+                        if m_val:
+                            keys.add(m_val.group(1))
         return keys
 
     @staticmethod

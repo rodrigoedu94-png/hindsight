@@ -6765,7 +6765,8 @@ class MemoryEngine(MemoryEngineInterface):
                     for tenant in tenants:
                         if tenant.schema:
                             schema = self._backend.normalize_schema(tenant.schema)
-                            self._backend.run_migrations(self.db_url, schema=schema)
+                            effective_schema = schema or self._backend.normalize_schema(config.database_schema)
+                            self._backend.run_migrations(self.db_url, schema=effective_schema)
                             # The Oracle baseline declares VECTOR(384); reconcile it with the model
                             # like the PG path does. It alters tables, so it runs as the migration
                             # user when one is configured. Its DDL (index rebuilds included) can take
@@ -6775,7 +6776,7 @@ class MemoryEngine(MemoryEngineInterface):
                                 ensure_embedding_dimension,
                                 config.migration_database_url or self.db_url,
                                 self.embeddings.dimension,
-                                schema=schema,
+                                schema=effective_schema,
                                 store_owned_memories=get_memories().store_owned,
                             )
                 logger.info("Schema migrations completed")

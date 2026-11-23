@@ -82,8 +82,9 @@ _GRANT_PROPERTY_GRAPH_PLSQL = """
 BEGIN
   FOR r IN (
     SELECT DISTINCT grantee
-    FROM user_tab_privs_made
-    WHERE table_name = 'MEMORY_UNITS'
+    FROM all_tab_privs
+    WHERE table_schema = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+      AND table_name = 'MEMORY_UNITS'
       AND privilege = 'SELECT'
       AND grantee NOT IN ('PUBLIC')
   ) LOOP

@@ -1133,9 +1133,14 @@ def _ensure_oracle_table_embedding_dimension(cursor: Any, table_name: str, requi
     # catalog instead; tuning parameters beyond distance/accuracy reset to defaults, which is
     # harmless on the empty table this runs on.
     cursor.execute(
-        "SELECT index_name, index_subtype, partitioned FROM all_indexes "
-        "WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND table_name = :table_name "
-        "AND index_type = 'VECTOR'",
+        "SELECT i.index_name, i.index_subtype, i.partitioned FROM all_indexes i "
+        "WHERE i.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND i.table_name = :table_name "
+        "AND i.index_type = 'VECTOR' "
+        "AND EXISTS ("
+        "SELECT 1 FROM all_ind_columns ic "
+        "WHERE ic.index_owner = i.owner AND ic.index_name = i.index_name "
+        "AND ic.table_name = i.table_name AND ic.column_name = 'EMBEDDING'"
+        ")",
         {"table_name": table_name},
     )
     index_names: list[str] = []
