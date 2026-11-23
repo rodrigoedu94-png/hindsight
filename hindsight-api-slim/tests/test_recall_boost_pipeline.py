@@ -1,8 +1,8 @@
 """Exercise stage-2 scoring through recall_async without a database or model server."""
 
 import asyncio
-from datetime import UTC, datetime
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal
 from unittest.mock import AsyncMock
 
