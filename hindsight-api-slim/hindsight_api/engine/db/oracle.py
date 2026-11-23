@@ -196,16 +196,23 @@ _ORACLE_IN_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, _ORACLE_IN_LIMIT)
 _UUID_STR_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 
 
+class OracleLiteralStr(str):
+    """String value bound as VARCHAR2/CLOB without UUID-to-RAW(16) conversion."""
+
+
 def _convert_arg(value: Any) -> Any:
     """Convert a single Python value to an Oracle-compatible bind value.
 
     Handles:
+    - OracleLiteralStr → str (preserved verbatim, even if UUID-formatted)
     - uuid.UUID → bytes (RAW(16))
     - UUID-formatted strings (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) → bytes
     - dict → JSON string
     - list of UUIDs → list of bytes
     - list → JSON string
     """
+    if isinstance(value, OracleLiteralStr):
+        return str(value)
     if isinstance(value, _uuid_mod.UUID):
         return value.bytes
     if isinstance(value, str) and _UUID_STR_RE.match(value):

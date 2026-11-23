@@ -37,6 +37,7 @@ from ..config import DEFAULT_KB_RERANKER_LOW_TOKENS, get_config
 from ..engine import bank_aliases
 from ..engine.aiohttp_session import UpstreamHTTPError
 from ..engine.cross_encoder import CohereCompatibleRerankClient, reranker_retry_policy
+from ..engine.db.oracle import OracleLiteralStr
 from ..engine.db_utils import acquire_with_retry
 from ..engine.decision_model import JEV_IMAGE_SIDE, jev_accepts
 from ..engine.operation_metadata import KnowledgeIngestChildMetadata, KnowledgeIngestParentMetadata
@@ -688,7 +689,14 @@ class KnowledgeService:
     @property
     def store(self) -> KnowledgeStore:
         if self._store is None:
-            self._store = load_knowledge_store(self._engine._get_backend, get_config().kb_store_extension)
+            backend_type = getattr(getattr(self._engine, "_db_backend", None), "backend_type", None)
+            if not backend_type:
+                backend_type = get_config().database_backend
+            self._store = load_knowledge_store(
+                self._engine._get_backend,
+                get_config().kb_store_extension,
+                backend_type=backend_type,
+            )
         return self._store
 
     async def _ready(self, request_context: RequestContext | None) -> None:
@@ -703,7 +711,10 @@ class KnowledgeService:
 
     async def _kind_of(self, bank_id: str) -> str | None:
         async with acquire_with_retry(await self._engine._get_backend()) as conn:
-            return await conn.fetchval(f"SELECT kind FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
+            return await conn.fetchval(
+                f"SELECT kind FROM {fq_table('banks')} WHERE bank_id = $1",
+                OracleLiteralStr(bank_id),
+            )
 
     async def _require_bank(self, bank_id: str) -> None:
         kind = await self._kind_of(bank_id)
@@ -771,18 +782,40 @@ class KnowledgeService:
                 # A bank must not be born under a name that is already an alias: resolution prefers a real
                 # bank, so the alias would silently start pointing here (see bank_utils' create path).
                 await bank_aliases.refuse_alias_as_bank_id_on_conn(conn, bank_id)
-                await conn.execute(
-                    f"""
-                    INSERT INTO {fq_table("banks")} (bank_id, name, disposition, mission, internal_id, kind)
-                    VALUES ($1, $2, $3::jsonb, '', $4, $5)
-                    ON CONFLICT (bank_id) DO NOTHING
-                    """,
-                    bank_id,
-                    bank_id,
-                    json.dumps(bank_utils.DEFAULT_DISPOSITION),
-                    uuid.uuid4(),
-                    KIND,
-                )
+                if getattr(conn, "backend_type", None) == "oracle":
+                    try:
+                        await conn.execute(
+                            f"""
+                            MERGE INTO {fq_table("banks")} target
+                            USING (SELECT $1 AS bank_id, $2 AS name, $3 AS disposition, NULL AS mission,
+                                          $4 AS internal_id, $5 AS kind FROM DUAL) src
+                            ON (target.bank_id = src.bank_id)
+                            WHEN NOT MATCHED THEN
+                                INSERT (bank_id, name, disposition, mission, internal_id, kind)
+                                VALUES (src.bank_id, src.name, src.disposition, src.mission, src.internal_id, src.kind)
+                            """,
+                            OracleLiteralStr(bank_id),
+                            OracleLiteralStr(bank_id),
+                            json.dumps(bank_utils.DEFAULT_DISPOSITION),
+                            uuid.uuid4(),
+                            KIND,
+                        )
+                    except Exception as exc:
+                        if "ORA-00001" not in str(exc):
+                            raise
+                else:
+                    await conn.execute(
+                        f"""
+                        INSERT INTO {fq_table("banks")} (bank_id, name, disposition, mission, internal_id, kind)
+                        VALUES ($1, $2, $3::jsonb, '', $4, $5)
+                        ON CONFLICT (bank_id) DO NOTHING
+                        """,
+                        bank_id,
+                        bank_id,
+                        json.dumps(bank_utils.DEFAULT_DISPOSITION),
+                        uuid.uuid4(),
+                        KIND,
+                    )
         # Outside the insert, on every create: a bank whose index build failed gets it on a retry.
         await self.store.bank_created(bank_id)
         return await self.get_bank(bank_id, request_context)
@@ -801,47 +834,101 @@ class KnowledgeService:
         allowed = await bank_aliases.resolve_many(backend, scope.bank_ids) if scope and scope.bank_ids else None
         if scope is not None and scope.bank_ids is not None and not allowed:
             return KnowledgeBankPage(banks=[], total=0)
-        where = (
-            "WHERE kind = $1 AND ($2::text IS NULL OR strpos(lower(bank_id), lower($2)) > 0) "
-            "AND ($3::text[] IS NULL OR bank_id = ANY($3))"
-        )
-        async with acquire_with_retry(backend) as conn:
-            if scope is None:
-                # The validator may drop any bank, so it sees every match and the page is cut after.
-                rows = await conn.fetch(
-                    f"SELECT bank_id, created_at FROM {fq_table('banks')} {where} ORDER BY created_at DESC, bank_id",
-                    KIND,
-                    q or None,
-                    None,
-                )
-                assert validator is not None
-                kept = await validator.filter_knowledge_bank_list(
-                    KnowledgeBankListContext(
-                        banks=[{"bank_id": r["bank_id"], "created_at": r["created_at"]} for r in rows],
-                        request_context=request_context,
+        is_oracle = getattr(backend, "backend_type", None) == "oracle"
+        if is_oracle:
+            where_parts = ["kind = $1"]
+            params: list[Any] = [KIND]
+            if q:
+                params.append(OracleLiteralStr(q))
+                where_parts.append(f"INSTR(LOWER(bank_id), LOWER(${len(params)})) > 0")
+            if allowed is not None:
+                chunks = [allowed[i : i + 900] for i in range(0, len(allowed), 900)]
+                or_groups = []
+                for chunk in chunks:
+                    phs = []
+                    for item in chunk:
+                        params.append(OracleLiteralStr(item))
+                        phs.append(f"${len(params)}")
+                    or_groups.append(f"bank_id IN ({', '.join(phs)})")
+                where_parts.append("(" + " OR ".join(or_groups) + ")")
+            where_oracle = "WHERE " + " AND ".join(where_parts)
+            async with acquire_with_retry(backend) as conn:
+                if scope is None:
+                    rows = await conn.fetch(
+                        f"SELECT bank_id, created_at FROM {fq_table('banks')} {where_oracle} "
+                        "ORDER BY created_at DESC, bank_id",
+                        *params,
                     )
-                )
-                page_rows = [(b["bank_id"], b["created_at"]) for b in kept.banks[offset : offset + limit]]
-                total = len(kept.banks)
-            else:
-                rows = await conn.fetch(
-                    f"SELECT bank_id, created_at, count(*) OVER () AS total FROM {fq_table('banks')} {where} "
-                    "ORDER BY created_at DESC, bank_id LIMIT $4 OFFSET $5",
-                    KIND,
-                    q or None,
-                    allowed,
-                    limit,
-                    offset,
-                )
-                page_rows = [(r["bank_id"], r["created_at"]) for r in rows]
-                # An offset past the end returns no rows, and with them no window total.
-                total = (
-                    int(rows[0]["total"])
-                    if rows
-                    else await conn.fetchval(
-                        f"SELECT count(*) FROM {fq_table('banks')} {where}", KIND, q or None, allowed
+                    assert validator is not None
+                    kept = await validator.filter_knowledge_bank_list(
+                        KnowledgeBankListContext(
+                            banks=[{"bank_id": r["bank_id"], "created_at": r["created_at"]} for r in rows],
+                            request_context=request_context,
+                        )
                     )
-                )
+                    page_rows = [(b["bank_id"], b["created_at"]) for b in kept.banks[offset : offset + limit]]
+                    total = len(kept.banks)
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT bank_id, created_at, COUNT(*) OVER () AS total "
+                        f"FROM {fq_table('banks')} {where_oracle} "
+                        f"ORDER BY created_at DESC, bank_id "
+                        f"OFFSET ${len(params) + 1} ROWS FETCH NEXT ${len(params) + 2} ROWS ONLY",
+                        *params,
+                        offset,
+                        limit,
+                    )
+                    page_rows = [(r["bank_id"], r["created_at"]) for r in rows]
+                    total = (
+                        int(rows[0]["total"])
+                        if rows
+                        else int(
+                            await conn.fetchval(f"SELECT COUNT(*) FROM {fq_table('banks')} {where_oracle}", *params)
+                            or 0
+                        )
+                    )
+        else:
+            where = (
+                "WHERE kind = $1 AND ($2::text IS NULL OR strpos(lower(bank_id), lower($2)) > 0) "
+                "AND ($3::text[] IS NULL OR bank_id = ANY($3))"
+            )
+            async with acquire_with_retry(backend) as conn:
+                if scope is None:
+                    # The validator may drop any bank, so it sees every match and the page is cut after.
+                    rows = await conn.fetch(
+                        f"SELECT bank_id, created_at FROM {fq_table('banks')} {where} ORDER BY created_at DESC, bank_id",
+                        KIND,
+                        q or None,
+                        None,
+                    )
+                    assert validator is not None
+                    kept = await validator.filter_knowledge_bank_list(
+                        KnowledgeBankListContext(
+                            banks=[{"bank_id": r["bank_id"], "created_at": r["created_at"]} for r in rows],
+                            request_context=request_context,
+                        )
+                    )
+                    page_rows = [(b["bank_id"], b["created_at"]) for b in kept.banks[offset : offset + limit]]
+                    total = len(kept.banks)
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT bank_id, created_at, count(*) OVER () AS total FROM {fq_table('banks')} {where} "
+                        "ORDER BY created_at DESC, bank_id LIMIT $4 OFFSET $5",
+                        KIND,
+                        q or None,
+                        allowed,
+                        limit,
+                        offset,
+                    )
+                    page_rows = [(r["bank_id"], r["created_at"]) for r in rows]
+                    # An offset past the end returns no rows, and with them no window total.
+                    total = (
+                        int(rows[0]["total"])
+                        if rows
+                        else await conn.fetchval(
+                            f"SELECT count(*) FROM {fq_table('banks')} {where}", KIND, q or None, allowed
+                        )
+                    )
         stats = await self.store.bank_stats([bank_id for bank_id, _ in page_rows])
         return KnowledgeBankPage(
             banks=[KnowledgeBankInfo(bank_id, created_at, stats[bank_id]) for bank_id, created_at in page_rows],
@@ -854,7 +941,7 @@ class KnowledgeService:
         async with acquire_with_retry(await self._engine._get_backend()) as conn:
             row = await conn.fetchrow(
                 f"SELECT bank_id, created_at FROM {fq_table('banks')} WHERE bank_id = $1 AND kind = $2",
-                bank_id,
+                OracleLiteralStr(bank_id),
                 KIND,
             )
         if not row:
@@ -936,12 +1023,35 @@ class KnowledgeService:
     async def reset_bank_config(self, bank_id: str, request_context: RequestContext) -> KnowledgeBankConfig:
         await self._open_bank(bank_id, KnowledgeBankWriteOperation.RESET_KNOWLEDGE_BANK_CONFIG, request_context)
         overrides = KnowledgeBankOverrides()
-        async with acquire_with_retry(await self._engine._get_backend()) as conn:
+        async with acquire_with_retry(await self._engine._get_backend()) as conn, conn.transaction():
             await self._write_overrides(conn, bank_id, overrides)
         return self._bank_config(bank_id, overrides)
 
     async def _write_overrides(self, conn: Any, bank_id: str, overrides: KnowledgeBankOverrides) -> None:
         # Only this bank's knowledge keys are replaced: anything else in the column is left as it is.
+        if getattr(conn, "backend_type", None) == "oracle":
+            raw = await conn.fetchval(
+                f"SELECT config FROM {fq_table('banks')} WHERE bank_id = $1 AND kind = $2 FOR UPDATE",
+                bank_id,
+                KIND,
+            )
+            if isinstance(raw, dict):
+                current: dict[str, Any] = dict(raw)
+            elif isinstance(raw, str) and raw.strip():
+                parsed = json.loads(raw)
+                current = dict(parsed) if isinstance(parsed, dict) else {}
+            else:
+                current = {}
+            for field in bank_config.OVERRIDABLE_FIELDS:
+                current.pop(bank_config.STORED_PREFIX + field, None)
+            current.update(bank_config.to_stored(overrides))
+            await conn.execute(
+                f"UPDATE {fq_table('banks')} SET config = $1, updated_at = SYSTIMESTAMP WHERE bank_id = $2 AND kind = $3",
+                json.dumps(current),
+                bank_id,
+                KIND,
+            )
+            return
         await conn.execute(
             f"""
             UPDATE {fq_table("banks")}
