@@ -6,6 +6,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from ...db.oracle import OracleLiteralStr
 from ...search.tags import TagsMatch, build_tag_groups_where_clause, build_tags_where_clause
 from ..base import StoredMemory
 from ..pg.reads import _MEMORY_COLUMNS, _ScopeWhere, _stored_from_row
@@ -22,7 +23,7 @@ def _refresh_scope_where(
 ) -> _ScopeWhere:
     """A refresh's scope within ``(since, until]`` as an Oracle UTC-normalized WHERE clause."""
     until_bound = until if until.tzinfo is not None else until.replace(tzinfo=timezone.utc)
-    params: list[Any] = [bank_id, until_bound]
+    params: list[Any] = [OracleLiteralStr(bank_id), until_bound]
     where = [
         "bank_id = $1",
         "SYS_EXTRACT_UTC(updated_at) <= SYS_EXTRACT_UTC(CAST($2 AS TIMESTAMP WITH TIME ZONE))",
@@ -104,5 +105,5 @@ async def latest_memory_write_at(
     return await conn.fetchval(
         f"SELECT /*+ INDEX(m idx_mu_bank_updated_at) */ m.updated_at FROM {fq_table('memory_units')} m "
         "WHERE m.bank_id = $1 ORDER BY SYS_EXTRACT_UTC(m.updated_at) DESC FETCH FIRST 1 ROW ONLY",
-        bank_id,
+        OracleLiteralStr(bank_id),
     )

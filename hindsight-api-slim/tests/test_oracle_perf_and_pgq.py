@@ -1,5 +1,6 @@
 """Unit tests for Oracle 26ai optimizations and native SQL/PGQ property graph support."""
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -424,6 +425,52 @@ class TestOracleOpsAndPropertyGraph:
         monkeypatch.setattr(LinkExpansionRetriever, "_expand_combined", AsyncMock(return_value=fallback_rows))
         res_fb = await retriever._expand_combined(conn, ["seed-1"], "world", 20, ops=ops)
         assert res_fb is fallback_rows
+
+        # When PGQ times out, semantic+causal fallback runs with bounded timeout.
+        conn.fetch = AsyncMock(
+            side_effect=[
+                asyncio.TimeoutError(),
+                [{"source": "causal", "id": "u2"}],
+            ]
+        )
+        res_to = await retriever._expand_combined(conn, ["seed-1"], "world", 20, ops=ops)
+        assert len(res_to.causal) == 1
+        assert conn.fetch.await_count == 2
+
+        # When both PGQ and its timeout fallback fail/timeout, degrade to relational super()._expand_combined.
+        conn.fetch = AsyncMock(side_effect=[asyncio.TimeoutError(), asyncio.TimeoutError()])
+        res_to_fb = await retriever._expand_combined(conn, ["seed-1"], "world", 20, ops=ops)
+        assert res_to_fb is fallback_rows
+
+    @pytest.mark.asyncio
+    async def test_uuid_shaped_bank_ids_stay_str_in_ora_modules(self):
+        from hindsight_api.engine.db.oracle import OracleLiteralStr, _convert_arg
+        from hindsight_api.engine.memories.ora import banks as ora_banks
+        from hindsight_api.engine.memories.ora import engine_curation as ora_curation
+        from hindsight_api.engine.memories.ora import recall as ora_recall
+
+        uuid_bank = "11111111-2222-3333-4444-555555555555"
+        conn = MagicMock()
+        conn.backend_type = "oracle"
+        conn.fetch = AsyncMock(return_value=[])
+        conn.execute = AsyncMock(return_value="DELETE 0")
+
+        await ora_banks.bank_page_rows(conn=conn, fq_table=lambda t: t, bank_ids=[uuid_bank], sql_owned=[uuid_bank])
+        assert all(
+            isinstance(b, OracleLiteralStr) and isinstance(_convert_arg(b), str) for b in conn.fetch.await_args.args[1]
+        )
+
+        conn.fetch.reset_mock()
+        await ora_curation.purge_bank_rows(conn=conn, fq_table=lambda t: t, bank_id=uuid_bank)
+        assert isinstance(conn.fetch.await_args_list[0].args[1], OracleLiteralStr)
+        assert isinstance(_convert_arg(conn.fetch.await_args_list[0].args[1]), str)
+
+        conn.fetch.reset_mock()
+        await ora_recall.retrieve_semantic_bm25_combined_sql(
+            conn, "[0.1]", "", uuid_bank, ["world"], 5, enable_text_search=False
+        )
+        assert isinstance(conn.fetch.await_args.args[2], OracleLiteralStr)
+        assert isinstance(_convert_arg(conn.fetch.await_args.args[2]), str)
 
     def test_graph_retriever_dispatch_and_ora_importable_without_oracledb(self, monkeypatch):
         import subprocess

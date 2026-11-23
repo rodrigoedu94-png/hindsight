@@ -85,7 +85,25 @@ class OracleLinkExpansionRetriever(LinkExpansionRetriever):
                 SELECT * FROM causal_expanded
                 LIMIT $3
                 """
-            all_rows = await conn.fetch(fallback_query, *params)
+            try:
+                all_rows = await asyncio.wait_for(
+                    conn.fetch(fallback_query, *params),
+                    timeout=config.link_expansion_timeout,
+                )
+            except Exception as fb_err:
+                logger.warning(
+                    "[LinkExpansion] Oracle SQL/PGQ timeout fallback failed (%s), falling back to relational expansion",
+                    fb_err,
+                )
+                return await super()._expand_combined(
+                    conn,
+                    seed_ids,
+                    fact_type,
+                    budget,
+                    ops=ops,
+                    created_after=created_after,
+                    created_before=created_before,
+                )
         except Exception as pgq_err:
             logger.warning(
                 "[LinkExpansion] Oracle SQL/PGQ query failed (%s), falling back to relational expansion",

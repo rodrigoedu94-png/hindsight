@@ -698,6 +698,7 @@ from .embeddings import (
 from .interface import BankConfigState, BankTemplateImportWrite, MemoryEngineInterface
 from .memories import sql_memories
 from .memories.base import watermark_may_postdate as _may_need_refresh
+from .memories.ora import is_oracle_conn
 from .page_markdown import EMPTY_PAGE_NOTICE
 from .schema import _is_oracle, fq_table
 from .search.decision_reranker import PROVIDER_NAME as DECISION_MODEL_RERANKER
@@ -20825,7 +20826,7 @@ class MemoryEngine(MemoryEngineInterface):
                 if is_failure
                 else f"(content->>'kind' IS NULL OR content->>'kind' <> '{_MM_HISTORY_KIND_FAILURE}')"
             )
-            if getattr(conn, "backend_type", None) == "oracle":
+            if is_oracle_conn(conn):
                 from .memories.ora import engine_queries as oracle_engine_queries
 
                 await oracle_engine_queries.trim_mental_model_history(
@@ -23079,7 +23080,7 @@ class MemoryEngine(MemoryEngineInterface):
             total = total_row["total"] if total_row else 0
 
             # Get operations with pagination (include result_metadata to check for parent operations)
-            if getattr(conn, "backend_type", None) == "oracle":
+            if is_oracle_conn(conn):
                 from .memories.ora import engine_queries as oracle_engine_queries
 
                 op_clauses = oracle_engine_queries.async_operations_list_clauses(

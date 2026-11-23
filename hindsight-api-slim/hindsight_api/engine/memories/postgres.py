@@ -657,7 +657,7 @@ class PostgresMemories(MemoriesExtension):
         offset: int = 0,
         tag_groups: list[TagGroup] | None = None,
     ) -> dict[str, Any]:
-        if getattr(conn, "backend_type", "postgresql") == "oracle":
+        if is_oracle_conn(conn):
             from .ora import counts as oracle_counts
 
             return await oracle_counts.observation_scope_counts(
@@ -1678,7 +1678,7 @@ class PostgresMemories(MemoriesExtension):
         bounds: _TemporalBounds,
         embeddings: Embeddings,  # noqa: ARG002 — the fold keeps the stored embedding.
     ) -> bool:
-        if getattr(conn, "backend_type", "postgresql") == "oracle":
+        if is_oracle_conn(conn):
             from .ora import consolidation as oracle_consolidation
 
             return await oracle_consolidation.fold_sources_into_observation(
@@ -1714,7 +1714,7 @@ class PostgresMemories(MemoriesExtension):
         merged_text: str,
         embeddings: Embeddings,  # noqa: ARG002 — the fold keeps the twin's stored embedding.
     ) -> bool:
-        if getattr(conn, "backend_type", "postgresql") == "oracle":
+        if is_oracle_conn(conn):
             from .ora import consolidation as oracle_consolidation
 
             return await oracle_consolidation.fold_observation_into_twin(

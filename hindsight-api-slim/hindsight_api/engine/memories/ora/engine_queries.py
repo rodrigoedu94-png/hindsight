@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ...db.oracle import OracleLiteralStr
+
 
 @dataclass(frozen=True)
 class AsyncOperationsClauses:
@@ -39,7 +41,7 @@ async def trim_mental_model_history(
         )
         """,
         mental_model_id,
-        bank_id,
+        OracleLiteralStr(bank_id),
         max_entries,
     )
 
