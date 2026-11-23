@@ -679,3 +679,20 @@ def test_admin_migration_of_an_oracle_url_aggregates_per_schema_errors(monkeypat
 
     assert isinstance(exc_info.value.__cause__, ValueError)
     assert calls == ["migrate:TENANT_A", "migrate:TENANT_B", "dimension:TENANT_B"]
+def test_vector_index_lookup_filters_to_embedding_column():
+    """Ensure Oracle vector-index discovery restricts drops/rebuilds to the EMBEDDING column."""
+    from hindsight_api import migrations
+
+    seen_sql: list[str] = []
+
+    class _SpyCursor(_ScriptedCursor):
+        def execute(self, sql, binds=None):
+            seen_sql.append(sql)
+            super().execute(sql, binds)
+
+    cursor = _SpyCursor(vector_info="VECTOR(384,FLOAT32,DENSE)", vector_indexes=[])
+    migrations._ensure_oracle_table_embedding_dimension(cursor, "MEMORY_UNITS", 1536)
+    idx_queries = [s for s in seen_sql if "index_type = 'VECTOR'" in s]
+    assert len(idx_queries) == 1
+    assert "all_ind_columns" in idx_queries[0]
+    assert "column_name = 'EMBEDDING'" in idx_queries[0]

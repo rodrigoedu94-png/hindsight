@@ -129,15 +129,31 @@ _INDEXES: tuple[str, ...] = (
 _TEXT_INDEX = "CREATE INDEX idx_kb_passages_text ON kb_passages (text) INDEXTYPE IS CTXSYS.CONTEXT PARAMETERS ('SYNC (ON COMMIT)')"
 
 _GRANT_KB_TABLES_PLSQL = """
+DECLARE
+  l_rc SYS_REFCURSOR;
+  l_grantee VARCHAR2(128);
 BEGIN
-  FOR r IN (
-    SELECT DISTINCT grantee
-    FROM all_tab_privs
-    WHERE table_schema = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
-      AND table_name = 'MEMORY_UNITS'
-      AND privilege = 'INSERT'
-      AND grantee NOT IN ('PUBLIC')
-  ) LOOP
+  BEGIN
+    OPEN l_rc FOR
+      'SELECT DISTINCT grantee FROM dba_tab_privs '
+      || 'WHERE owner = SYS_CONTEXT(''USERENV'', ''CURRENT_SCHEMA'') '
+      || 'AND table_name = ''MEMORY_UNITS'' AND privilege = ''INSERT'' '
+      || 'AND grantee NOT IN (''PUBLIC'', SYS_CONTEXT(''USERENV'', ''SESSION_USER''), SYS_CONTEXT(''USERENV'', ''CURRENT_SCHEMA''))';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE IN (-942, -1031) THEN
+        OPEN l_rc FOR
+          'SELECT DISTINCT grantee FROM all_tab_privs '
+          || 'WHERE table_schema = SYS_CONTEXT(''USERENV'', ''CURRENT_SCHEMA'') '
+          || 'AND table_name = ''MEMORY_UNITS'' AND privilege = ''INSERT'' '
+          || 'AND grantee NOT IN (''PUBLIC'', SYS_CONTEXT(''USERENV'', ''SESSION_USER''), SYS_CONTEXT(''USERENV'', ''CURRENT_SCHEMA''))';
+      ELSE
+        RAISE;
+      END IF;
+  END;
+  LOOP
+    FETCH l_rc INTO l_grantee;
+    EXIT WHEN l_rc%NOTFOUND;
     FOR t IN (
       SELECT column_value AS tbl
       FROM TABLE(SYS.ODCIVARCHAR2LIST(
@@ -150,10 +166,10 @@ BEGIN
     ) LOOP
       BEGIN
         EXECUTE IMMEDIATE
-          'GRANT SELECT, INSERT, UPDATE, DELETE ON ' || t.tbl || ' TO "' || REPLACE(r.grantee, '"', '""') || '"';
+          'GRANT SELECT, INSERT, UPDATE, DELETE ON ' || t.tbl || ' TO "' || REPLACE(l_grantee, '"', '""') || '"';
       EXCEPTION
         WHEN OTHERS THEN
-          IF SQLCODE IN (-1031, -1917, -942, -905, -922) THEN
+          IF SQLCODE IN (-1031, -1749, -1917, -942, -905, -922) THEN
             NULL;
           ELSE
             RAISE;
@@ -161,6 +177,7 @@ BEGIN
       END;
     END LOOP;
   END LOOP;
+  CLOSE l_rc;
 END;
 """
 

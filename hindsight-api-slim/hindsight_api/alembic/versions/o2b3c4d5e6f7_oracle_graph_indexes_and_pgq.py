@@ -79,27 +79,44 @@ CREATE PROPERTY GRAPH hindsight_memory_graph
 """
 
 _GRANT_PROPERTY_GRAPH_PLSQL = """
+DECLARE
+  l_rc SYS_REFCURSOR;
+  l_grantee VARCHAR2(128);
 BEGIN
-  FOR r IN (
-    SELECT DISTINCT grantee
-    FROM all_tab_privs
-    WHERE table_schema = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
-      AND table_name = 'MEMORY_UNITS'
-      AND privilege = 'SELECT'
-      AND grantee NOT IN ('PUBLIC')
-  ) LOOP
+  BEGIN
+    OPEN l_rc FOR
+      'SELECT DISTINCT grantee FROM dba_tab_privs '
+      || 'WHERE owner = SYS_CONTEXT(''USERENV'', ''CURRENT_SCHEMA'') '
+      || 'AND table_name = ''MEMORY_UNITS'' AND privilege = ''SELECT'' '
+      || 'AND grantee NOT IN (''PUBLIC'', SYS_CONTEXT(''USERENV'', ''SESSION_USER''), SYS_CONTEXT(''USERENV'', ''CURRENT_SCHEMA''))';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLCODE IN (-942, -1031) THEN
+        OPEN l_rc FOR
+          'SELECT DISTINCT grantee FROM all_tab_privs '
+          || 'WHERE table_schema = SYS_CONTEXT(''USERENV'', ''CURRENT_SCHEMA'') '
+          || 'AND table_name = ''MEMORY_UNITS'' AND privilege = ''SELECT'' '
+          || 'AND grantee NOT IN (''PUBLIC'', SYS_CONTEXT(''USERENV'', ''SESSION_USER''), SYS_CONTEXT(''USERENV'', ''CURRENT_SCHEMA''))';
+      ELSE
+        RAISE;
+      END IF;
+  END;
+  LOOP
+    FETCH l_rc INTO l_grantee;
+    EXIT WHEN l_rc%NOTFOUND;
     BEGIN
       EXECUTE IMMEDIATE
-        'GRANT READ ON PROPERTY GRAPH hindsight_memory_graph TO "' || REPLACE(r.grantee, '"', '""') || '"';
+        'GRANT READ ON PROPERTY GRAPH hindsight_memory_graph TO "' || REPLACE(l_grantee, '"', '""') || '"';
     EXCEPTION
       WHEN OTHERS THEN
-        IF SQLCODE IN (-1031, -1917, -42404, -905, -922) THEN
+        IF SQLCODE IN (-1031, -1749, -1917, -42404, -905, -922) THEN
           NULL;
         ELSE
           RAISE;
         END IF;
     END;
   END LOOP;
+  CLOSE l_rc;
 END;
 """
 

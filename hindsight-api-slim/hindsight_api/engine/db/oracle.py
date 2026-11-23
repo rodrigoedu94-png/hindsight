@@ -111,8 +111,12 @@ _VECTOR_DISTANCE_PARAM_RE = re.compile(
     r"\bVECTOR_DISTANCE\s*\(\s*[\w.\"]+\s*,\s*(?:TO_VECTOR\(\s*)?:(\w+)", re.IGNORECASE
 )
 _VECTOR_DISTANCE_CALL_RE = re.compile(r"\bVECTOR_DISTANCE\s*\(", re.IGNORECASE)
-_EMBEDDING_ASSIGN_PARAM_RE = re.compile(r'\b"?embedding"?\s*=\s*:(\w+)', re.IGNORECASE)
-_MERGE_SOURCE_EMBEDDING_RE = re.compile(r":(\w+)\s+AS\s+\"?embedding\"?", re.IGNORECASE)
+_EMBEDDING_ASSIGN_PARAM_RE = re.compile(
+    r'\b"?embedding"?\s*=\s*(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?', re.IGNORECASE
+)
+_MERGE_SOURCE_EMBEDDING_RE = re.compile(
+    r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?\s+AS\s+\"?embedding\"?", re.IGNORECASE
+)
 _INSERT_COLUMNS_VALUES_RE = re.compile(
     r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*(\(.*)", re.IGNORECASE | re.DOTALL
 )

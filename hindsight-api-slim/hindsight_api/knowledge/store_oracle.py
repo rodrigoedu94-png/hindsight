@@ -792,26 +792,25 @@ class OracleKnowledgeStore(KnowledgeStore):
                     )
                     df_map: dict[str, float] = {}
                     batched_df_ok = False
-                    if len(raw_terms) > 1 and hasattr(conn, "fetchrow"):
+                    if len(raw_terms) > 1:
                         escaped_terms = [_escape_oracle_text_term(t) for t in raw_terms]
-                        select_exprs = ", ".join(
-                            f"SUM(CASE WHEN CONTAINS(text, ${i + 2}, {i + 1}) > 0 THEN 1 ELSE 0 END) AS df_{i}"
+                        union_sql = " UNION ALL ".join(
+                            f"SELECT {i} AS term_idx, COUNT(*) AS df FROM {passages_table} "
+                            f"WHERE bank_id = $1 AND CONTAINS(text, ${i + 2}, {i + 1}) > 0"
                             for i in range(len(escaped_terms))
                         )
                         try:
-                            df_row = await conn.fetchrow(
-                                f"SELECT {select_exprs} FROM {passages_table} WHERE bank_id = $1",
-                                _lit(bank_id),
-                                *escaped_terms,
-                            )
-                            if df_row is not None:
-                                for i, term in enumerate(raw_terms):
-                                    val = df_row[f"df_{i}"]
-                                    if val and float(val) > 0:
-                                        df_map[term] = float(val)
-                                batched_df_ok = True
+                            df_rows = await conn.fetch(union_sql, _lit(bank_id), *escaped_terms)
+                            for row in df_rows:
+                                idx_val = int(row["term_idx"])
+                                df_val = row["df"]
+                                if 0 <= idx_val < len(raw_terms) and df_val and float(df_val) > 0:
+                                    df_map[raw_terms[idx_val]] = float(df_val)
+                            batched_df_ok = True
                         except Exception:
-                            logger.debug("Batched Oracle Text df probe failed; falling back to per-term probes", exc_info=True)
+                            logger.debug(
+                                "Batched Oracle Text df probe failed; falling back to per-term probes", exc_info=True
+                            )
                     if not batched_df_ok:
                         for term in raw_terms:
                             escaped = _escape_oracle_text_term(term)
