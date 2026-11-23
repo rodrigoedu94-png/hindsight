@@ -498,18 +498,15 @@ class TestOracleOpsAndPropertyGraph:
 
         # Verify all ora/* modules import cleanly in a fresh process without oracledb.
         probe = (
-            "import importlib, sys\n"
+            "import importlib, pkgutil, sys\n"
             "class BlockOracle:\n"
             "    def find_spec(self, name, path, target=None):\n"
             "        if name == 'oracledb' or name.startswith('oracledb.'):\n"
             "            raise ImportError('blocked')\n"
             "sys.meta_path.insert(0, BlockOracle())\n"
-            "for m in ('hindsight_api.engine.memories.ora', 'hindsight_api.engine.memories.ora.banks', "
-            "'hindsight_api.engine.memories.ora.consolidation', 'hindsight_api.engine.memories.ora.counts', "
-            "'hindsight_api.engine.memories.ora.engine_curation', 'hindsight_api.engine.memories.ora.engine_queries', "
-            "'hindsight_api.engine.memories.ora.link_expansion', 'hindsight_api.engine.memories.ora.reads', "
-            "'hindsight_api.engine.memories.ora.recall'):\n"
-            "    assert importlib.import_module(m) is not None\n"
+            "ora_pkg = importlib.import_module('hindsight_api.engine.memories.ora')\n"
+            "for mod in pkgutil.iter_modules(ora_pkg.__path__, ora_pkg.__name__ + '.'):\n"
+            "    assert importlib.import_module(mod.name) is not None\n"
         )
         proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=False)
         assert proc.returncode == 0, proc.stderr

@@ -40,7 +40,7 @@ async def trim_mental_model_history(
             WHERE rn > $3
         )
         """,
-        mental_model_id,
+        OracleLiteralStr(mental_model_id),
         OracleLiteralStr(bank_id),
         max_entries,
     )
