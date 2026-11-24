@@ -502,3 +502,23 @@ async def test_routing_logic_from_url_path():
 
         assert bank_id_from_path == expected_bank_from_path, f"Failed for: {description} (path={path})"
         assert bank_id == expected_bank_id, f"Failed bank_id for: {description} (path={path}, got={bank_id})"
+
+
+@pytest.mark.parametrize(("multi_bank", "knowledge_bank"), [(True, False), (False, False), (False, True)])
+def test_global_mcp_enabled_tools_with_no_built_in_registers_no_built_in(
+    mock_memory, multi_bank, knowledge_bank, caplog
+):
+    """An allowlist naming only extension tools must not fall back to every built-in tool (#6815)."""
+    from unittest.mock import MagicMock, patch
+
+    from hindsight_api.api.mcp import create_mcp_server
+    from hindsight_api.mcp_tools import _ALL_TOOLS, _KNOWLEDGE_TOOLS
+
+    mock_cfg = MagicMock()
+    mock_cfg.mcp_enabled_tools = ["my_extension_tool"]
+
+    with patch("hindsight_api.api.mcp._get_raw_config", return_value=mock_cfg):
+        mcp_server = create_mcp_server(mock_memory, multi_bank=multi_bank, knowledge_bank=knowledge_bank)
+
+    assert set(_tools(mcp_server)) & (set(_ALL_TOOLS) | set(_KNOWLEDGE_TOOLS)) == set()
+    assert "matches no built-in tool" in caplog.text

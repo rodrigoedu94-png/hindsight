@@ -883,6 +883,8 @@ class OracleKnowledgeStore(KnowledgeStore):
 
             if not rows:
                 return StoreSearchResult([])
+            # Break equal-score ties deterministically by (document_id, idx) (#6697).
+            rows.sort(key=lambda r: (r["document_id"], int(r["idx"])))
 
             # Fetch extra non-sentence vector role scores for candidates.
             role_scores: dict[tuple[str, int], dict[str, list[float]]] = {}

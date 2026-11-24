@@ -548,10 +548,133 @@ async def test_oracle_bank_kind_and_service_preserve_uuid_bank_id_and_delegate_o
         await svc.delete_operation(uuid_bank, "op-1", rc)
 
     assert engine.list_operations.await_args.kwargs["_knowledge_bank"] is True
+    assert isinstance(engine.list_operations.await_args.args[0], OracleLiteralStr)
     assert engine.get_operation_status.await_args.kwargs["_knowledge_bank"] is True
+    assert isinstance(engine.get_operation_status.await_args.args[0], OracleLiteralStr)
     assert engine.cancel_operation.await_args.kwargs["_knowledge_bank"] is True
+    assert isinstance(engine.cancel_operation.await_args.args[0], OracleLiteralStr)
     assert engine.retry_operation.await_args.kwargs["_knowledge_bank"] is True
+    assert isinstance(engine.retry_operation.await_args.args[0], OracleLiteralStr)
     assert engine.delete_operation.await_args.kwargs["_knowledge_bank"] is True
+    assert isinstance(engine.delete_operation.await_args.args[0], OracleLiteralStr)
+
+    from hindsight_api.engine import bank_aliases
+
+    conn.fetchval_responses.append(None)
+    await bank_aliases.refuse_alias_as_bank_id_on_conn(conn, uuid_bank)  # ty: ignore[invalid-argument-type]
+    _, alias_args = conn.executed[-1]
+    assert isinstance(alias_args[0], OracleLiteralStr)
+
+
+@pytest.mark.asyncio
+async def test_oracle_store_search_breaks_equal_score_ties_deterministically():
+    conn = _FakeConn()
+    conn.fetchval_responses.append(1)  # bank exists
+    conn.fetch_responses.extend(
+        [
+            [
+                {"document_id": "doc-b", "idx": 1, "arm_score": 0.9},
+                {"document_id": "doc-a", "idx": 2, "arm_score": 0.9},
+                {"document_id": "doc-a", "idx": 0, "arm_score": 0.9},
+            ],
+            [],  # extra vectors arm
+            [  # hydrated rows returned out of order
+                {
+                    "document_id": "doc-b",
+                    "idx": 1,
+                    "modality": "text",
+                    "text": "same content",
+                    "page": None,
+                    "start_ms": None,
+                    "end_ms": None,
+                    "media_key": None,
+                    "filename": "b.txt",
+                    "content_type": "text/plain",
+                    "media_type": "text",
+                    "language": None,
+                    "size_bytes": 12,
+                    "storage_key": None,
+                    "content_hash": "hb",
+                    "status": "ready",
+                    "error": None,
+                    "passage_count": 1,
+                    "tags": "[]",
+                    "source_document_id": None,
+                    "content_tokens": 2,
+                    "created_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                    "updated_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                    "score": 0.9,
+                },
+                {
+                    "document_id": "doc-a",
+                    "idx": 2,
+                    "modality": "text",
+                    "text": "same content",
+                    "page": None,
+                    "start_ms": None,
+                    "end_ms": None,
+                    "media_key": None,
+                    "filename": "a.txt",
+                    "content_type": "text/plain",
+                    "media_type": "text",
+                    "language": None,
+                    "size_bytes": 12,
+                    "storage_key": None,
+                    "content_hash": "ha",
+                    "status": "ready",
+                    "error": None,
+                    "passage_count": 2,
+                    "tags": "[]",
+                    "source_document_id": None,
+                    "content_tokens": 2,
+                    "created_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                    "updated_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                    "score": 0.9,
+                },
+                {
+                    "document_id": "doc-a",
+                    "idx": 0,
+                    "modality": "text",
+                    "text": "same content",
+                    "page": None,
+                    "start_ms": None,
+                    "end_ms": None,
+                    "media_key": None,
+                    "filename": "a.txt",
+                    "content_type": "text/plain",
+                    "media_type": "text",
+                    "language": None,
+                    "size_bytes": 12,
+                    "storage_key": None,
+                    "content_hash": "ha",
+                    "status": "ready",
+                    "error": None,
+                    "passage_count": 2,
+                    "tags": "[]",
+                    "source_document_id": None,
+                    "content_tokens": 2,
+                    "created_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                    "updated_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                    "score": 0.9,
+                },
+            ],
+            [],  # role scores
+        ]
+    )
+    store = OracleKnowledgeStore(AsyncMock(return_value=_FakeBackend(conn)))  # ty: ignore[invalid-argument-type]
+    result = await store.search(
+        "bank-1",
+        query_text="same",
+        vector=[0.1, 0.2],
+        top_k=3,
+        around=0,
+        filters=SearchFilters(),
+    )
+    assert [(h.document.document_id, h.passage.index) for h in result.hits] == [
+        ("doc-a", 0),
+        ("doc-a", 2),
+        ("doc-b", 1),
+    ]
 
 
 @pytest.mark.oracle
