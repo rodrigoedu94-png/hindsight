@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from ..._vector_index import index_using_clause, per_bank_indexes_are_eager, uses_per_bank_vector_indexes
 from ...config import get_config
 from ...schema_context import get_current_schema
+from ..db.oracle import OracleLiteralStr
 from ..db_utils import acquire_with_retry, retry_with_backoff
 from ..response_models import DispositionTraits, id_problem
 from ..schema import fq_table
@@ -258,12 +259,25 @@ async def bank_exists_on_conn(conn: "DatabaseConnection", bank_id: str) -> bool:
 
 async def bank_kind_on_conn(conn: "DatabaseConnection", bank_id: str) -> str | None:
     """The bank's kind ('memory' or 'knowledge'), or None when there is no such bank."""
-    return await conn.fetchval(f"SELECT kind FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
+    return await conn.fetchval(f"SELECT kind FROM {fq_table('banks')} WHERE bank_id = $1", OracleLiteralStr(bank_id))
 
 
 async def bank_kind(pool, bank_id: str) -> str | None:
     async with acquire_with_retry(pool) as conn:
         return await bank_kind_on_conn(conn, bank_id)
+
+
+async def bank_kind_cached(pool, bank_id: str) -> str | None:
+    """:func:`bank_kind` through ``bank_info_cache`` -- for the per-request routing check, where an
+    uncached read would cost every request a pooled connection. Misses are never cached."""
+    from .. import bank_info_cache
+
+    async def _load() -> dict:
+        kind = await bank_kind(pool, bank_id)
+        return {"kind": kind} if kind else {}
+
+    row = await bank_info_cache.get_or_load(bank_id, "kind", _load)
+    return row.get("kind")
 
 
 async def bank_exists(pool, bank_id: str) -> bool:

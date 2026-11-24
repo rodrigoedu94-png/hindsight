@@ -466,3 +466,384 @@ async def test_oracle_uuid_shaped_bank_id_and_tags_stay_str():
     assert len(params) == 2
     assert isinstance(params[0], OracleLiteralStr)
     assert isinstance(_convert_arg(params[0]), str)
+
+
+@pytest.mark.asyncio
+async def test_oracle_store_search_skips_documents_join_when_unfiltered():
+    conn = _FakeConn()
+    store = OracleKnowledgeStore(AsyncMock(return_value=_FakeBackend(conn)))
+
+    conn.fetchval_responses.extend([1, 5, 1])
+    conn.fetch_responses.extend([[], [], [], []])
+    await store.search(
+        "kb-unfiltered",
+        [1.0, 0.0],
+        top_k=5,
+        filters=SearchFilters(document_ids=["doc-1"]),
+        query_text="oracle",
+    )
+    arm_sqls = [sql for sql, _ in conn.executed if "FETCH EXACT FIRST" in sql or "FETCH FIRST" in sql]
+    assert len(arm_sqls) == 3
+    for sql in arm_sqls:
+        assert "JOIN " not in sql
+
+    conn2 = _FakeConn()
+    store2 = OracleKnowledgeStore(AsyncMock(return_value=_FakeBackend(conn2)))
+    conn2.fetchval_responses.append(1)
+    conn2.fetch_responses.extend([[], []])
+    await store2.search(
+        "kb-filtered",
+        [1.0, 0.0],
+        top_k=5,
+        filters=SearchFilters(tags=["alpha"]),
+    )
+    filtered_arms = [sql for sql, _ in conn2.executed if "FETCH EXACT FIRST" in sql or "FETCH FIRST" in sql]
+    assert len(filtered_arms) == 2
+    for sql in filtered_arms:
+        assert "JOIN " in sql and "kb_documents" in sql
+
+
+@pytest.mark.asyncio
+async def test_oracle_bank_kind_and_service_preserve_uuid_bank_id_and_delegate_ops():
+    from hindsight_api.engine.db.oracle import OracleLiteralStr, _convert_arg
+    from hindsight_api.engine.retain import bank_utils
+
+    uuid_bank = "11111111-2222-3333-4444-555555555555"
+    conn = _FakeConn()
+    conn.fetchval_responses.append("knowledge")
+    kind = await bank_utils.bank_kind_on_conn(conn, uuid_bank)  # ty: ignore[invalid-argument-type]
+    assert kind == "knowledge"
+    _, args = conn.executed[0]
+    assert isinstance(args[0], OracleLiteralStr)
+    assert isinstance(_convert_arg(args[0]), str)
+
+    backend = _FakeBackend(conn)
+    engine = SimpleNamespace(
+        _db_backend=backend,
+        _get_backend=AsyncMock(return_value=backend),
+        _operation_validator=None,
+        _authenticate_tenant=AsyncMock(),
+        _file_storage=SimpleNamespace(delete_prefix=AsyncMock()),
+        delete_bank=AsyncMock(),
+        list_operations=AsyncMock(return_value={"total": 0, "operations": []}),
+        get_operation_status=AsyncMock(return_value={"status": "completed"}),
+        cancel_operation=AsyncMock(return_value={"success": True}),
+        retry_operation=AsyncMock(return_value={"success": True}),
+        delete_operation=AsyncMock(return_value={"success": True}),
+    )
+    svc = KnowledgeService(engine)  # ty: ignore[invalid-argument-type]
+
+    conn.fetchval_responses.append(json.dumps({"kb_text_passage_tokens": 128}))
+    overrides = await svc._overrides(uuid_bank)
+    assert overrides.text_passage_tokens == 128
+    _, ov_args = conn.executed[-1]
+    assert isinstance(ov_args[0], OracleLiteralStr)
+
+    rc = MagicMock()
+    with patch.object(svc, "_open_bank", AsyncMock()):
+        await svc.list_operations(uuid_bank, rc, status=None, task_type=None, limit=10, offset=0, exclude_parents=False)
+        await svc.get_operation(uuid_bank, "op-1", rc, include_payload=False)
+        await svc.cancel_operation(uuid_bank, "op-1", rc)
+        await svc.retry_operation(uuid_bank, "op-1", rc)
+        await svc.delete_operation(uuid_bank, "op-1", rc)
+
+    assert engine.list_operations.await_args.kwargs["_knowledge_bank"] is True
+    assert engine.get_operation_status.await_args.kwargs["_knowledge_bank"] is True
+    assert engine.cancel_operation.await_args.kwargs["_knowledge_bank"] is True
+    assert engine.retry_operation.await_args.kwargs["_knowledge_bank"] is True
+    assert engine.delete_operation.await_args.kwargs["_knowledge_bank"] is True
+
+
+@pytest.mark.oracle
+@pytest.mark.asyncio
+async def test_oracle_small_bank_finds_its_passages_next_to_a_big_one(oracle_db_url):
+    """Live Oracle 26ai check for #6731: a small bank finds its passages after a 3,000-row big bank."""
+    import uuid
+
+    from hindsight_api.engine.db.oracle import OracleBackend
+    from hindsight_api.engine.schema import fq_table
+    from hindsight_api.knowledge.service import KIND
+
+    backend = OracleBackend()
+    await backend.initialize(oracle_db_url, min_size=1, max_size=4)
+
+    big = f"kb-big-{uuid.uuid4().hex[:8]}"
+    small = f"kb-small-{uuid.uuid4().hex[:8]}"
+    dim = 384
+    big_vec = array.array("f", [1.0] + [0.0] * (dim - 1))
+    small_vecs = [
+        [0.0, 1.0] + [0.0] * (dim - 2),
+        [0.0, 0.0, 1.0] + [0.0] * (dim - 3),
+        [0.0, 0.0, 0.0, 1.0] + [0.0] * (dim - 4),
+    ]
+    store = OracleKnowledgeStore(AsyncMock(return_value=backend))
+    try:
+        async with backend.acquire() as conn:
+            async with conn.transaction():
+                for b in (big, small):
+                    await conn.execute(
+                        f"INSERT INTO {fq_table('banks')} (bank_id, name, disposition, mission, internal_id, kind) "
+                        "VALUES ($1, $2, $3, NULL, $4, $5)",
+                        OracleLiteralStr(b),
+                        OracleLiteralStr(b),
+                        "{}",
+                        uuid.uuid4(),
+                        KIND,
+                    )
+                await conn.execute(
+                    f"INSERT INTO {fq_table('kb_documents')} (bank_id, document_id, content_type, media_type, content_hash, passage_count) "
+                    "VALUES ($1, $2, 'text/plain', 'text', 'h', 3000)",
+                    OracleLiteralStr(big),
+                    OracleLiteralStr("d"),
+                )
+                rows = [
+                    (OracleLiteralStr(big), OracleLiteralStr("d"), i, "text", f"big filler {i} red", big_vec)
+                    for i in range(1, 3001)
+                ]
+                for idx in range(0, len(rows), 500):
+                    await conn.executemany(
+                        f"INSERT INTO {fq_table('kb_passages')} (bank_id, document_id, idx, modality, text, embedding) "
+                        "VALUES ($1, $2, $3, $4, $5, $6)",
+                        rows[idx : idx + 500],
+                    )
+                for n, vec in enumerate(small_vecs):
+                    doc_id = f"s{n}"
+                    await conn.execute(
+                        f"INSERT INTO {fq_table('kb_documents')} (bank_id, document_id, content_type, media_type, content_hash, passage_count) "
+                        "VALUES ($1, $2, 'text/plain', 'text', 'h', 1)",
+                        OracleLiteralStr(small),
+                        OracleLiteralStr(doc_id),
+                    )
+                    await conn.execute(
+                        f"INSERT INTO {fq_table('kb_passages')} (bank_id, document_id, idx, modality, text, embedding) "
+                        "VALUES ($1, $2, 0, 'text', $3, $4)",
+                        OracleLiteralStr(small),
+                        OracleLiteralStr(doc_id),
+                        f"small passage {n} red",
+                        array.array("f", vec),
+                    )
+            try:
+                await conn.execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'KB_PASSAGES'); END;")
+                await conn.execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'KB_DOCUMENTS'); END;")
+            except Exception:
+                pass
+
+        # Warm the shared cursor on the big bank first, then search the small bank.
+        big_res = await store.search(big, list(big_vec), top_k=10, filters=SearchFilters(), query_text="red")
+        assert len(big_res.hits) == 10
+
+        small_vec_res = await store.search(small, small_vecs[0], top_k=10, filters=SearchFilters())
+        assert {h.document.document_id for h in small_vec_res.hits} == {"s0", "s1", "s2"}
+
+        small_hybrid_res = await store.search(small, small_vecs[0], top_k=10, filters=SearchFilters(), query_text="red")
+        assert {h.document.document_id for h in small_hybrid_res.hits} == {"s0", "s1", "s2"}
+    finally:
+        try:
+            async with backend.acquire() as conn, conn.transaction():
+                for b in (big, small):
+                    await conn.execute(f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1", OracleLiteralStr(b))
+        finally:
+            await backend.shutdown()
+
+
+@pytest.mark.oracle
+@pytest.mark.asyncio
+async def test_oracle_knowledge_bank_operations_and_mcp_e2e(oracle_db_url, monkeypatch):
+    """Live Oracle 26ai E2E for #6791 (KB operations & /banks refusal), #6801 (/mcp/kb/), and auth boundaries."""
+    import os
+    import uuid
+
+    import httpx
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    from hindsight_api import MemoryEngine
+    from hindsight_api.api import create_app
+    from hindsight_api.config import clear_config_cache
+    from hindsight_api.engine.cross_encoder import CrossEncoderModel
+    from hindsight_api.engine.embeddings import Embeddings
+    from hindsight_api.extensions.builtin.tenant import ApiKeyTenantExtension
+    from hindsight_api.extensions.operation_validator import (
+        KnowledgeBankReadContext,
+        OperationValidatorExtension,
+        ValidationResult,
+    )
+    from hindsight_api.knowledge.service import get_knowledge_service
+    from hindsight_api.mcp_tools import _KNOWLEDGE_TOOLS
+
+    class _DetEmbeddings(Embeddings):
+        @property
+        def provider_name(self) -> str:
+            return "mock"
+
+        @property
+        def dimension(self) -> int:
+            return 384
+
+        async def initialize(self) -> None:
+            return None
+
+        async def encode(self, texts: list[str]) -> list[list[float]]:
+            out = []
+            for t in texts:
+                v = [0.0] * 384
+                v[0] = 1.0 if "password" in t.lower() or "vault" in t.lower() else 0.1
+                v[1] = 1.0 if "red" in t.lower() else 0.1
+                out.append(v)
+            return out
+
+    class _NoopCrossEncoder(CrossEncoderModel):
+        @property
+        def provider_name(self) -> str:
+            return "mock"
+
+        async def initialize(self) -> None:
+            return None
+
+        async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+            return [0.5] * len(pairs)
+
+    class _DetKBEmbedder:
+        provider = "fake"
+        model = "fake"
+        dimension = 384
+        modalities = frozenset({"text"})
+
+        def __init__(self, emb: _DetEmbeddings) -> None:
+            self._emb = emb
+
+        async def embed_documents(self, items: list[Any]) -> list[list[float]]:
+            return await self._emb.encode([getattr(i, "text", None) or "" for i in items])
+
+        async def embed_query(
+            self, text: str | None, image: bytes | None = None, video: bytes | None = None
+        ) -> list[float]:
+            return (await self._emb.encode([text or ""]))[0]
+
+    class _HideForbiddenKB(OperationValidatorExtension):
+        def __init__(self, forbidden_id: str) -> None:
+            super().__init__({})
+            self.forbidden_id = forbidden_id
+
+        async def validate_retain(self, ctx: Any) -> ValidationResult:
+            return ValidationResult.accept()
+
+        async def validate_recall(self, ctx: Any) -> ValidationResult:
+            return ValidationResult.accept()
+
+        async def validate_reflect(self, ctx: Any) -> ValidationResult:
+            return ValidationResult.accept()
+
+        async def validate_knowledge_bank_read(self, ctx: KnowledgeBankReadContext) -> ValidationResult:
+            if ctx.bank_id == self.forbidden_id:
+                return ValidationResult.reject("forbidden kb", status_code=403)
+            return ValidationResult.accept()
+
+    monkeypatch.setenv("HINDSIGHT_API_DATABASE_BACKEND", "oracle")
+    clear_config_cache()
+
+    emb = _DetEmbeddings()
+    mem = MemoryEngine(
+        db_url=oracle_db_url,
+        memory_llm_provider="mock",
+        embeddings=emb,
+        cross_encoder=_NoopCrossEncoder(),
+        run_migrations=False,
+        pool_min_size=1,
+        pool_max_size=4,
+    )
+    await mem.initialize()
+
+    kb_id = f"kb-ora-mcp-{uuid.uuid4().hex[:8]}"
+    forbidden_kb = f"kb-forbid-{uuid.uuid4().hex[:8]}"
+    mem_id = f"mem-ora-{uuid.uuid4().hex[:8]}"
+    try:
+        svc = get_knowledge_service(mem)
+        monkeypatch.setattr(svc, "_embedder", _DetKBEmbedder(emb))
+
+        mem._tenant_extension = ApiKeyTenantExtension({"api_key": "ora-secret-key"})
+        mem._operation_validator = _HideForbiddenKB(forbidden_kb)
+
+        app = create_app(mem, mcp_api_enabled=True, initialize_memory=False)
+        async with app.router.lifespan_context(app):
+            headers = {"Authorization": "Bearer ora-secret-key"}
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test", headers=headers
+            ) as http:
+                # 1. Auth boundary check: wrong bearer token -> 401 and no credentials leaked
+                unauth = await http.post(
+                    f"/mcp/kb/{kb_id}/",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    headers={"Authorization": "Bearer wrong-key", "Accept": "application/json, text/event-stream"},
+                )
+                assert unauth.status_code == 401
+                assert "oracle" not in unauth.text.lower() and os.getenv("ORACLE_TEST_DSN", "x") not in unauth.text
+
+                # 2. Multi-bank MCP: create, ingest, cross-kind refusal, validator 403 boundary
+                async with streamable_http_client("http://test/mcp/", http_client=http) as (r, w, _):
+                    async with ClientSession(r, w) as s:
+                        await s.initialize()
+                        names = {t.name for t in (await s.list_tools()).tools}
+                        assert _KNOWLEDGE_TOOLS <= names
+
+                        created = json.loads(
+                            (await s.call_tool("create_knowledge_bank", {"bank_id": kb_id})).content[0].text
+                        )
+                        assert created["bank_id"] == kb_id
+                        ingested = json.loads(
+                            (
+                                await s.call_tool(
+                                    "ingest_knowledge_text",
+                                    {
+                                        "bank_id": kb_id,
+                                        "document_id": "pw",
+                                        "text": "The vault password is kept in the red box.",
+                                    },
+                                )
+                            )
+                            .content[0]
+                            .text
+                        )
+                        assert ingested["document_ids"] == ["pw"]
+                        assert "error" in json.loads(
+                            (await s.call_tool("recall", {"bank_id": kb_id, "query": "vault"})).content[0].text
+                        )
+                        forbid_res = json.loads(
+                            (await s.call_tool("search_knowledge_bank", {"bank_id": forbidden_kb, "query": "x"}))
+                            .content[0]
+                            .text
+                        )
+                        assert "forbidden kb" in forbid_res["error"]
+
+                # 3. HTTP #6791 operations separation
+                assert (await http.get(f"/v1/default/knowledge-banks/{kb_id}/operations")).status_code == 200
+                refused_http = await http.get(f"/v1/default/banks/{kb_id}/operations")
+                assert (
+                    refused_http.status_code == 400
+                    and f"/v1/default/knowledge-banks/{kb_id}" in refused_http.json()["detail"]
+                )
+
+                # 4. Single-KB MCP (/mcp/kb/{kb_id}/): search, get, delete doc, delete bank
+                async with streamable_http_client(f"http://test/mcp/kb/{kb_id}/", http_client=http) as (r, w, _):
+                    async with ClientSession(r, w) as s:
+                        await s.initialize()
+                        kb_names = {t.name for t in (await s.list_tools()).tools}
+                        assert kb_names == _KNOWLEDGE_TOOLS - {"list_knowledge_banks", "create_knowledge_bank"}
+                        found = (await s.call_tool("search_knowledge_bank", {"query": "password"})).structuredContent
+                        assert found is not None
+                        assert found["results"][0]["document_id"] == "pw"
+                        doc = (await s.call_tool("get_knowledge_document", {"document_id": "pw"})).structuredContent
+                        assert doc is not None
+                        assert doc["status"] == "ready"
+                        assert (
+                            await s.call_tool("delete_knowledge_document", {"document_id": "pw"})
+                        ).structuredContent == {"deleted": True}
+                        assert (await s.call_tool("delete_knowledge_bank", {})).structuredContent == {"deleted": True}
+
+                # 5. Memory bank still works on /banks/{mem_id}/operations
+                assert (await http.put(f"/v1/default/banks/{mem_id}", json={})).is_success
+                assert (await http.get(f"/v1/default/banks/{mem_id}/operations")).status_code == 200
+                await http.delete(f"/v1/default/banks/{mem_id}")
+    finally:
+        await mem.close()
+        clear_config_cache()
