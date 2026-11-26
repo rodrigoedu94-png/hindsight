@@ -109,6 +109,19 @@ _MERGE_SOURCE_EMBEDDING_RE = re.compile(r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?\s+
 _INSERT_COLUMNS_VALUES_RE = re.compile(
     r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*(\(.*)", re.IGNORECASE | re.DOTALL
 )
+_INSERT_EMBEDDING_VALUE_RE = re.compile(r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?", re.IGNORECASE)
+# Text the vector-bind scan must not read as SQL: Oracle alternative-quoted literals
+# (q'[...]', q'{...}', q'(...)', q'<...>', q'!...!', optionally N-prefixed), ordinary '...'
+# literals ('' escapes a quote), -- line comments and /* */ block comments. A single
+# left-to-right alternation, so a quote inside a comment, or a comment marker inside a
+# literal, is read as what it is.
+_SQL_TEXT_OR_COMMENT_RE = re.compile(
+    r"(?<![\w$#])[nN]?[qQ]'(?:\[.*?\]|\{.*?\}|\(.*?\)|<.*?>|([^\s\[{(<]).*?\1)'"
+    r"|'(?:''|[^'])*'"
+    r"|--[^\n]*"
+    r"|/\*.*?\*/",
+    re.DOTALL,
+)
 
 # Pre-compiled patterns used inside _rewrite_pg_to_oracle and _expand_any_lists
 _LEFT_RE = re.compile(r"\bLEFT\s*\(\s*([\w.]+)\s*,\s*(\d+|:\w+)\s*\)", re.IGNORECASE)
@@ -959,31 +972,34 @@ class OracleConnection(DatabaseConnection):
                 params[key] = lob
 
     @staticmethod
-    def _mask_sql_string_literals(query: str) -> str:
-        """Collapse each single-quoted SQL string literal to ``''`` so regex scans skip its contents."""
-        if "'" not in query:
+    def _mask_sql_text_and_comments(query: str) -> str:
+        """Collapse string literals to ``''`` and comments to a space, so regex scans read only SQL.
+
+        Literals keep a placeholder so a masked VALUES list still pairs with its columns by position.
+        """
+        if "'" not in query and "--" not in query and "/*" not in query:
             return query
-        return re.sub(r"'(?:''|[^'])*'", "''", query)
+        return _SQL_TEXT_OR_COMMENT_RE.sub(lambda m: " " if m.group(0)[0] in "-/" else "''", query)
 
     @staticmethod
     def _vector_bind_keys(query: str) -> set[str]:
         """Names of the bind parameters that carry an embedding in ``query`` (see _bind_vectors_natively)."""
-        unquoted = OracleConnection._mask_sql_string_literals(query)
+        sql = OracleConnection._mask_sql_text_and_comments(query)
         keys = (
-            set(_VECTOR_DISTANCE_PARAM_RE.findall(unquoted))
-            | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(unquoted))
-            | set(_MERGE_SOURCE_EMBEDDING_RE.findall(unquoted))
+            set(_VECTOR_DISTANCE_PARAM_RE.findall(sql))
+            | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(sql))
+            | set(_MERGE_SOURCE_EMBEDDING_RE.findall(sql))
         )
         # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...) [, (...)]: pair each
         # row group's column/value lists by position (one list per row on multi-row inserts).
-        insert = _INSERT_COLUMNS_VALUES_RE.search(query)
+        insert = _INSERT_COLUMNS_VALUES_RE.search(sql)
         if insert:
             columns = [c.strip().strip('"').lower() for c in insert.group(1).split(",")]
             for group in _top_level_paren_contents(insert.group(2)):
                 values = _split_respecting_parens(group)
                 for column, value in zip(columns, values, strict=False):
                     if column == "embedding":
-                        m_val = re.fullmatch(r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?", value.strip(), re.IGNORECASE)
+                        m_val = _INSERT_EMBEDDING_VALUE_RE.fullmatch(value.strip())
                         if m_val:
                             keys.add(m_val.group(1))
         return keys
