@@ -976,6 +976,7 @@ class OracleConnection(DatabaseConnection):
         """Collapse string literals to ``''`` and comments to a space, so regex scans read only SQL.
 
         Literals keep a placeholder so a masked VALUES list still pairs with its columns by position.
+        For scanning only: the result drops literal values and is never executed.
         """
         if "'" not in query and "--" not in query and "/*" not in query:
             return query

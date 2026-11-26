@@ -438,6 +438,30 @@ def _vector_index_params(cursor, table: str) -> dict[str, tuple[str, int]]:
 
 
 @pytest.mark.oracle
+def test_live_resize_leaves_a_vector_index_on_another_column_alone(oracle_cursor):
+    cursor, table = oracle_cursor
+    cursor.execute(
+        f"CREATE TABLE {table} (id NUMBER PRIMARY KEY, embedding VECTOR(384, FLOAT32), other_vec VECTOR(384, FLOAT32))"
+    )
+    for name, column in (("EMB", "embedding"), ("OTH", "other_vec")):
+        cursor.execute(
+            f"CREATE VECTOR INDEX {table}_{name} ON {table} ({column}) ORGANIZATION NEIGHBOR PARTITIONS "
+            "DISTANCE COSINE WITH TARGET ACCURACY 95"
+        )
+
+    _ensure_oracle_table_embedding_dimension(cursor, table, 1536)
+
+    assert _vector_info(cursor, table) == "VECTOR(1536,FLOAT32,DENSE)"
+    cursor.execute(
+        "SELECT c.index_name, c.column_name FROM user_ind_columns c JOIN user_indexes i "
+        "ON i.index_name = c.index_name WHERE c.table_name = :t AND i.index_type = 'VECTOR' ORDER BY 1",
+        {"t": table},
+    )
+    # Only the EMBEDDING index is rebuilt; the other column's index is neither dropped nor re-pointed.
+    assert cursor.fetchall() == [(f"{table}_EMB", "EMBEDDING"), (f"{table}_OTH", "OTHER_VEC")]
+
+
+@pytest.mark.oracle
 def test_live_resize_replaces_the_column_and_keeps_the_vector_index(oracle_cursor):
     cursor, table = oracle_cursor
     # Same shape as the baseline: VECTOR(384, FLOAT32) with an IVF (neighbor partitions) index.

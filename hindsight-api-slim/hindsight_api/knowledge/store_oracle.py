@@ -830,6 +830,9 @@ class OracleKnowledgeStore(KnowledgeStore):
                         max_idf = max(raw_idf.values())
                         terms_idf = {t: val for t, val in raw_idf.items() if val >= KEYWORD_IDF_SHARE * max_idf}
                     if terms_idf:
+                        # ACCUM, not OR: OR scores a passage by its best single term, so one that matches
+                        # every query term ties one that matches only the strongest. ACCUM adds the terms'
+                        # scores, so the candidate pool (ORDER BY SCORE) favors passages matching more terms.
                         or_expr = " ACCUM ".join(_escape_oracle_text_term(t) for t in terms_idf)
                         kw_params = [*filter_params, or_expr]
                         kw_pos = len(kw_params)

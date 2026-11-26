@@ -64,6 +64,12 @@ BEGIN
     END LOOP;
   END LOOP;
   CLOSE l_rc;
+EXCEPTION
+  WHEN OTHERS THEN
+    IF l_rc%ISOPEN THEN
+      CLOSE l_rc;
+    END IF;
+    RAISE;
 END;
 """
 
@@ -107,5 +113,11 @@ BEGIN
     END;
   END LOOP;
   CLOSE l_rc;
+EXCEPTION
+  WHEN OTHERS THEN
+    IF l_rc%ISOPEN THEN
+      CLOSE l_rc;
+    END IF;
+    RAISE;
 END;
 """
