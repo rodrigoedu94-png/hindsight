@@ -57,14 +57,6 @@ class RewriteResult(NamedTuple):
     returning_cols: tuple[str, ...] | None
 
 
-class _CachedRewriteResult(NamedTuple):
-    """Immutable internal cache entry for rewritten SQL."""
-
-    query: str
-    ignore_dup: bool
-    returning_cols: tuple[str, ...] | None
-
-
 # ---------------------------------------------------------------------------
 # Regex patterns for PostgreSQL → Oracle query rewriting
 # ---------------------------------------------------------------------------
@@ -582,8 +574,13 @@ def _rewrite_array_contains(m: re.Match) -> str:
     )
 
 
-@functools.lru_cache(maxsize=512)
-def _rewrite_pg_to_oracle_cached(query: str, supports_for_update_row_limit: bool) -> _CachedRewriteResult:
+# The rewrite is a pure function of the query text (and the server's FOR UPDATE row-limit
+# support) and the same few hundred query shapes repeat, so caching it skips re-running ~60
+# regexes on every statement. Table names carry the tenant schema, so each tenant adds its own
+# copy of every shape: the cap leaves room for a few dozen tenants before entries start evicting.
+# Results are shared between callers, hence the immutable RewriteResult (tuple returning_cols).
+@functools.lru_cache(maxsize=8192)
+def _rewrite_pg_to_oracle_cached(query: str, supports_for_update_row_limit: bool) -> RewriteResult:
     """Cached immutable PostgreSQL → Oracle SQL rewriter."""
     ignore_dup = False
     returning_cols: tuple[str, ...] | None = None
@@ -618,7 +615,7 @@ def _rewrite_pg_to_oracle_cached(query: str, supports_for_update_row_limit: bool
 
     # PG-specific SET SESSION commands → skip (Oracle doesn't need these)
     if _SET_SESSION_RE.match(query):
-        return _CachedRewriteResult("SELECT 1 FROM DUAL", False, None)
+        return RewriteResult("SELECT 1 FROM DUAL", False, None)
 
     # NOW() AT TIME ZONE 'UTC' → SYS_EXTRACT_UTC(SYSTIMESTAMP)
     query = _NOW_UTC_RE.sub("SYS_EXTRACT_UTC(SYSTIMESTAMP)", query)
@@ -737,7 +734,7 @@ def _rewrite_pg_to_oracle_cached(query: str, supports_for_update_row_limit: bool
             into_vars = ", ".join(f":ret_{i}" for i in range(len(returning_cols)))
             query = query[: m.start()] + f"RETURNING {ret_cols_str} INTO {into_vars}" + query[m.end() :]
 
-    return _CachedRewriteResult(query, ignore_dup, returning_cols)
+    return RewriteResult(query, ignore_dup, returning_cols)
 
 
 def _rewrite_pg_to_oracle(query: str, *, supports_for_update_row_limit: bool = False) -> RewriteResult:
@@ -747,9 +744,7 @@ def _rewrite_pg_to_oracle(query: str, *, supports_for_update_row_limit: bool = F
     - ignore_dup: True if ON CONFLICT DO NOTHING was stripped (caller should catch ORA-00001)
     - returning_cols: column names from RETURNING clause (None if no RETURNING)
     """
-    cached = _rewrite_pg_to_oracle_cached(query, supports_for_update_row_limit)
-    returning_cols = list(cached.returning_cols) if cached.returning_cols is not None else None
-    return RewriteResult(cached.query, cached.ignore_dup, returning_cols)
+    return _rewrite_pg_to_oracle_cached(query, supports_for_update_row_limit)
 
 
 _rewrite_pg_to_oracle.cache_info = _rewrite_pg_to_oracle_cached.cache_info  # type: ignore[attr-defined]

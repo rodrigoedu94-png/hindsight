@@ -69,16 +69,17 @@ class TestOracleExpandListsAndRewriterCache:
         assert sql.count(":any0_") == 3
         assert params == {"any0_0": "a", "any0_1": None, "any0_2": "b"}
 
-    def test_rewriter_lru_cache_hits_and_isolates_returning_list(self):
+    def test_rewriter_lru_cache_hits_and_shares_an_immutable_result(self):
         _rewrite_pg_to_oracle.cache_clear()
         sql = "UPDATE banks SET name = $1 WHERE bank_id = $2 RETURNING bank_id, name"
 
         first = _rewrite_pg_to_oracle(sql)
-        assert first.returning_cols == ["bank_id", "name"]
-        first.returning_cols.append("mutated")
+        assert first.returning_cols == ("bank_id", "name")
+        # Shared between callers, so nothing in it can be mutated.
+        assert isinstance(first.returning_cols, tuple)
 
         second = _rewrite_pg_to_oracle(sql)
-        assert second.returning_cols == ["bank_id", "name"]
+        assert second is first
         assert _rewrite_pg_to_oracle.cache_info().hits >= 1
 
 
@@ -308,7 +309,7 @@ class TestOracleOpsAndPropertyGraph:
         rows = await ops.fetch_unit_dates(conn, "memory_units", ["u1", "u2"])
         assert len(rows) == 1
         conn.fetch.assert_awaited_once()
-        assert "WHERE id = ANY($1::uuid[])" in conn.fetch.await_args.args[0]
+        assert "WHERE id = ANY($1)" in conn.fetch.await_args.args[0]
 
         conn.fetch.reset_mock()
         assert await ops.fetch_unit_dates(conn, "memory_units", []) == []

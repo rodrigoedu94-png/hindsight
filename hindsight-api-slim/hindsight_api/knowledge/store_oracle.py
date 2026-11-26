@@ -893,10 +893,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                     role_scores.setdefault(key, {}).setdefault(vr["role"], []).append(float(vr["sim"] or 0.0))
 
             roles = [role_scores.get((r["document_id"], int(r["idx"])), {}) for r in rows]
-            first = [
-                page_score(float(r["score"] or 0.0), ro, text_weight)
-                for r, ro in zip(rows, roles, strict=True)
-            ]
+            first = [page_score(float(r["score"] or 0.0), ro, text_weight) for r, ro in zip(rows, roles, strict=True)]
 
             # Stage 3: rescore top pages with sentence vectors.
             top_indices = sorted(range(len(rows)), key=lambda i: first[i], reverse=True)[: max(top_k, RESCORE_POOL)]
