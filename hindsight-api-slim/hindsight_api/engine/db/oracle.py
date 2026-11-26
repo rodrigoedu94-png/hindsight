@@ -104,10 +104,23 @@ _VECTOR_DISTANCE_PARAM_RE = re.compile(
     r"\bVECTOR_DISTANCE\s*\(\s*[\w.\"]+\s*,\s*(?:TO_VECTOR\(\s*)?:(\w+)", re.IGNORECASE
 )
 _VECTOR_DISTANCE_CALL_RE = re.compile(r"\bVECTOR_DISTANCE\s*\(", re.IGNORECASE)
-_EMBEDDING_ASSIGN_PARAM_RE = re.compile(r'\b"?embedding"?\s*=\s*:(\w+)', re.IGNORECASE)
-_MERGE_SOURCE_EMBEDDING_RE = re.compile(r":(\w+)\s+AS\s+\"?embedding\"?", re.IGNORECASE)
+_EMBEDDING_ASSIGN_PARAM_RE = re.compile(r'\b"?embedding"?\s*=\s*(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?', re.IGNORECASE)
+_MERGE_SOURCE_EMBEDDING_RE = re.compile(r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?\s+AS\s+\"?embedding\"?", re.IGNORECASE)
 _INSERT_COLUMNS_VALUES_RE = re.compile(
     r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*(\(.*)", re.IGNORECASE | re.DOTALL
+)
+_INSERT_EMBEDDING_VALUE_RE = re.compile(r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?", re.IGNORECASE)
+# Text the vector-bind scan must not read as SQL: Oracle alternative-quoted literals
+# (q'[...]', q'{...}', q'(...)', q'<...>', q'!...!', optionally N-prefixed), ordinary '...'
+# literals ('' escapes a quote), -- line comments and /* */ block comments. A single
+# left-to-right alternation, so a quote inside a comment, or a comment marker inside a
+# literal, is read as what it is.
+_SQL_TEXT_OR_COMMENT_RE = re.compile(
+    r"(?<![\w$#])[nN]?[qQ]'(?:\[.*?\]|\{.*?\}|\(.*?\)|<.*?>|([^\s\[{(<]).*?\1)'"
+    r"|'(?:''|[^'])*'"
+    r"|--[^\n]*"
+    r"|/\*.*?\*/",
+    re.DOTALL,
 )
 
 # Pre-compiled patterns used inside _rewrite_pg_to_oracle and _expand_any_lists
@@ -361,25 +374,42 @@ _UPSERT_RE = re.compile(
 
 
 def _split_respecting_parens(s: str) -> list[str]:
-    """Split a comma-separated string while respecting parenthesised groups.
+    """Split a comma-separated string while respecting parenthesised groups and string literals.
 
     e.g. "$1, COALESCE($2, NOW()), $3" → ["$1", "COALESCE($2, NOW())", "$3"]
     """
     parts: list[str] = []
     depth = 0
+    in_quote = False
     current: list[str] = []
-    for ch in s:
-        if ch == "(":
-            depth += 1
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_quote:
             current.append(ch)
-        elif ch == ")":
-            depth -= 1
-            current.append(ch)
-        elif ch == "," and depth == 0:
-            parts.append("".join(current).strip())
-            current = []
+            if ch == "'":
+                if i + 1 < n and s[i + 1] == "'":
+                    current.append(s[i + 1])
+                    i += 2
+                    continue
+                in_quote = False
         else:
-            current.append(ch)
+            if ch == "'":
+                in_quote = True
+                current.append(ch)
+            elif ch == "(":
+                depth += 1
+                current.append(ch)
+            elif ch == ")":
+                depth -= 1
+                current.append(ch)
+            elif ch == "," and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        i += 1
     if current:
         parts.append("".join(current).strip())
     return parts
@@ -390,20 +420,35 @@ def _top_level_paren_contents(s: str) -> list[str]:
 
     e.g. "(:1, :2), (:3, :4)" → [":1, :2", ":3, :4"] — the row groups of a
     multi-row VALUES list, which naive splitting mispairs against the columns.
+    Ignores parentheses inside single-quoted SQL string literals.
     """
     groups: list[str] = []
     depth = 0
     start = -1
-    for i, ch in enumerate(s):
-        if ch == "(":
-            if depth == 0:
-                start = i + 1
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0 and start >= 0:
-                groups.append(s[start:i])
-                start = -1
+    in_quote = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_quote:
+            if ch == "'":
+                if i + 1 < n and s[i + 1] == "'":
+                    i += 2
+                    continue
+                in_quote = False
+        else:
+            if ch == "'":
+                in_quote = True
+            elif ch == "(":
+                if depth == 0:
+                    start = i + 1
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    groups.append(s[start:i])
+                    start = -1
+        i += 1
     return groups
 
 
@@ -927,23 +972,37 @@ class OracleConnection(DatabaseConnection):
                 params[key] = lob
 
     @staticmethod
+    def _mask_sql_text_and_comments(query: str) -> str:
+        """Collapse string literals to ``''`` and comments to a space, so regex scans read only SQL.
+
+        Literals keep a placeholder so a masked VALUES list still pairs with its columns by position.
+        For scanning only: the result drops literal values and is never executed.
+        """
+        if "'" not in query and "--" not in query and "/*" not in query:
+            return query
+        return _SQL_TEXT_OR_COMMENT_RE.sub(lambda m: " " if m.group(0)[0] in "-/" else "''", query)
+
+    @staticmethod
     def _vector_bind_keys(query: str) -> set[str]:
         """Names of the bind parameters that carry an embedding in ``query`` (see _bind_vectors_natively)."""
+        sql = OracleConnection._mask_sql_text_and_comments(query)
         keys = (
-            set(_VECTOR_DISTANCE_PARAM_RE.findall(query))
-            | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(query))
-            | set(_MERGE_SOURCE_EMBEDDING_RE.findall(query))
+            set(_VECTOR_DISTANCE_PARAM_RE.findall(sql))
+            | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(sql))
+            | set(_MERGE_SOURCE_EMBEDDING_RE.findall(sql))
         )
         # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...) [, (...)]: pair each
         # row group's column/value lists by position (one list per row on multi-row inserts).
-        insert = _INSERT_COLUMNS_VALUES_RE.search(query)
+        insert = _INSERT_COLUMNS_VALUES_RE.search(sql)
         if insert:
             columns = [c.strip().strip('"').lower() for c in insert.group(1).split(",")]
             for group in _top_level_paren_contents(insert.group(2)):
                 values = _split_respecting_parens(group)
                 for column, value in zip(columns, values, strict=False):
-                    if column == "embedding" and value.startswith(":"):
-                        keys.add(value[1:])
+                    if column == "embedding":
+                        m_val = _INSERT_EMBEDDING_VALUE_RE.fullmatch(value.strip())
+                        if m_val:
+                            keys.add(m_val.group(1))
         return keys
 
     @staticmethod

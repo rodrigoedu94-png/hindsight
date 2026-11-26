@@ -26,6 +26,7 @@ from collections.abc import Sequence
 from alembic import op
 
 from hindsight_api.alembic._dialect import run_for_dialect
+from hindsight_api.alembic._oracle_grants import GRANT_PROPERTY_GRAPH_PLSQL
 
 revision: str = "o2b3c4d5e6f7"
 down_revision: str | Sequence[str] | None = "kbtok1a2b3c4"
@@ -78,29 +79,7 @@ CREATE PROPERTY GRAPH hindsight_memory_graph
   OPTIONS (TRUSTED MODE)
 """
 
-_GRANT_PROPERTY_GRAPH_PLSQL = """
-BEGIN
-  FOR r IN (
-    SELECT DISTINCT grantee
-    FROM user_tab_privs_made
-    WHERE table_name = 'MEMORY_UNITS'
-      AND privilege = 'SELECT'
-      AND grantee NOT IN ('PUBLIC')
-  ) LOOP
-    BEGIN
-      EXECUTE IMMEDIATE
-        'GRANT READ ON PROPERTY GRAPH hindsight_memory_graph TO "' || REPLACE(r.grantee, '"', '""') || '"';
-    EXCEPTION
-      WHEN OTHERS THEN
-        IF SQLCODE IN (-1031, -1917, -42404, -905, -922) THEN
-          NULL;
-        ELSE
-          RAISE;
-        END IF;
-    END;
-  END LOOP;
-END;
-"""
+_GRANT_PROPERTY_GRAPH_PLSQL = GRANT_PROPERTY_GRAPH_PLSQL
 
 
 def _oracle_exec_ignoring(sql: str, *codes: int) -> None:

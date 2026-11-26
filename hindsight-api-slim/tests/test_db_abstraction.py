@@ -2052,3 +2052,44 @@ class TestOracleSessionAndClobBinding:
             i for i, (kind, q) in enumerate(events) if kind == "execute" and "DELETE FROM documents" in q
         )
         assert lock_idx < del_links_idx < del_docs_idx
+
+    def test_vector_bind_keys_handles_quoted_literals_and_to_vector_across_dml(self):
+        from hindsight_api.engine.db.oracle import OracleConnection, _split_respecting_parens, _top_level_paren_contents
+
+        values_tail = "('it''s (a, b)', :1, TO_VECTOR(:2)), ('close)paren,comma', :3, :4)"
+        groups = _top_level_paren_contents(values_tail)
+        assert groups == ["'it''s (a, b)', :1, TO_VECTOR(:2)", "'close)paren,comma', :3, :4"]
+        assert _split_respecting_parens(groups[0]) == ["'it''s (a, b)'", ":1", "TO_VECTOR(:2)"]
+
+        insert_sql = f"INSERT INTO memory_units (text, bank_id, embedding) VALUES {values_tail}"
+        assert OracleConnection._vector_bind_keys(insert_sql) == {"2", "4"}
+
+        merge_sql = (
+            "MERGE INTO memory_units t USING (SELECT :1 AS id, TO_VECTOR(:2) AS embedding FROM DUAL) s ON (t.id = s.id)"
+        )
+        assert OracleConnection._vector_bind_keys(merge_sql) == {"2"}
+
+        update_sql = "UPDATE memory_units SET embedding = TO_VECTOR(:3) WHERE id = :1"
+        assert OracleConnection._vector_bind_keys(update_sql) == {"3"}
+
+        literal_sql = "SELECT 'embedding = TO_VECTOR(:9)', :9 FROM DUAL WHERE text = 'VECTOR_DISTANCE(embedding, :8)'"
+        assert OracleConnection._vector_bind_keys(literal_sql) == set()
+
+    def test_vector_bind_keys_skip_comments_and_alternative_quoted_literals(self):
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        keys = OracleConnection._vector_bind_keys
+        # Comments are not SQL: a bind named only inside one is not an embedding.
+        assert keys("UPDATE memory_units SET metadata = :1 /* embedding = TO_VECTOR(:1) */ WHERE id = :2") == set()
+        assert keys("SELECT :3 FROM DUAL -- VECTOR_DISTANCE(embedding, :3)\nWHERE 1 = 1") == set()
+        # A quote inside a comment does not open a literal, and -- inside a literal is not a comment.
+        assert keys("SELECT :1 FROM DUAL -- don't\nWHERE VECTOR_DISTANCE(embedding, :2) < 1") == {"2"}
+        assert keys("UPDATE memory_units SET text = 'a -- b', embedding = :3 WHERE id = :1") == {"3"}
+        # Oracle alternative quoting, including an apostrophe and INSERT punctuation inside it.
+        assert keys("SELECT q'[it's embedding = :9]', :9 FROM DUAL") == set()
+        assert keys("SELECT nq'!don't VECTOR_DISTANCE(embedding, :8)!' FROM DUAL") == set()
+        insert_sql = (
+            "INSERT INTO memory_units (text, bank_id, embedding) "
+            "VALUES (q'{it's (a, b), :7}', :1, TO_VECTOR(:2)), (Q'<x) y,>', :3, /* c, ) */ :4)"
+        )
+        assert keys(insert_sql) == {"2", "4"}

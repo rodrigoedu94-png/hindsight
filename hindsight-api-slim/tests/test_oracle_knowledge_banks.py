@@ -5,6 +5,7 @@ from __future__ import annotations
 import array
 import importlib.util
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,19 +33,32 @@ from hindsight_api.knowledge.store import (
 from hindsight_api.knowledge.store_oracle import OracleKnowledgeStore
 
 
-def _load_migration_module():
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "hindsight_api"
-        / "alembic"
-        / "versions"
-        / "e3c4d5e6f7a8_oracle_knowledge_banks.py"
-    )
-    spec = importlib.util.spec_from_file_location("e3c4d5e6f7a8_oracle_knowledge_banks", path)
+def _load_migration_module(name: str = "e3c4d5e6f7a8_oracle_knowledge_banks"):
+    path = Path(__file__).resolve().parents[1] / "hindsight_api" / "alembic" / "versions" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _grantee_queries(plsql: str) -> list[str]:
+    """The dynamic SQL each ``OPEN l_rc FOR`` in a grant block runs, with its PL/SQL quoting undone."""
+    queries = []
+    for stmt in re.findall(r"OPEN l_rc FOR(.*?);", plsql, re.S):
+        pieces = re.findall(r"'((?:[^']|'')*)'", stmt)
+        queries.append("".join(pieces).replace("''", "'"))
+    return queries
+
+
+def _assert_grantees_scoped_to_current_schema(plsql: str, privilege: str) -> None:
+    schema = "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"
+    dba, fallback = _grantee_queries(plsql)
+    assert dba.startswith(f"SELECT DISTINCT grantee FROM dba_tab_privs WHERE owner = {schema} ")
+    assert fallback.startswith(f"SELECT DISTINCT grantee FROM all_tab_privs WHERE table_schema = {schema} ")
+    for query in (dba, fallback):
+        assert f"AND table_name = 'MEMORY_UNITS' AND privilege = '{privilege}' " in query
+        assert query.endswith(f"grantee NOT IN ('PUBLIC', SYS_CONTEXT('USERENV', 'SESSION_USER'), {schema})")
 
 
 class _FakeConn:
@@ -140,8 +154,47 @@ def test_oracle_knowledge_banks_migration_ddl_and_dialect():
         assert f"DROP TABLE {tbl} CASCADE CONSTRAINTS PURGE" in joined
     assert "idx_kb_passages_text" in joined
     assert "CTXSYS.CONTEXT" in joined
-    assert "privilege = 'INSERT'" in joined
+    # Grantees are read through dynamic SQL (dba_tab_privs, falling back to all_tab_privs),
+    # so the literals inside the PL/SQL string are quote-doubled.
+    assert "privilege = ''INSERT''" in joined
+    assert "FROM dba_tab_privs" in joined and "FROM all_tab_privs" in joined
+    assert "user_tab_privs_made" not in joined
     assert "GRANT SELECT, INSERT, UPDATE, DELETE ON" in joined
+    # A separate migration user sets CURRENT_SCHEMA to the owner: both lookups must scope to it.
+    _assert_grantees_scoped_to_current_schema(mod._GRANT_KB_TABLES_PLSQL, "INSERT")
+
+    pg_bind = MagicMock()
+    pg_bind.dialect.name = "postgresql"
+    with patch.object(mod.op, "get_bind", return_value=pg_bind):
+        mod.upgrade()
+        mod.downgrade()
+    pg_bind.exec_driver_sql.assert_not_called()
+
+
+def test_property_graph_grant_scoped_to_current_schema():
+    from hindsight_api.alembic._oracle_grants import GRANT_PROPERTY_GRAPH_PLSQL
+
+    _assert_grantees_scoped_to_current_schema(GRANT_PROPERTY_GRAPH_PLSQL, "SELECT")
+    assert "GRANT READ ON PROPERTY GRAPH hindsight_memory_graph" in GRANT_PROPERTY_GRAPH_PLSQL
+    assert "-42421" in GRANT_PROPERTY_GRAPH_PLSQL  # ORA-42421 (graph absent) is tolerated
+
+
+def test_reapply_runtime_grants_migration_reruns_both_blocks_on_oracle_only():
+    from hindsight_api.alembic._oracle_grants import GRANT_KB_TABLES_PLSQL, GRANT_PROPERTY_GRAPH_PLSQL
+
+    mod = _load_migration_module("f7a8b9c0d1e2_oracle_reapply_runtime_grants")
+    assert mod.revision == "f7a8b9c0d1e2"
+    assert mod.down_revision == "e3c4d5e6f7a8"
+    # The original revisions run the same shared blocks.
+    assert _load_migration_module()._GRANT_KB_TABLES_PLSQL is GRANT_KB_TABLES_PLSQL
+
+    ora_bind = MagicMock()
+    ora_bind.dialect.name = "oracle"
+    with patch.object(mod.op, "get_bind", return_value=ora_bind):
+        mod.upgrade()
+        mod.downgrade()
+    executed = [c.args[0] for c in ora_bind.exec_driver_sql.call_args_list]
+    assert executed == [GRANT_PROPERTY_GRAPH_PLSQL, GRANT_KB_TABLES_PLSQL]
 
     pg_bind = MagicMock()
     pg_bind.dialect.name = "postgresql"
@@ -466,3 +519,49 @@ async def test_oracle_uuid_shaped_bank_id_and_tags_stay_str():
     assert len(params) == 2
     assert isinstance(params[0], OracleLiteralStr)
     assert isinstance(_convert_arg(params[0]), str)
+
+
+@pytest.mark.asyncio
+async def test_oracle_search_batches_multi_term_df_with_indexed_union_and_accum():
+    conn = _FakeConn()
+    store = OracleKnowledgeStore(AsyncMock(return_value=_FakeBackend(conn)))
+    doc_row = _sample_doc_row("doc-1")
+    passage_row = {
+        "idx": 0,
+        "modality": "text",
+        "text": "Oracle vector search",
+        "page": None,
+        "start_ms": None,
+        "end_ms": None,
+        "media_key": None,
+        **{k: v for k, v in doc_row.items()},
+        "score": 0.91,
+    }
+    conn.fetchval_responses.extend([1, 20])
+    conn.fetch_responses.extend(
+        [
+            [{"document_id": "doc-1", "idx": 0, "arm_score": 0.91}],
+            [],
+            [{"term_idx": 0, "df": 2}, {"term_idx": 1, "df": 3}],
+            [{"document_id": "doc-1", "idx": 0, "arm_score": 42.0}],
+            [passage_row],
+            [],
+        ]
+    )
+    res = await store.search(
+        "kb-1",
+        [1.0, 0.0],
+        top_k=5,
+        filters=SearchFilters(),
+        query_text="oracle vector",
+    )
+    assert len(res.hits) == 1
+    df_sql, df_args = next((s, a) for s, a in conn.executed if "AS term_idx" in s)
+    assert "UNION ALL" in df_sql
+    assert "WHERE bank_id = $1 AND CONTAINS(text, $2, 1) > 0" in df_sql
+    assert "WHERE bank_id = $1 AND CONTAINS(text, $3, 2) > 0" in df_sql
+    assert df_args[1:] == ("{oracle}", "{vector}")
+    kw_sql, kw_args = next((s, a) for s, a in conn.executed if "ORDER BY SCORE(1) DESC" in s)
+    assert "CONTAINS(x.text," in kw_sql
+    assert " ACCUM " in kw_args[-1]
+    assert " OR " not in kw_args[-1]
