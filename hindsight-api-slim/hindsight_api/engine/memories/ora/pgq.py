@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from ...db.ops import LinkExpansionRows, UpdatedWindow, memory_unit_columns
+from ...db.oracle import OracleLiteralStr
 
 
 def build_pgq_entity_expansion_cte(
@@ -21,7 +22,8 @@ def build_pgq_entity_expansion_cte(
     window: UpdatedWindow,
 ) -> str:
     """Build entity expansion CTE using Oracle 26ai SQL/PGQ GRAPH_TABLE over mentions edges."""
-    safe_limit = max(1, int(per_entity_limit))
+    # As the relational CTEs: a cap of 0 (or less) keeps no entity-linked units.
+    safe_limit = int(per_entity_limit)
     return f"""
             entity_units_raw AS (
                 SELECT DISTINCT entity_id, unit_id
@@ -64,6 +66,44 @@ def build_pgq_entity_expansion_cte(
             )"""
 
 
+def _pgq_semantic_scores_cte(graph_name: str, fact_type_sql: str, window: UpdatedWindow) -> str:
+    """``sem_scores``: best semantic-link weight per non-seed neighbour, both link directions.
+
+    One directed GRAPH_TABLE per direction, like the relational CTE's two arms, so each
+    seeks its own ``memory_links`` index (from_unit_id / to_unit_id, link_type, weight).
+    An undirected ``-[l]-`` match returns the same rows, but in a statement that also holds
+    the SQL/PGQ entity arm the optimizer OR-expands it and full-scans ``memory_links`` for
+    the incoming side: ~8.5x the logical reads of the relational CTE on a 36k-link bank.
+    """
+    arms = []
+    for pattern in (
+        "(src IS memory_unit) -[l IS memory_link]-> (dst IS memory_unit)",
+        "(dst IS memory_unit) -[l IS memory_link]-> (src IS memory_unit)",
+    ):
+        arms.append(f"""
+                    SELECT id, weight
+                    FROM GRAPH_TABLE (
+                        {graph_name}
+                        MATCH {pattern}
+                        WHERE src.id = ANY($1::uuid[])
+                          AND l.link_type = 'semantic'
+                          AND dst.fact_type = {fact_type_sql}
+                          AND dst.id != ALL($1::uuid[])
+                          {window.clause("dst")}
+                        COLUMNS (
+                            dst.id AS id,
+                            l.weight AS weight
+                        )
+                    )""")
+    union = "\n                    UNION ALL".join(arms)
+    return f"""sem_scores AS (
+                SELECT id, MAX(weight) AS score
+                FROM ({union}
+                ) sem_raw
+                GROUP BY id
+            )"""
+
+
 def build_pgq_semantic_causal_cte(
     graph_name: str,
     mu_table: str,
@@ -94,23 +134,7 @@ def build_pgq_semantic_causal_cte(
                     )"""
 
     return f"""
-            sem_scores AS (
-                SELECT id, MAX(weight) AS score
-                FROM GRAPH_TABLE (
-                    {graph_name}
-                    MATCH (src IS memory_unit) -[l IS memory_link]- (dst IS memory_unit)
-                    WHERE src.id = ANY($1::uuid[])
-                      AND l.link_type = 'semantic'
-                      AND dst.fact_type = $2
-                      AND dst.id != ALL($1::uuid[])
-                      {window.clause("dst")}
-                    COLUMNS (
-                        dst.id AS id,
-                        l.weight AS weight
-                    )
-                )
-                GROUP BY id
-            ),
+            {_pgq_semantic_scores_cte(graph_name, "$2", window)},
             semantic_expanded AS (
                 SELECT {memory_unit_columns("mu", indent=23)},
                        ss.score, 'semantic' AS source
@@ -159,11 +183,25 @@ async def expand_observations_pgq(
     window: UpdatedWindow,
     *,
     max_causal_hops: int = 2,
+    os_table: str = "observation_sources",
 ) -> LinkExpansionRows:
-    """Expand observation memories via Oracle 26ai SQL/PGQ (derived_from, mentions, memory_link)."""
+    """Expand observation memories via Oracle 26ai SQL/PGQ (derived_from, mentions, memory_link).
+
+    The entity arm ranks every unit that mentions a seed source's entities, the seed
+    sources included, and drops those only after the per-entity cap (``connected_sources``),
+    as ``OracleOps.expand_observations`` does, so both pick the same units under the cap.
+
+    The last hop, from the connected sources back to their observations, joins
+    ``observation_sources`` on ``source_id`` instead of matching ``derived_from`` again.
+    A GRAPH_TABLE cannot be seeded from a CTE, so that match enumerated every
+    observation-to-source edge and joined ``memory_units`` once per edge to bind its
+    ``src`` vertex: 6.2k buffer gets for this arm against 0.8k relational, on an
+    8.5k-unit bank. The join reads only the candidate sources' rows (0.9k).
+    """
     if not seed_ids or budget <= 0:
         return LinkExpansionRows(entity=[], semantic=[], causal=[])
-    safe_limit = max(1, int(per_entity_limit))
+    # As the relational CTEs: a cap of 0 (or less) keeps no entity-linked units.
+    safe_limit = int(per_entity_limit)
     causal_two_hop = ""
     if max_causal_hops >= 2:
         causal_two_hop = f"""
@@ -206,7 +244,6 @@ async def expand_observations_pgq(
                           -[m1 IS mentions]-> (e IS entity)
                           <-[m2 IS mentions]- (tgt IS memory_unit)
                     WHERE obs.id = ANY($1::uuid[])
-                      AND tgt.id != src.id
                     COLUMNS (
                         e.id AS entity_id,
                         tgt.id AS unit_id
@@ -229,25 +266,12 @@ async def expand_observations_pgq(
                       SELECT 1 FROM seed_sources ss WHERE ss.source_id = eur.unit_id
                   )
             ),
-            obs_derived_edges AS (
-                SELECT observation_id, source_id
-                FROM GRAPH_TABLE (
-                    {graph_name}
-                    MATCH (obs IS memory_unit) -[d IS derived_from]-> (src IS memory_unit)
-                    WHERE obs.fact_type = 'observation'
-                      AND obs.id != ALL($1::uuid[])
-                      {window.clause("obs")}
-                    COLUMNS (
-                        obs.id AS observation_id,
-                        src.id AS source_id
-                    )
-                )
-            ),
             obs_scores AS (
-                SELECT ode.observation_id, COUNT(DISTINCT cs.source_id) AS score
+                SELECT os.observation_id, COUNT(DISTINCT cs.source_id) AS score
                 FROM connected_sources cs
-                JOIN obs_derived_edges ode ON ode.source_id = cs.source_id
-                GROUP BY ode.observation_id
+                JOIN {os_table} os ON os.source_id = cs.source_id
+                WHERE os.observation_id != ALL($1::uuid[])
+                GROUP BY os.observation_id
             ),
             observation_entity_expanded AS (
                 SELECT {memory_unit_columns("mu", indent=23)},
@@ -260,23 +284,7 @@ async def expand_observations_pgq(
                 ORDER BY s.score DESC
                 FETCH FIRST $2 ROWS ONLY
             ),
-            sem_scores AS (
-                SELECT id, MAX(weight) AS score
-                FROM GRAPH_TABLE (
-                    {graph_name}
-                    MATCH (src IS memory_unit) -[l IS memory_link]- (dst IS memory_unit)
-                    WHERE src.id = ANY($1::uuid[])
-                      AND l.link_type = 'semantic'
-                      AND dst.fact_type = 'observation'
-                      AND dst.id != ALL($1::uuid[])
-                      {window.clause("dst")}
-                    COLUMNS (
-                        dst.id AS id,
-                        l.weight AS weight
-                    )
-                )
-                GROUP BY id
-            ),
+            {_pgq_semantic_scores_cte(graph_name, "'observation'", window)},
             semantic_expanded AS (
                 SELECT {memory_unit_columns("mu", indent=23)},
                        ss.score, 'semantic' AS source
@@ -342,11 +350,16 @@ async def query_entity_neighborhood_pgq(
     occurred_before: datetime | None = None,
     limit: int = 50,
 ) -> list[Any]:
-    """Traverse entity co-occurrences and linked bi-temporal facts with explicit 0/1/2 hop distances."""
+    """Traverse entity co-occurrences and linked bi-temporal facts with explicit 0/1/2 hop distances.
+
+    ``max_hops`` is clamped to [0, 2]: 0 returns only the units mentioning ``entity_ids``,
+    1 adds their co-occurring entities' units, 2 the entities one co-occurrence further.
+    """
     if not entity_ids or limit <= 0:
         return []
-    hops = max(1, min(int(max_hops), 2))
-    params: list[object] = [entity_ids, bank_id]
+    hops = max(0, min(int(max_hops), 2))
+    # bank_id is VARCHAR2: keep a UUID-shaped bank id a string, not a RAW(16) bind.
+    params: list[object] = [entity_ids, OracleLiteralStr(bank_id)]
     temporal_clauses: list[str] = []
     if occurred_after is not None:
         params.append(occurred_after)
@@ -355,13 +368,29 @@ async def query_entity_neighborhood_pgq(
         )
     if occurred_before is not None:
         params.append(occurred_before)
-        temporal_clauses.append(
-            f"AND COALESCE(mu.occurred_start, mu.mentioned_at, mu.event_date) <= ${len(params)}"
-        )
+        temporal_clauses.append(f"AND COALESCE(mu.occurred_start, mu.mentioned_at, mu.event_date) <= ${len(params)}")
     params.append(limit)
     limit_param = f"${len(params)}"
     temporal_sql = " ".join(temporal_clauses)
 
+    one_hop_arm = ""
+    if hops >= 1:
+        one_hop_arm = f"""
+                        UNION ALL
+                        SELECT unit_id, neighbor_entity_id, neighbor_entity_name, 1 AS hop_distance
+                        FROM GRAPH_TABLE (
+                            {graph_name}
+                            MATCH (e1 IS entity) -[co1 IS cooccurs_with]- (e2 IS entity)
+                                  <-[m IS mentions]- (u IS memory_unit)
+                            WHERE e1.id = ANY($1::uuid[])
+                              AND e2.id != e1.id
+                              AND u.bank_id = $2
+                            COLUMNS (
+                                u.id AS unit_id,
+                                e2.id AS neighbor_entity_id,
+                                e2.canonical_name AS neighbor_entity_name
+                            )
+                        )"""
     two_hop_arm = ""
     if hops >= 2:
         two_hop_arm = f"""
@@ -409,22 +438,7 @@ async def query_entity_neighborhood_pgq(
                                 e1.id AS neighbor_entity_id,
                                 e1.canonical_name AS neighbor_entity_name
                             )
-                        )
-                        UNION ALL
-                        SELECT unit_id, neighbor_entity_id, neighbor_entity_name, 1 AS hop_distance
-                        FROM GRAPH_TABLE (
-                            {graph_name}
-                            MATCH (e1 IS entity) -[co1 IS cooccurs_with]- (e2 IS entity)
-                                  <-[m IS mentions]- (u IS memory_unit)
-                            WHERE e1.id = ANY($1::uuid[])
-                              AND e2.id != e1.id
-                              AND u.bank_id = $2
-                            COLUMNS (
-                                u.id AS unit_id,
-                                e2.id AS neighbor_entity_id,
-                                e2.canonical_name AS neighbor_entity_name
-                            )
-                        ){two_hop_arm}
+                        ){one_hop_arm}{two_hop_arm}
                     )
                     GROUP BY unit_id, neighbor_entity_id
                 ) n

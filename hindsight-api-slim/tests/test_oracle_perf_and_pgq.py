@@ -379,7 +379,9 @@ class TestOracleOpsAndPropertyGraph:
         )
         sql = conn.fetch.await_args.args[0]
         assert "GRAPH_TABLE (" in sql
-        assert "-[co IS cooccurs_with]-{1,2}" in sql
+        # Delegates to ora/pgq.py: explicit hop arms, no quantified edge (which reported 2 hops as 1).
+        assert "{1,2}" not in sql
+        assert "1 AS hop_distance" in sql and "2 AS hop_distance" in sql
         assert "COALESCE(mu.occurred_end, mu.occurred_start, mu.mentioned_at, mu.event_date) >= $3" in sql
         assert "COALESCE(mu.occurred_start, mu.mentioned_at, mu.event_date) <= $4" in sql
         assert "LIMIT $5" in sql

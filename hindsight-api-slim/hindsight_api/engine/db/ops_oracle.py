@@ -932,76 +932,25 @@ class OracleOps(DataAccessOps):
         occurred_before: datetime | None = None,
         limit: int = 50,
     ) -> list[ResultRow]:
-        """Traverse entity co-occurrences and linked bi-temporal facts via SQL/PGQ."""
-        if not entity_ids or limit <= 0:
-            return []
-        hops = max(1, min(int(max_hops), 2))
-        params: list[object] = [entity_ids, bank_id]
-        temporal_clauses: list[str] = []
-        if occurred_after is not None:
-            params.append(occurred_after)
-            temporal_clauses.append(
-                f"AND COALESCE(mu.occurred_end, mu.occurred_start, mu.mentioned_at, mu.event_date) >= ${len(params)}"
-            )
-        if occurred_before is not None:
-            params.append(occurred_before)
-            temporal_clauses.append(
-                f"AND COALESCE(mu.occurred_start, mu.mentioned_at, mu.event_date) <= ${len(params)}"
-            )
-        params.append(limit)
-        limit_param = f"${len(params)}"
-        temporal_sql = " ".join(temporal_clauses)
+        """Traverse entity co-occurrences and linked bi-temporal facts via SQL/PGQ.
+
+        One implementation, in ``memories/ora/pgq.py``: explicit 0/1/2-hop arms, so a unit
+        two co-occurrences away reports hop_distance 2 (a quantified ``{1,2}`` edge reported 1).
+        """
+        from ..memories.ora.pgq import query_entity_neighborhood_pgq
 
         return cast(
             "list[ResultRow]",
-            await conn.fetch(
-                f"""
-                SELECT {memory_unit_columns("mu", indent=23)},
-                       n.neighbor_entity_id,
-                       n.neighbor_entity_name,
-                       n.hop_distance
-                FROM (
-                    SELECT unit_id,
-                           neighbor_entity_id,
-                           MAX(neighbor_entity_name) AS neighbor_entity_name,
-                           MIN(hop_distance) AS hop_distance
-                    FROM (
-                        SELECT unit_id, neighbor_entity_id, neighbor_entity_name, 0 AS hop_distance
-                        FROM GRAPH_TABLE (
-                            {graph_name}
-                            MATCH (e1 IS entity) <-[m IS mentions]- (u IS memory_unit)
-                            WHERE e1.id = ANY($1::uuid[])
-                              AND u.bank_id = $2
-                            COLUMNS (
-                                u.id AS unit_id,
-                                e1.id AS neighbor_entity_id,
-                                e1.canonical_name AS neighbor_entity_name
-                            )
-                        )
-                        UNION ALL
-                        SELECT unit_id, neighbor_entity_id, neighbor_entity_name, 1 AS hop_distance
-                        FROM GRAPH_TABLE (
-                            {graph_name}
-                            MATCH (e1 IS entity) -[co IS cooccurs_with]-{{1,{hops}}} (e2 IS entity)
-                                  <-[m IS mentions]- (u IS memory_unit)
-                            WHERE e1.id = ANY($1::uuid[])
-                              AND u.bank_id = $2
-                            COLUMNS (
-                                u.id AS unit_id,
-                                e2.id AS neighbor_entity_id,
-                                e2.canonical_name AS neighbor_entity_name
-                            )
-                        )
-                    )
-                    GROUP BY unit_id, neighbor_entity_id
-                ) n
-                JOIN {mu_table} mu ON mu.id = n.unit_id
-                WHERE mu.bank_id = $2
-                  {temporal_sql}
-                ORDER BY n.hop_distance ASC, mu.event_date DESC
-                LIMIT {limit_param}
-                """,
-                *params,
+            await query_entity_neighborhood_pgq(
+                conn,
+                mu_table=mu_table,
+                graph_name=graph_name,
+                bank_id=bank_id,
+                entity_ids=entity_ids,
+                max_hops=max_hops,
+                occurred_after=occurred_after,
+                occurred_before=occurred_before,
+                limit=limit,
             ),
         )
 
