@@ -466,3 +466,49 @@ async def test_oracle_uuid_shaped_bank_id_and_tags_stay_str():
     assert len(params) == 2
     assert isinstance(params[0], OracleLiteralStr)
     assert isinstance(_convert_arg(params[0]), str)
+
+
+@pytest.mark.asyncio
+async def test_oracle_search_batches_multi_term_df_with_indexed_union_and_accum():
+    conn = _FakeConn()
+    store = OracleKnowledgeStore(AsyncMock(return_value=_FakeBackend(conn)))
+    doc_row = _sample_doc_row("doc-1")
+    passage_row = {
+        "idx": 0,
+        "modality": "text",
+        "text": "Oracle vector search",
+        "page": None,
+        "start_ms": None,
+        "end_ms": None,
+        "media_key": None,
+        **{k: v for k, v in doc_row.items()},
+        "score": 0.91,
+    }
+    conn.fetchval_responses.extend([1, 20])
+    conn.fetch_responses.extend(
+        [
+            [{"document_id": "doc-1", "idx": 0, "arm_score": 0.91}],
+            [],
+            [{"term_idx": 0, "df": 2}, {"term_idx": 1, "df": 3}],
+            [{"document_id": "doc-1", "idx": 0, "arm_score": 42.0}],
+            [passage_row],
+            [],
+        ]
+    )
+    res = await store.search(
+        "kb-1",
+        [1.0, 0.0],
+        top_k=5,
+        filters=SearchFilters(),
+        query_text="oracle vector",
+    )
+    assert len(res.hits) == 1
+    df_sql, df_args = next((s, a) for s, a in conn.executed if "AS term_idx" in s)
+    assert "UNION ALL" in df_sql
+    assert "WHERE bank_id = $1 AND CONTAINS(text, $2, 1) > 0" in df_sql
+    assert "WHERE bank_id = $1 AND CONTAINS(text, $3, 2) > 0" in df_sql
+    assert df_args[1:] == ("{oracle}", "{vector}")
+    kw_sql, kw_args = next((s, a) for s, a in conn.executed if "ORDER BY SCORE(1) DESC" in s)
+    assert "CONTAINS(x.text," in kw_sql
+    assert " ACCUM " in kw_args[-1]
+    assert " OR " not in kw_args[-1]

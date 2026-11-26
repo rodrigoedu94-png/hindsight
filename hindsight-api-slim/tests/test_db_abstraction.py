@@ -2052,3 +2052,25 @@ class TestOracleSessionAndClobBinding:
             i for i, (kind, q) in enumerate(events) if kind == "execute" and "DELETE FROM documents" in q
         )
         assert lock_idx < del_links_idx < del_docs_idx
+
+    def test_vector_bind_keys_handles_quoted_literals_and_to_vector_across_dml(self):
+        from hindsight_api.engine.db.oracle import OracleConnection, _split_respecting_parens, _top_level_paren_contents
+
+        values_tail = "('it''s (a, b)', :1, TO_VECTOR(:2)), ('close)paren,comma', :3, :4)"
+        groups = _top_level_paren_contents(values_tail)
+        assert groups == ["'it''s (a, b)', :1, TO_VECTOR(:2)", "'close)paren,comma', :3, :4"]
+        assert _split_respecting_parens(groups[0]) == ["'it''s (a, b)'", ":1", "TO_VECTOR(:2)"]
+
+        insert_sql = f"INSERT INTO memory_units (text, bank_id, embedding) VALUES {values_tail}"
+        assert OracleConnection._vector_bind_keys(insert_sql) == {"2", "4"}
+
+        merge_sql = (
+            "MERGE INTO memory_units t USING (SELECT :1 AS id, TO_VECTOR(:2) AS embedding FROM DUAL) s ON (t.id = s.id)"
+        )
+        assert OracleConnection._vector_bind_keys(merge_sql) == {"2"}
+
+        update_sql = "UPDATE memory_units SET embedding = TO_VECTOR(:3) WHERE id = :1"
+        assert OracleConnection._vector_bind_keys(update_sql) == {"3"}
+
+        literal_sql = "SELECT 'embedding = TO_VECTOR(:9)', :9 FROM DUAL WHERE text = 'VECTOR_DISTANCE(embedding, :8)'"
+        assert OracleConnection._vector_bind_keys(literal_sql) == set()
