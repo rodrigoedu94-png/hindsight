@@ -140,7 +140,11 @@ def test_oracle_knowledge_banks_migration_ddl_and_dialect():
         assert f"DROP TABLE {tbl} CASCADE CONSTRAINTS PURGE" in joined
     assert "idx_kb_passages_text" in joined
     assert "CTXSYS.CONTEXT" in joined
-    assert "privilege = 'INSERT'" in joined
+    # Grantees are read through dynamic SQL (dba_tab_privs, falling back to all_tab_privs),
+    # so the literals inside the PL/SQL string are quote-doubled.
+    assert "privilege = ''INSERT''" in joined
+    assert "FROM dba_tab_privs" in joined and "FROM all_tab_privs" in joined
+    assert "user_tab_privs_made" not in joined
     assert "GRANT SELECT, INSERT, UPDATE, DELETE ON" in joined
 
     pg_bind = MagicMock()
