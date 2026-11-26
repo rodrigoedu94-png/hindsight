@@ -142,6 +142,11 @@ async def purge_bank_rows(*, conn, fq_table: Callable[[str], str], bank_id: str)
         )
     ]
 
+    # Delete memory_links BEFORE documents / memory_units / entities
+    # so cascading deletes never remove bidirectional links in arbitrary endpoint
+    # order and deadlock against concurrent link writers (#4251, PI-96).
+    await conn.execute(f"DELETE FROM {fq_table('memory_links')} WHERE bank_id = $1", bank_id)
+
     # Delete documents (cascades to chunks)
     await conn.execute(f"DELETE FROM {fq_table('documents')} WHERE bank_id = $1", bank_id)
     # Attachments hang off the bank, not a document, so clearing a bank

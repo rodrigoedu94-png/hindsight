@@ -1394,9 +1394,18 @@ def fuse_keyword(dense: list[float], keyword: list[float], weight: float, has_te
     ]
 
 
-def load_knowledge_store(backend_provider: Any, extension_path: str | None) -> KnowledgeStore:
-    """The configured store: an extension class when one is named, else Postgres."""
+def load_knowledge_store(
+    backend_provider: Any,
+    extension_path: str | None,
+    *,
+    backend_type: str | None = None,
+) -> KnowledgeStore:
+    """The configured store: an extension class when one is named, else Oracle or Postgres."""
     if not extension_path:
+        if backend_type == "oracle":
+            from .store_oracle import OracleKnowledgeStore
+
+            return OracleKnowledgeStore(backend_provider)
         return PostgresKnowledgeStore(backend_provider)
     import importlib
     import os

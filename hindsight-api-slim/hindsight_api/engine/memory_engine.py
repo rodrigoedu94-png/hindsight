@@ -29,7 +29,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, null
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import IO, TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, TypeVar, cast
+from typing import IO, TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, Protocol, TypeVar, cast
 
 import asyncpg
 import numpy as np
@@ -701,6 +701,7 @@ from .embeddings import (
 from .interface import BankConfigState, BankTemplateImportWrite, MemoryEngineInterface
 from .memories import sql_memories
 from .memories.base import watermark_may_postdate as _may_need_refresh
+from .memories.ora import is_oracle_conn
 from .page_markdown import EMPTY_PAGE_NOTICE
 from .schema import _is_oracle, fq_table
 from .search.decision_reranker import PROVIDER_NAME as DECISION_MODEL_RERANKER
@@ -1746,6 +1747,47 @@ def _is_foreign_key_violation(e: Exception) -> bool:
     return code == 2291
 
 
+class _OperationCanceller(Protocol):
+    def __call__(
+        self,
+        operation_id: str,
+        schema: str | None = None,
+        *,
+        expected_worker_id: str | None = None,
+        expected_claimed_at: datetime | None = None,
+    ) -> bool: ...
+
+
+class _BankOperationsCanceller(Protocol):
+    def __call__(
+        self,
+        bank_id: str,
+        schema: str | None = None,
+        *,
+        track_delete_gate: bool = False,
+    ) -> int: ...
+
+
+class _BankDeleteFinisher(Protocol):
+    def __call__(self, bank_id: str, schema: str | None = None) -> None: ...
+
+
+class _OperationActiveChecker(Protocol):
+    def __call__(self, operation_id: str, schema: str | None = None) -> bool: ...
+
+
+def _parse_json_dict(raw: Any) -> dict[str, Any]:
+    """Decode a JSON object column (string, dict, or None) into a mutable dict."""
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
 #: Tasks that write into a bank that already existed when they were queued. They run bound to
 #: that bank's life (bank_life): a delete while one runs stops it instead of letting it recreate
 #: the bank. import_bank / clone_bank are absent on purpose: they create their target bank.
@@ -2524,6 +2566,7 @@ class _MentalModelRefreshRun:
     usage: TokenUsage = field(default_factory=TokenUsage)
     duration_ms: int = 0
     warnings: list[str] = field(default_factory=list)
+    delta_ops_transient_failure: bool = False
 
     def to_trace(self, *, include_tool_outputs: bool = False) -> MentalModelRefreshTrace:
         """Render the run as a trace.
@@ -3572,6 +3615,10 @@ class MemoryEngine(MemoryEngineInterface):
         from .maintenance import MaintenanceLoop
 
         self._maintenance_loop: MaintenanceLoop | None = None
+        self._active_operation_canceller: _OperationCanceller | None = None
+        self._active_bank_operations_canceller: _BankOperationsCanceller | None = None
+        self._finish_bank_delete: _BankDeleteFinisher | None = None
+        self._is_operation_active: _OperationActiveChecker | None = None
 
         # Backpressure mechanism: limit concurrent searches to prevent overwhelming the database
         # Configurable via HINDSIGHT_API_RECALL_MAX_CONCURRENT (default: 50)
@@ -4158,7 +4205,13 @@ class MemoryEngine(MemoryEngineInterface):
         )
 
         async with self._retrieve_archive(storage_key) as archive:
-            result = await self._run_import_documents(bank_id, archive, on_conflict, context)
+            result = await self._run_import_documents(bank_id, archive, on_conflict, context, operation_id=operation_id)
+
+        if result.cancelled:
+            logger.info(
+                "Document import operation %s cancelled; skipping completion metadata and archive cleanup", operation_id
+            )
+            return
 
         if operation_id:
             counts = {
@@ -4174,11 +4227,16 @@ class MemoryEngine(MemoryEngineInterface):
             }
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
+                existing_raw = await conn.fetchval(
+                    f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                    uuid.UUID(operation_id),
+                )
+                merged_meta = _parse_json_dict(existing_raw)
+                merged_meta.pop("_import_checkpoint", None)
+                merged_meta.update(counts)
                 await conn.execute(
-                    f"UPDATE {fq_table('async_operations')} "
-                    f"SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $1::jsonb "
-                    f"WHERE operation_id = $2",
-                    json.dumps(counts, default=_json_default),
+                    f"UPDATE {fq_table('async_operations')} SET result_metadata = $1::jsonb WHERE operation_id = $2",
+                    json.dumps(merged_meta, default=_json_default),
                     uuid.UUID(operation_id),
                 )
 
@@ -4355,10 +4413,17 @@ class MemoryEngine(MemoryEngineInterface):
                 ),
                 operation_id=operation_id,
             )
-            # Restored documents are reported like imported ones. Only here, not in
-            # import_bank_async: a clone reuses that restore, but copies documents the
-            # tenant already has rather than bringing in new ones.
-            await self._report_imported_documents(result.bank_id, archive, result.fact_unit_ids, {}, context)
+            if not result.cancelled:
+                # Restored documents are reported like imported ones. Only here, not in
+                # import_bank_async: a clone reuses that restore, but copies documents the
+                # tenant already has rather than bringing in new ones.
+                await self._report_imported_documents(result.bank_id, archive, result.fact_unit_ids, {}, context)
+
+        if result.cancelled:
+            logger.info(
+                "Bank import operation %s cancelled; skipping completion metadata and archive cleanup", operation_id
+            )
+            return
 
         if operation_id:
             counts = {
@@ -4447,6 +4512,9 @@ class MemoryEngine(MemoryEngineInterface):
                 archive.write(chunk)
             archive_byte_size = archive.tell()
             archive.seek(0)
+            if operation_id and not await self._check_op_alive(operation_id):
+                logger.info("Clone bank operation %s cancelled before restore phase", operation_id)
+                return
             result = await self.import_bank_async(
                 archive,
                 context,
@@ -4454,6 +4522,10 @@ class MemoryEngine(MemoryEngineInterface):
                 scope=scope,
                 operation_id=operation_id,
             )
+
+        if result.cancelled:
+            logger.info("Clone bank operation %s cancelled; skipping completion metadata", operation_id)
+            return
 
         if operation_id:
             counts = {
@@ -4507,29 +4579,36 @@ class MemoryEngine(MemoryEngineInterface):
         except Exception:
             logger.warning("Failed to delete export archive %s", storage_key, exc_info=True)
 
+    async def _delete_operation_import_archive(self, task_payload: Any) -> None:
+        """Best-effort delete of a cancelled/failed import operation's staged ZIP."""
+        payload = _parse_json_dict(task_payload)
+        storage_key = payload.get("storage_key")
+        if not storage_key:
+            return
+        try:
+            await self._file_storage.delete(storage_key)
+        except Exception:
+            logger.warning("Failed to delete import archive %s", storage_key, exc_info=True)
+
     async def purge_expired_export_archives(self, conn: Any, table: str, cutoff: Any, *, batch_size: int) -> int:
-        """Delete stored archives of export operations retention is about to prune.
+        """Delete stored archives of export and failed/cancelled import operations retention is about to prune.
 
         Mirrors ``prune_terminal_operations``' predicate (terminal status +
-        ``updated_at < cutoff``), ordering and batch bound, so an export's archive
+        ``updated_at < cutoff``), ordering and batch bound, so a stored archive
         is removed in step with its operation row instead of being orphaned in file
         storage when the row is pruned. Called by the maintenance sweep before the
         row prune, on the same (schema-scoped) connection. Returns the number of
         archives deleted.
-
-        The bound is what keeps this proportionate. The prune deletes at most
-        ``batch_size`` rows per run, but an unbounded purge re-selects *every*
-        expired export on every run and re-issues a file-storage delete for each —
-        ``storage_key`` stays in ``result_metadata`` until the row itself is pruned,
-        so there is nothing to mark the blob as already gone. With a backlog that
-        is one redundant round-trip to the blob store per expired export per cycle,
-        per process. Sharing the prune's ``ORDER BY updated_at, operation_id``
-        window makes the two advance together instead.
         """
         rows = await conn.fetch(
-            f"""SELECT result_metadata FROM {table}
-                WHERE operation_type IN ('export_documents', 'export_bank')
-                  AND status IN ('completed', 'failed', 'cancelled')
+            f"""SELECT operation_type, status, result_metadata, task_payload FROM {table}
+                WHERE (
+                    (operation_type IN ('export_documents', 'export_bank')
+                     AND status IN ('completed', 'failed', 'cancelled'))
+                    OR
+                    (operation_type IN ('import_documents', 'import_bank')
+                     AND status IN ('failed', 'cancelled'))
+                )
                   AND updated_at < $1
                 ORDER BY updated_at, operation_id
                 LIMIT $2""",
@@ -4538,13 +4617,15 @@ class MemoryEngine(MemoryEngineInterface):
         )
         purged = 0
         for row in rows:
-            meta = row["result_metadata"]
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-            if isinstance(meta, dict) and meta.get("storage_key"):
+            op_type = row.get("operation_type")
+            if op_type in ("import_documents", "import_bank"):
+                payload = _parse_json_dict(row.get("task_payload"))
+                if payload.get("storage_key"):
+                    await self._delete_operation_import_archive(payload)
+                    purged += 1
+                continue
+            meta = _parse_json_dict(row.get("result_metadata"))
+            if meta.get("storage_key"):
                 await self._delete_operation_export_archive(meta)
                 purged += 1
         return purged
@@ -5360,6 +5441,14 @@ class MemoryEngine(MemoryEngineInterface):
                 # Task-owned retry: let the poller handle scheduling
                 raise
             except BankDeletedError as e:
+                target_bank_id = task_dict.get("target_bank_id")
+                if task_type in ("import_bank", "clone_bank") and target_bank_id and target_bank_id != bank_id:
+                    # Target bank deleted mid-restore; operation lives on source bank, so mark it failed.
+                    logger.info(f"Failing {task_type} (operation {operation_id}) after target bank delete: {e}")
+                    if operation_id:
+                        await self._mark_operation_failed(operation_id, str(e), "")
+                    audit_entry.response = {"status": "failed", "operation_id": operation_id}
+                    return
                 # The bank was deleted while this ran. Its operation row went with it, so there is
                 # nothing to mark: drop the job rather than retry it into a bank that is gone.
                 logger.info(f"Dropping {task_type} (operation {operation_id}): {e}")
@@ -5373,6 +5462,34 @@ class MemoryEngine(MemoryEngineInterface):
                 # and lose the "not a failure" semantics entirely.
                 raise
             except Exception as e:
+                if _is_foreign_key_violation(e):
+                    target_bank_id = task_dict.get("target_bank_id")
+                    for candidate_bank in (b for b in (bank_id, target_bank_id) if b):
+                        if not job_bank_bound(candidate_bank):
+                            continue
+                        try:
+                            await assert_job_bank_alive_on_pool(await self._get_backend(), candidate_bank)
+                        except BankDeletedError as bank_gone:
+                            if (
+                                task_type in ("import_bank", "clone_bank")
+                                and target_bank_id
+                                and candidate_bank == target_bank_id
+                                and target_bank_id != bank_id
+                            ):
+                                logger.info(
+                                    f"Failing {task_type} (operation {operation_id}) after FK violation on deleted target "
+                                    f"bank {candidate_bank}: {bank_gone}"
+                                )
+                                if operation_id:
+                                    await self._mark_operation_failed(operation_id, str(bank_gone), "")
+                                audit_entry.response = {"status": "failed", "operation_id": operation_id}
+                                return
+                            logger.info(
+                                f"Dropping {task_type} (operation {operation_id}) after FK violation on deleted bank "
+                                f"{candidate_bank}: {bank_gone}"
+                            )
+                            audit_entry.response = {"status": "dropped", "operation_id": operation_id}
+                            return
                 if is_embedding_model_mismatch(e):
                     # This server is on the embedding model a re-embed just replaced: not a
                     # failure of the task, and it clears once a server on the new model runs it.
@@ -5394,7 +5511,12 @@ class MemoryEngine(MemoryEngineInterface):
                 # to the offending call site, and under production log volume the
                 # stderr copy is unattributed and rotates away first (issue #3218).
                 error_message = format_task_error(e)
-                logger.error(f"Task execution failed: {task_type}, error: {error_message}", exc_info=True)
+                # Retried tasks need an operation id here: RetryTaskAt bypasses
+                # the poller's generic failure log, losing that correlation.
+                logger.error(
+                    f"Task execution failed: {task_type}, operation_id: {operation_id}, error: {error_message}",
+                    exc_info=True,
+                )
                 import traceback
 
                 error_traceback = traceback.format_exc()
@@ -6658,10 +6780,24 @@ class MemoryEngine(MemoryEngineInterface):
                     # unnecessary; run sequentially via the backend's own runner.
                     # normalize_schema() maps PG's "public" default to None (the
                     # connecting user's schema) on Oracle.
+                    from ..migrations import ensure_embedding_dimension
+                    from .memories import get_memories
+
                     for tenant in tenants:
                         if tenant.schema:
-                            self._backend.run_migrations(
-                                self.db_url, schema=self._backend.normalize_schema(tenant.schema)
+                            schema = self._backend.normalize_schema(tenant.schema)
+                            self._backend.run_migrations(self.db_url, schema=schema)
+                            # The Oracle baseline declares VECTOR(384); reconcile it with the model
+                            # like the PG path does. It alters tables, so it runs as the migration
+                            # user when one is configured. Its DDL (index rebuilds included) can take
+                            # a while on Autonomous Database, so it runs off the event loop, as the
+                            # PG path does.
+                            await asyncio.to_thread(
+                                ensure_embedding_dimension,
+                                config.migration_database_url or self.db_url,
+                                self.embeddings.dimension,
+                                schema=schema,
+                                store_owned_memories=get_memories().store_owned,
                             )
                 logger.info("Schema migrations completed")
             # PG only: the maintenance routines it installs are PG functions, and the
@@ -9390,6 +9526,58 @@ class MemoryEngine(MemoryEngineInterface):
                         written[document_id] = [record.short_id for record in stored if record.newly_stored]
         return written
 
+    async def _cleanup_partial_restored_bank(
+        self,
+        bank_id: str,
+        expected_internal_id: str | None,
+        request_context: "RequestContext",
+        operation_id: str | None,
+    ) -> None:
+        """Delete a partially restored bank only if it still carries ``expected_internal_id``.
+
+        The internal_id check runs inside delete_bank's transaction, under the bank-row lock.
+        It used to be a separate SELECT before the delete, so a bank recreated under the same
+        name in between could be deleted as if it were the partial restore.
+        """
+        try:
+            backend = await self._get_backend()
+            logger.info("[transfer] Discarding partial restored bank %s after cancellation", bank_id)
+            deleted = await self.delete_bank(
+                bank_id,
+                request_context=request_context,
+                _signal_in_flight=False,
+                _expected_internal_id=expected_internal_id,
+            )
+            if not deleted.get("bank_deleted"):
+                logger.info(
+                    "[transfer] Partial restored bank %s is gone or was replaced (expected internal_id=%s); "
+                    "nothing discarded",
+                    bank_id,
+                    expected_internal_id,
+                )
+                return
+            if operation_id:
+                async with acquire_with_retry(backend) as conn:
+                    raw_meta = await conn.fetchval(
+                        f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                        uuid.UUID(operation_id),
+                    )
+                    meta = _parse_json_dict(raw_meta)
+                    changed = False
+                    for key in ("restored_bank_id", "restored_bank_internal_id"):
+                        if key in meta:
+                            meta.pop(key)
+                            changed = True
+                    if changed:
+                        await conn.execute(
+                            f"UPDATE {fq_table('async_operations')} SET result_metadata = $1::jsonb "
+                            f"WHERE operation_id = $2",
+                            json.dumps(meta, default=_json_default),
+                            uuid.UUID(operation_id),
+                        )
+        except Exception:
+            logger.warning("Failed to clean up partial restored bank %s", bank_id, exc_info=True)
+
     async def import_bank_async(
         self,
         archive: "Archive",
@@ -9422,28 +9610,49 @@ class MemoryEngine(MemoryEngineInterface):
         bank_id = target_bank_id or read_bank_manifest(archive).source_bank_id
 
         on_bank_created = None
+        created_internal_id: str | None = None
         if operation_id:
             operations = fq_table("async_operations")
             async with acquire_with_retry(backend) as conn:
-                metadata = conn.parse_json(
-                    await conn.fetchval(
-                        f"SELECT result_metadata FROM {operations} WHERE operation_id = $1", uuid.UUID(operation_id)
+                metadata = _parse_json_dict(
+                    conn.parse_json(
+                        await conn.fetchval(
+                            f"SELECT result_metadata FROM {operations} WHERE operation_id = $1", uuid.UUID(operation_id)
+                        )
                     )
                 )
             # Only a bank this operation created, and only if it is still there (someone
             # may have deleted the leftovers by hand before the retry ran).
-            if (metadata or {}).get("restored_bank_id") == bank_id and (
+            if metadata.get("restored_bank_id") == bank_id and (
                 await bank_utils.get_bank_profile_if_exists(backend, bank_id) is not None
             ):
-                logger.info("[transfer] Retrying operation %s: discarding partial restore of %s", operation_id, bank_id)
-                await self.delete_bank(bank_id, request_context=request_context)
+                expected_id = metadata.get("restored_bank_internal_id")
+                if expected_id is not None:
+                    await self._cleanup_partial_restored_bank(bank_id, str(expected_id), request_context, operation_id)
+                else:
+                    logger.info(
+                        "[transfer] Retrying operation %s: discarding partial restore of %s", operation_id, bank_id
+                    )
+                    await self.delete_bank(bank_id, request_context=request_context, _signal_in_flight=False)
 
             async def on_bank_created(conn: Any) -> None:
+                nonlocal created_internal_id
+                internal_id = await conn.fetchval(
+                    f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1",
+                    bank_id,
+                )
+                created_internal_id = str(internal_id) if internal_id is not None else None
+                raw_meta = await conn.fetchval(
+                    f"SELECT result_metadata FROM {operations} WHERE operation_id = $1",
+                    uuid.UUID(operation_id),
+                )
+                meta = _parse_json_dict(raw_meta)
+                meta["restored_bank_id"] = bank_id
+                if created_internal_id is not None:
+                    meta["restored_bank_internal_id"] = created_internal_id
                 await conn.execute(
-                    f"UPDATE {operations} "
-                    f"SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $1::jsonb "
-                    f"WHERE operation_id = $2",
-                    json.dumps({"restored_bank_id": bank_id}),
+                    f"UPDATE {operations} SET result_metadata = $1::jsonb WHERE operation_id = $2",
+                    json.dumps(meta, default=_json_default),
                     uuid.UUID(operation_id),
                 )
 
@@ -9467,20 +9676,30 @@ class MemoryEngine(MemoryEngineInterface):
             # an imported bank classified as regular (#3236).
             return await self._config_resolver.resolve_full_config(bank_id, request_context)
 
-        return await import_bank(
-            backend=backend,
-            embeddings_model=self.embeddings,
-            entity_resolver=self.entity_resolver,
-            resolve_config=_resolve_restored_config,
-            format_date_fn=self._format_readable_date,
-            archive=archive,
-            target_bank_id=target_bank_id,
-            scope=scope,
-            # Attachment bytes ride in the archive; the target writes them to its
-            # own storage under its own keys (see transfer._restore_attachments).
-            file_storage=self._file_storage,
-            on_bank_created=on_bank_created,
-        )
+        try:
+            result = await import_bank(
+                backend=backend,
+                embeddings_model=self.embeddings,
+                entity_resolver=self.entity_resolver,
+                resolve_config=_resolve_restored_config,
+                format_date_fn=self._format_readable_date,
+                archive=archive,
+                target_bank_id=target_bank_id,
+                scope=scope,
+                # Attachment bytes ride in the archive; the target writes them to its
+                # own storage under its own keys (see transfer._restore_attachments).
+                file_storage=self._file_storage,
+                on_bank_created=on_bank_created,
+                check_alive=(lambda: self._check_op_alive(operation_id)) if operation_id else None,
+            )
+        except asyncio.CancelledError:
+            if created_internal_id is not None:
+                await self._cleanup_partial_restored_bank(bank_id, created_internal_id, request_context, operation_id)
+            raise
+
+        if result.cancelled and created_internal_id is not None:
+            await self._cleanup_partial_restored_bank(bank_id, created_internal_id, request_context, operation_id)
+        return result
 
     async def import_documents_async(
         self,
@@ -9637,6 +9856,8 @@ class MemoryEngine(MemoryEngineInterface):
         # point rejects anything else, and the task path replays a value it wrote itself.
         on_conflict: "OnConflict",
         request_context: "RequestContext",
+        *,
+        operation_id: str | None = None,
     ) -> "ImportResult":
         """Run the deterministic import inline (shared by the worker handler).
 
@@ -9660,6 +9881,42 @@ class MemoryEngine(MemoryEngineInterface):
         outbox_factory = self._build_retain_outbox_callback_factory(
             bank_id=bank_id, operation_id=None, schema=_current_schema.get()
         )
+        from .transfer.importer import ImportCheckpoint
+
+        checkpoint: ImportCheckpoint | None = None
+        if operation_id:
+            try:
+                async with acquire_with_retry(backend) as conn:
+                    raw_meta = await conn.fetchval(
+                        f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                        uuid.UUID(operation_id),
+                    )
+                raw_checkpoint = _parse_json_dict(raw_meta).get("_import_checkpoint")
+                # A checkpoint from before document_targets existed still parses (missing fields
+                # default), so an operation started on the older build resumes as it did then.
+                checkpoint = ImportCheckpoint.model_validate(_parse_json_dict(raw_checkpoint))
+            except Exception:
+                logger.debug("Failed to load import checkpoint for operation %s", operation_id, exc_info=True)
+            if checkpoint is None:
+                checkpoint = ImportCheckpoint()
+
+        async def _save_import_checkpoint(progress: ImportCheckpoint) -> None:
+            if not operation_id:
+                return
+            op_uuid = uuid.UUID(operation_id)
+            async with acquire_with_retry(backend) as conn:
+                raw_meta = await conn.fetchval(
+                    f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                    op_uuid,
+                )
+                merged_meta = _parse_json_dict(raw_meta)
+                merged_meta["_import_checkpoint"] = progress.model_dump(mode="json")
+                await conn.execute(
+                    f"UPDATE {fq_table('async_operations')} SET result_metadata = $1::jsonb WHERE operation_id = $2",
+                    json.dumps(merged_meta, default=_json_default),
+                    op_uuid,
+                )
+
         result = await import_documents(
             backend=backend,
             embeddings_model=self.embeddings,
@@ -9670,7 +9927,18 @@ class MemoryEngine(MemoryEngineInterface):
             archive=archive,
             on_conflict=on_conflict,
             outbox_callback_factory=outbox_factory,
+            check_alive=(lambda: self._check_op_alive(operation_id)) if operation_id else None,
+            checkpoint=checkpoint,
+            on_checkpoint=_save_import_checkpoint if operation_id else None,
         )
+
+        if result.cancelled:
+            logger.info(
+                "Document import cancelled for bank %s (operation %s); skipping post-import maintenance",
+                bank_id,
+                operation_id,
+            )
+            return result
 
         await self._report_imported_documents(
             bank_id, archive, result.fact_unit_ids, result.remapped_document_ids, request_context
@@ -12582,6 +12850,12 @@ class MemoryEngine(MemoryEngineInterface):
         # A knowledge bank is deleted through here for its rows, but it answers to the validator's
         # knowledge-bank hooks (run by the knowledge service), never to the memory-bank ones.
         _knowledge_bank: bool = False,
+        _signal_in_flight: bool = True,
+        # Delete only if the bank row still carries this internal_id. Checked under the bank-row
+        # lock inside the delete transaction, so a bank recreated under the same name between a
+        # caller's own check and this call is never mistaken for the one it meant (the partial
+        # restore cleanup). A mismatch deletes nothing and returns without "bank_deleted".
+        _expected_internal_id: str | None = None,
     ) -> dict[str, int]:
         """
         Delete all data for a specific agent (multi-tenant cleanup).
@@ -12617,7 +12891,30 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankWriteOperation.DELETE_BANK, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
+        # Resolved before the in-flight gate below is taken: everything between taking the gate
+        # and the try/finally that releases it must not raise, or interrupted tasks would wait
+        # out the full reconcile timeout on a gate nobody releases.
         backend = await self._get_backend()
+        delete_schema = _current_schema.get()
+        delete_gate_acquired = False
+        if (
+            _signal_in_flight
+            and not fact_type
+            and delete_bank_profile
+            and self._active_bank_operations_canceller is not None
+        ):
+            try:
+                cancelled_in_flight = self._active_bank_operations_canceller(
+                    bank_id, delete_schema, track_delete_gate=True
+                )
+                delete_gate_acquired = True
+                if cancelled_in_flight:
+                    logger.info(
+                        f"Signalled {cancelled_in_flight} in-flight task(s) for bank {bank_id} before delete_bank"
+                    )
+            except Exception as e:
+                logger.debug(f"In-flight bank task cancellation hook failed for {bank_id}: {e}")
+
         invalidated_obs = 0
         result: dict[str, int] = {}
         bank_internal_id: str | None = None
@@ -12629,171 +12926,233 @@ class MemoryEngine(MemoryEngineInterface):
         # post-commit gate sits outside the transaction that fetches the row.
         bank_present = False
         freed_aliases: list[str] = []
-        async with acquire_with_retry(backend) as conn:
-            # Ensure connection is not in read-only mode (can happen with connection poolers)
-            await conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
-            async with conn.transaction():
-                try:
-                    # Match delete_document's bank-before-data order. Otherwise a
-                    # bank delete could hold its documents while waiting for the
-                    # bank row held by a concurrent document delete.
-                    bank_row = await conn.fetchrow(
-                        f"SELECT bank_id FROM {fq_table('banks')} WHERE bank_id = $1 FOR NO KEY UPDATE",
-                        bank_id,
-                    )
-                    bank_present = bank_row is not None
-                    from .memories import get_memories as _get_memories_for_delete
-                    from .memories.base import BankContentCounts, TypedMemoryScope
+        committed = False
+        replaced_or_gone = False
 
-                    _del_store = _get_memories_for_delete()
-                    # Counted where the memories live: for a bank whose memories, documents and
-                    # entity registry are outside SQL the Postgres tables are empty, and a count
-                    # read there reported deleting nothing while dropping everything (#4307). A
-                    # store-owned bank that was never created is not asked at all (see above).
-                    _ask_store = bank_present or not _del_store.store_owned_for(bank_id)
-                    if fact_type:
-                        # For source memory types, capture ids so we can invalidate
-                        # dependent observations AFTER the delete below. Running the
-                        # stale-observation sweep post-delete ensures we also catch
-                        # observations inserted concurrently by consolidation. The ids come
-                        # from wherever the memories live, or the sweep would silently skip.
-                        _scope = (
-                            await _del_store.bank_memories_of_type(
-                                conn=conn, fq_table=fq_table, bank_id=bank_id, fact_type=fact_type
-                            )
-                            if _ask_store
-                            else TypedMemoryScope()
+        async def _delete_tx() -> None:
+            nonlocal invalidated_obs, result, bank_internal_id, legacy_files, bank_present, freed_aliases, committed
+            nonlocal replaced_or_gone
+            if committed:
+                return
+            attempt_invalidated_obs = 0
+            attempt_result: dict[str, int] = {}
+            attempt_bank_internal_id: str | None = None
+            attempt_legacy_files: list[str] = []
+            attempt_bank_present = False
+            attempt_freed_aliases: list[str] = []
+            try:
+                async with acquire_with_retry(backend) as conn:
+                    # Ensure connection is not in read-only mode (can happen with connection poolers)
+                    await conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
+                    async with conn.transaction():
+                        # Match delete_document's bank-before-data order. Otherwise a
+                        # bank delete could hold its documents while waiting for the
+                        # bank row held by a concurrent document delete.
+                        bank_row = await conn.fetchrow(
+                            f"SELECT bank_id, internal_id FROM {fq_table('banks')} "
+                            f"WHERE bank_id = $1 FOR NO KEY UPDATE",
+                            bank_id,
                         )
-                        unit_ids = _scope.unit_ids
-                        units_count = _scope.count
-                        # Sweep before the delete as well, in the sweep's lock order (see delete_document).
-                        if unit_ids:
-                            invalidated_obs = await self._delete_stale_observations_for_memories(
-                                conn, bank_id, unit_ids
+                        if _expected_internal_id is not None and (
+                            bank_row is None or str(bank_row["internal_id"]) != str(_expected_internal_id)
+                        ):
+                            # Nothing written yet: committing here only releases the row lock.
+                            replaced_or_gone = True
+                            committed = True
+                            return
+                        attempt_bank_present = bank_row is not None
+                        from .memories import get_memories as _get_memories_for_delete
+                        from .memories.base import BankContentCounts, TypedMemoryScope
+
+                        _del_store = _get_memories_for_delete()
+                        # Counted where the memories live: for a bank whose memories, documents and
+                        # entity registry are outside SQL the Postgres tables are empty, and a count
+                        # read there reported deleting nothing while dropping everything (#4307). A
+                        # store-owned bank that was never created is not asked at all (see above).
+                        _ask_store = attempt_bank_present or not _del_store.store_owned_for(bank_id)
+                        if fact_type:
+                            # For source memory types, capture ids so we can invalidate
+                            # dependent observations AFTER the delete below. Running the
+                            # stale-observation sweep post-delete ensures we also catch
+                            # observations inserted concurrently by consolidation. The ids come
+                            # from wherever the memories live, or the sweep would silently skip.
+                            _scope = (
+                                await _del_store.bank_memories_of_type(
+                                    conn=conn, fq_table=fq_table, bank_id=bank_id, fact_type=fact_type
+                                )
+                                if _ask_store
+                                else TypedMemoryScope()
                             )
-                        # Delete only memories of a specific fact type, live and archived. A store
-                        # that owns its memories is told after the commit (delete_where below).
-                        await _del_store.delete_bank_memories_of_type(
-                            conn=conn,
-                            ops=self._backend.ops,
-                            fq_table=fq_table,
-                            bank_id=bank_id,
-                            fact_type=fact_type,
-                            unit_ids=unit_ids,
-                        )
-                        # Deleting observations directly (fact_type='observation') bypasses the
-                        # stale-observation sweep below — unit_ids is only filled for source types —
-                        # and history no longer cascades from memory_units (that FK was dropped), so
-                        # drop the observations' snapshots explicitly. All history in the bank belongs
-                        # to observations, and this branch removes them all.
-                        if fact_type == "observation":
-                            await conn.execute(
-                                f"DELETE FROM {fq_table('observation_history')} WHERE bank_id = $1",
-                                bank_id,
+                            unit_ids = _scope.unit_ids
+                            units_count = _scope.count
+                            # Sweep before the delete as well, in the sweep's lock order (see delete_document).
+                            if unit_ids:
+                                attempt_invalidated_obs = await self._delete_stale_observations_for_memories(
+                                    conn, bank_id, unit_ids
+                                )
+                            # Delete only memories of a specific fact type, live and archived. A store
+                            # that owns its memories is told after the commit (delete_where below).
+                            await _del_store.delete_bank_memories_of_type(
+                                conn=conn,
+                                ops=self._backend.ops,
+                                fq_table=fq_table,
+                                bank_id=bank_id,
+                                fact_type=fact_type,
+                                unit_ids=unit_ids,
                             )
-
-                        if unit_ids:
-                            invalidated_obs += await self._delete_stale_observations_for_memories(
-                                conn, bank_id, unit_ids
-                            )
-
-                        # Note: We don't delete entities when fact_type is specified,
-                        # as they may be referenced by other memory units
-                        result = {"memory_units_deleted": units_count, "entities_deleted": 0}
-                    else:
-                        # Delete all data for the bank — observations are included, no invalidation needed
-                        _contents = (
-                            await _del_store.count_bank_contents(conn=conn, fq_table=fq_table, bank_id=bank_id)
-                            if _ask_store
-                            else BankContentCounts()
-                        )
-                        units_count = _contents.memory_units
-                        entities_count = _contents.entities
-                        documents_count = _contents.documents
-
-                        # The bank's rows go, and with them the only record of its pre-tenant-prefix
-                        # file keys, which the store reads first for the sweep after the commit.
-                        legacy_files = await _del_store.purge_bank_rows(conn=conn, fq_table=fq_table, bank_id=bank_id)
-
-                        # Sweep extension-owned bank-scoped tables (audit receipts,
-                        # per-bank policy state, ...). These scope by bank_id without
-                        # a cascading FK to banks, so deleting the bank row below
-                        # would otherwise leave them as orphaned rows.
-                        extra_tables = self._tenant_extension.extra_bank_tables() if self._tenant_extension else []
-                        if extra_tables:
-                            for spec in extra_tables:
-                                if not spec.delete_with_bank:
-                                    continue
-                                qualified = fq_table(spec.name)
-                                # PG-only existence guard: a declared-but-unprovisioned
-                                # table must not abort the whole bank delete. (to_regclass
-                                # is PG syntax; extension bank tables are a PG feature.)
-                                if (
-                                    not _is_oracle()
-                                    and await conn.fetchval("SELECT to_regclass($1)", qualified) is None
-                                ):
-                                    continue
-                                await conn.execute(f"DELETE FROM {qualified} WHERE {spec.bank_id_column} = $1", bank_id)
-
-                        result = {
-                            "memory_units_deleted": units_count,
-                            "entities_deleted": entities_count,
-                            "documents_deleted": documents_count,
-                        }
-
-                        if delete_bank_profile:
-                            # The bank's request history holds its prompts and model output (memory
-                            # text included) and has no FK to banks, so it goes with the bank rather
-                            # than waiting for the retention sweep (#5839). PG-only table.
-                            from .llm_trace import (  # noqa: PLC0415
-                                _llm_requests_persistable,
-                                llm_requests_locked_in_id_order,
-                            )
-
-                            if _llm_requests_persistable():
-                                _llm_table = fq_table("llm_requests")
+                            # Deleting observations directly (fact_type='observation') bypasses the
+                            # stale-observation sweep below — unit_ids is only filled for source types —
+                            # and history no longer cascades from memory_units (that FK was dropped), so
+                            # drop the observations' snapshots explicitly. All history in the bank belongs
+                            # to observations, and this branch removes them all.
+                            if fact_type == "observation":
                                 await conn.execute(
-                                    f"{llm_requests_locked_in_id_order(_llm_table, 'bank_id = $1')} "
-                                    f"DELETE FROM {_llm_table} t USING target WHERE t.id = target.id",
+                                    f"DELETE FROM {fq_table('observation_history')} WHERE bank_id = $1",
                                     bank_id,
                                 )
-                            # The FK cascade drops these, but resolve() caches them: their
-                            # names are evicted after commit, or a write to one would recreate
-                            # this bank instead of creating a bank under the freed name.
-                            freed_aliases = [
-                                row["alias"]
-                                for row in await conn.fetch(
-                                    f"SELECT alias FROM {fq_table('bank_aliases')} WHERE bank_id = $1", bank_id
+
+                            if unit_ids:
+                                attempt_invalidated_obs += await self._delete_stale_observations_for_memories(
+                                    conn, bank_id, unit_ids
                                 )
-                            ]
-                            # Delete the bank profile and retrieve internal_id for HNSW index cleanup
-                            internal_id = await conn.fetchval(
-                                f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1 RETURNING internal_id", bank_id
+
+                            # Note: We don't delete entities when fact_type is specified,
+                            # as they may be referenced by other memory units
+                            attempt_result = {"memory_units_deleted": units_count, "entities_deleted": 0}
+                        else:
+                            # Delete all data for the bank — observations are included, no invalidation needed
+                            _contents = (
+                                await _del_store.count_bank_contents(conn=conn, fq_table=fq_table, bank_id=bank_id)
+                                if _ask_store
+                                else BankContentCounts()
                             )
-                            if internal_id:
-                                bank_internal_id = str(internal_id)
-                            result["bank_deleted"] = True
+                            units_count = _contents.memory_units
+                            entities_count = _contents.entities
+                            documents_count = _contents.documents
 
+                            # The bank's rows go, and with them the only record of its pre-tenant-prefix
+                            # file keys, which the store reads first for the sweep after the commit.
+                            attempt_legacy_files = await _del_store.purge_bank_rows(
+                                conn=conn, fq_table=fq_table, bank_id=bank_id
+                            )
+
+                            # Sweep extension-owned bank-scoped tables (audit receipts,
+                            # per-bank policy state, ...). These scope by bank_id without
+                            # a cascading FK to banks, so deleting the bank row below
+                            # would otherwise leave them as orphaned rows.
+                            extra_tables = self._tenant_extension.extra_bank_tables() if self._tenant_extension else []
+                            if extra_tables:
+                                for spec in extra_tables:
+                                    if not spec.delete_with_bank:
+                                        continue
+                                    qualified = fq_table(spec.name)
+                                    # PG-only existence guard: a declared-but-unprovisioned
+                                    # table must not abort the whole bank delete. (to_regclass
+                                    # is PG syntax; extension bank tables are a PG feature.)
+                                    if (
+                                        not _is_oracle()
+                                        and await conn.fetchval("SELECT to_regclass($1)", qualified) is None
+                                    ):
+                                        continue
+                                    await conn.execute(
+                                        f"DELETE FROM {qualified} WHERE {spec.bank_id_column} = $1", bank_id
+                                    )
+
+                            attempt_result = {
+                                "memory_units_deleted": units_count,
+                                "entities_deleted": entities_count,
+                                "documents_deleted": documents_count,
+                            }
+
+                            if delete_bank_profile:
+                                # The bank's request history holds its prompts and model output (memory
+                                # text included) and has no FK to banks, so it goes with the bank rather
+                                # than waiting for the retention sweep (#5839). PG-only table.
+                                from .llm_trace import (  # noqa: PLC0415
+                                    _llm_requests_persistable,
+                                    llm_requests_locked_in_id_order,
+                                )
+
+                                if _llm_requests_persistable():
+                                    _llm_table = fq_table("llm_requests")
+                                    await conn.execute(
+                                        f"{llm_requests_locked_in_id_order(_llm_table, 'bank_id = $1')} "
+                                        f"DELETE FROM {_llm_table} t USING target WHERE t.id = target.id",
+                                        bank_id,
+                                    )
+                                # The FK cascade drops these, but resolve() caches them: their
+                                # names are evicted after commit, or a write to one would recreate
+                                # this bank instead of creating a bank under the freed name.
+                                attempt_freed_aliases = [
+                                    row["alias"]
+                                    for row in await conn.fetch(
+                                        f"SELECT alias FROM {fq_table('bank_aliases')} WHERE bank_id = $1", bank_id
+                                    )
+                                ]
+                                # Delete the bank profile and retrieve internal_id for HNSW index cleanup
+                                internal_id = await conn.fetchval(
+                                    f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1 RETURNING internal_id", bank_id
+                                )
+                                if internal_id:
+                                    attempt_bank_internal_id = str(internal_id)
+                                attempt_result["bank_deleted"] = True
+
+                    invalidated_obs = attempt_invalidated_obs
+                    result = attempt_result
+                    bank_internal_id = attempt_bank_internal_id
+                    legacy_files = attempt_legacy_files
+                    bank_present = attempt_bank_present
+                    freed_aliases = attempt_freed_aliases
+                    if not _is_oracle():
+                        committed = True
+                committed = True
+            except Exception as post_err:
+                if committed:
+                    logger.warning(
+                        f"Post-commit connection release failed during delete_bank({bank_id}); skipping retry: "
+                        f"{post_err!r}"
+                    )
+                    return
+                raise
+
+        try:
+            await retry_with_backoff(_delete_tx, max_retries=5, max_delay=5.0)
+        except Exception as e:
+            # Name the type: a lock-wait timeout or cancellation has an empty str(), and
+            # the message alone then says nothing about what went wrong (#5805).
+            raise Exception(f"Failed to delete agent data: {type(e).__name__}: {e}") from e
+        finally:
+            if delete_gate_acquired and self._finish_bank_delete is not None:
+                try:
+                    self._finish_bank_delete(bank_id, delete_schema)
                 except Exception as e:
-                    # Name the type: a lock-wait timeout or cancellation has an empty str(), and
-                    # the message alone then says nothing about what went wrong (#5805).
-                    raise Exception(f"Failed to delete agent data: {type(e).__name__}: {e}") from e
+                    logger.debug(f"Failed to release bank-delete gate for {bank_id}: {e}")
 
-            # Drop per-bank vector indexes AFTER the transaction commits: the
-            # drop runs CONCURRENTLY (see ops.drop_bank_vector_indexes), which
-            # cannot run inside a transaction block. Same-process drops are
-            # serialized by the ops-level DDL lock; retry_with_backoff absorbs
-            # the residual cross-process deadlock a concurrent index build/drop
-            # on the shared memory_units table can still trigger (sqlstate
-            # 40P01 / ORA-00060) so a delete is never lost to a transient lock
-            # cycle. Sized well above the defaults: a many-process delete storm
-            # (CI teardown ran 8 workers' drops at once) drains at roughly one
-            # deadlock victim per deadlock_timeout (1s), so the default ~2.4s
-            # of backoff lost every retry; ~30s of jittered backoff outlasts
-            # any realistic pile-up.
-            if bank_internal_id:
+        if replaced_or_gone:
+            # Skip every post-commit step: the prefix sweep and store drop below would otherwise
+            # remove the files and storage of the bank that now holds this name.
+            logger.info(
+                f"delete_bank({bank_id}) skipped: bank is gone or no longer has internal_id {_expected_internal_id}"
+            )
+            return {}
+
+        # Drop per-bank vector indexes AFTER the transaction commits: the
+        # drop runs CONCURRENTLY (see ops.drop_bank_vector_indexes), which
+        # cannot run inside a transaction block. Same-process drops are
+        # serialized by the ops-level DDL lock; retry_with_backoff absorbs
+        # the residual cross-process deadlock a concurrent index build/drop
+        # on the shared memory_units table can still trigger (sqlstate
+        # 40P01 / ORA-00060) so a delete is never lost to a transient lock
+        # cycle. Sized well above the defaults: a many-process delete storm
+        # (CI teardown ran 8 workers' drops at once) drains at roughly one
+        # deadlock victim per deadlock_timeout (1s), so the default ~2.4s
+        # of backoff lost every retry; ~30s of jittered backoff outlasts
+        # any realistic pile-up.
+        if bank_internal_id:
+            internal_id_to_drop = bank_internal_id
+            async with acquire_with_retry(backend) as conn:
                 await retry_with_backoff(
-                    lambda: bank_utils.drop_bank_vector_indexes(conn, bank_internal_id, ops=self._backend.ops),
+                    lambda: bank_utils.drop_bank_vector_indexes(conn, internal_id_to_drop, ops=self._backend.ops),
                     max_retries=7,
                     max_delay=10.0,
                 )
@@ -19251,6 +19610,7 @@ class MemoryEngine(MemoryEngineInterface):
                 usage=reflect_result.usage or TokenUsage(),
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 warnings=warnings,
+                delta_ops_transient_failure=delta_ops_transient_failure,
             )
 
         # Delta-mode path: emit structured operations against the existing
@@ -19259,6 +19619,7 @@ class MemoryEngine(MemoryEngineInterface):
         # drift is structurally impossible. Falls back to the full candidate
         # markdown if either the structuring or the LLM op call fails.
         from .reflect.delta_ops import (
+            RetractionOperationList,
             apply_operations,
             request_delta_operations,
         )
@@ -19282,6 +19643,7 @@ class MemoryEngine(MemoryEngineInterface):
         # one flag let a failed new-facts delta write the unsay-only document and move
         # the watermark past the facts it never added (#6447).
         unsay_applied = False
+        delta_ops_transient_failure = False
         delta_operations: MentalModelDeltaOperations | None = None
         # Both op calls share one LLM handle, built on first use so a refresh that
         # neither retracts nor has new facts still pays no config resolution.
@@ -19340,6 +19702,9 @@ class MemoryEngine(MemoryEngineInterface):
                             system_prompt=STRUCTURED_RETRACTION_SYSTEM_PROMPT,
                             user_prompt=unsay_prompt,
                             scope="mental_model_retraction_ops",
+                            response_format=RetractionOperationList,
+                            strict_schema=get_config().llm_strict_schema_reflect,
+                            skip_validation=True,
                             max_completion_tokens=get_config().reflect_max_completion_tokens,
                             temperature=get_config().llm_temperature_mental_model_refresh,
                         )
@@ -19536,6 +19901,7 @@ class MemoryEngine(MemoryEngineInterface):
                         f"({exc}); delta operations were not applied"
                     )
                     mode_fallback_reason = "delta_ops_failed"
+                    delta_ops_transient_failure = is_transient_remote_error(exc)
 
             # The unsay ops edited the same document, in the same refresh, before the
             # new-facts ops did — so they belong in the same log, in that order.
@@ -19888,7 +20254,12 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
             async def _preserve_and_fail(
-                *, reason: RefreshFailureReason, outcome: RefreshOperationOutcome, detail: str, retryable: bool = True
+                *,
+                reason: RefreshFailureReason,
+                outcome: RefreshOperationOutcome,
+                detail: str,
+                retryable: bool = True,
+                pause_automatic: bool = True,
             ) -> NoReturn:
                 """Fail the refresh without touching the document.
 
@@ -19932,6 +20303,7 @@ class MemoryEngine(MemoryEngineInterface):
                     outcome=outcome,
                     failure_reason=reason,
                     error_message=detail,
+                    pause_automatic=pause_automatic,
                 )
                 raise MentalModelRefreshError(
                     f"Refresh failed for mental_model_id={mental_model_id}: {detail} "
@@ -19946,11 +20318,14 @@ class MemoryEngine(MemoryEngineInterface):
                     reason="empty_candidate",
                     outcome="refresh_failed_empty_candidate",
                     detail="the refresh produced empty content (likely an upstream LLM failure).",
+                    pause_automatic=not run.delta_ops_transient_failure,
                 )
 
             if run.outcome == "refresh_failed_delta_not_applied":
                 # #3112: the reflect candidate only covers the delta window, so it is
                 # not a document — see the guard in _execute_mental_model_refresh.
+                # #6674: a transient remote failure (429, 5xx, timeout) on the delta
+                # LLM call must not permanently pause automatic refresh.
                 await _preserve_and_fail(
                     reason=_delta_failure_reason(run.mode_fallback_reason),
                     outcome="refresh_failed_delta_not_applied",
@@ -19959,6 +20334,7 @@ class MemoryEngine(MemoryEngineInterface):
                         "memories newer than the last refresh, so writing it would drop the rest of the document. "
                         "If this keeps happening, set the model's refresh mode to full."
                     ),
+                    pause_automatic=not run.delta_ops_transient_failure,
                 )
 
             # Last check before readers get the document: the validator's verdict from
@@ -20527,36 +20903,35 @@ class MemoryEngine(MemoryEngineInterface):
                 if is_failure
                 else f"(content->>'kind' IS NULL OR content->>'kind' <> '{_MM_HISTORY_KIND_FAILURE}')"
             )
-            if getattr(conn, "backend_type", None) == "oracle":
-                # Oracle: number the rows once and delete past the cap, instead of
-                # checking every row against a NOT IN subquery that re-reads the
-                # CLOB predicate (#6771). Same order as idx_mm_history_model.
-                trim_sql = f"""
-                DELETE FROM {fq_table("mental_model_history")}
-                WHERE id IN (
-                    SELECT id FROM (
-                        SELECT id, ROW_NUMBER() OVER (ORDER BY changed_at DESC, id DESC) AS rn
-                        FROM {fq_table("mental_model_history")}
-                        WHERE mental_model_id = $1 AND bank_id = $2
-                          AND {kind_predicate}
-                    )
-                    WHERE rn > $3
+            if is_oracle_conn(conn):
+                from .memories.ora import engine_queries as oracle_engine_queries
+
+                await oracle_engine_queries.trim_mental_model_history(
+                    conn=conn,
+                    fq_table=fq_table,
+                    mental_model_id=mental_model_id,
+                    bank_id=bank_id,
+                    kind_predicate=kind_predicate,
+                    max_entries=max_entries,
                 )
-                """
             else:
-                trim_sql = f"""
-                DELETE FROM {fq_table("mental_model_history")}
-                WHERE mental_model_id = $1 AND bank_id = $2
-                  AND {kind_predicate}
-                  AND id NOT IN (
-                      SELECT id FROM {fq_table("mental_model_history")}
-                      WHERE mental_model_id = $1 AND bank_id = $2
-                        AND {kind_predicate}
-                      ORDER BY changed_at DESC, id DESC
-                      LIMIT $3
-                  )
-                """
-            await conn.execute(trim_sql, mental_model_id, bank_id, max_entries)
+                await conn.execute(
+                    f"""
+                    DELETE FROM {fq_table("mental_model_history")}
+                    WHERE mental_model_id = $1 AND bank_id = $2
+                      AND {kind_predicate}
+                      AND id NOT IN (
+                          SELECT id FROM {fq_table("mental_model_history")}
+                          WHERE mental_model_id = $1 AND bank_id = $2
+                            AND {kind_predicate}
+                          ORDER BY changed_at DESC, id DESC
+                          LIMIT $3
+                      )
+                    """,
+                    mental_model_id,
+                    bank_id,
+                    max_entries,
+                )
 
     async def _record_mental_model_refresh_failure(
         self,
@@ -22832,20 +23207,22 @@ class MemoryEngine(MemoryEngineInterface):
             total = total_row["total"] if total_row else 0
 
             # Get operations with pagination (include result_metadata to check for parent operations)
-            # Oracle: with only the bank filter, pin the (bank_id, created_at DESC) index so a
-            # peeked bind cannot settle on a full scan plus sort (#6771).
-            op_hint, op_alias = (
-                ("/*+ INDEX(ao idx_async_operations_bank_created_desc) */ ", " ao")
-                if getattr(conn, "backend_type", None) == "oracle" and len(where_conditions) == 1
-                else ("", "")
-            )
+            if is_oracle_conn(conn):
+                from .memories.ora import engine_queries as oracle_engine_queries
+
+                op_clauses = oracle_engine_queries.async_operations_list_clauses(
+                    single_condition=len(where_conditions) == 1
+                )
+                op_hint, op_order = op_clauses.hint, op_clauses.order_by
+            else:
+                op_hint, op_order = "", "ao.created_at DESC"
             operations = await conn.fetch(
                 f"""
-                SELECT {op_hint}operation_id, operation_type, created_at, updated_at, status, error_message,
-                       result_metadata, retry_count, next_retry_at
-                FROM {fq_table("async_operations")}{op_alias}
+                SELECT {op_hint}ao.operation_id, ao.operation_type, ao.created_at, ao.updated_at, ao.status,
+                       ao.error_message, ao.result_metadata, ao.retry_count, ao.next_retry_at
+                FROM {fq_table("async_operations")} ao
                 WHERE {where_clause}
-                ORDER BY created_at DESC
+                ORDER BY {op_order}
                 LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
                 """,
                 *params,
@@ -23063,6 +23440,20 @@ class MemoryEngine(MemoryEngineInterface):
                     "error_message": None,
                 }
 
+    def register_worker_cancellers(
+        self,
+        *,
+        cancel_operation: _OperationCanceller | None = None,
+        cancel_bank_operations: _BankOperationsCanceller | None = None,
+        finish_bank_delete: _BankDeleteFinisher | None = None,
+        is_operation_active: _OperationActiveChecker | None = None,
+    ) -> None:
+        """Register callbacks that inspect or cancel in-flight worker tasks in this process."""
+        self._active_operation_canceller = cancel_operation
+        self._active_bank_operations_canceller = cancel_bank_operations
+        self._finish_bank_delete = finish_bank_delete
+        self._is_operation_active = is_operation_active
+
     async def cancel_operation(
         self,
         bank_id: str,
@@ -23073,18 +23464,19 @@ class MemoryEngine(MemoryEngineInterface):
     ) -> dict[str, Any]:
         """Cancel a pending or in-flight async operation.
 
-        Cancellation is cooperative and never immediate: the row is flipped to
-        'cancelled' and the worker running it notices at its next checkpoint
-        (`_check_op_alive`), stopping after the batch/document it is on. An
-        operation whose worker died (SIGKILL, OOM) has no one to notice — the
-        flip is the whole fix there, and it is what unwedges a row stranded in
-        'processing' without hand-editing the database (issue #4131).
+        The row is flipped to 'cancelled' immediately. Workers interrupt in-flight
+        executions (immediately when hosted in-process, or on the poller's periodic
+        DB check) and also check `_check_op_alive` at batch checkpoints so already-
+        committed batches remain while remaining work is aborted. An operation whose
+        worker died (SIGKILL, OOM) has no one to notice — the flip itself unwedges
+        a row stranded in 'processing' without hand-editing the database (issue #4131).
 
         Every non-cancel status write in the worker is guarded against
         overwriting 'cancelled', so a task that runs to completion past the
         flip, or fails, cannot resurrect the row.
         """
         await self._authenticate_tenant(request_context)
+        cancel_schema = _current_schema.get()
         # ``_knowledge_bank``: called by the knowledge-bank service, which has already run the
         # knowledge-bank hook; the memory hooks and tag scopes never apply to a knowledge bank.
         if self._operation_validator and not _knowledge_bank:
@@ -23098,6 +23490,8 @@ class MemoryEngine(MemoryEngineInterface):
         backend = await self._get_backend()
 
         op_uuid = uuid.UUID(operation_id)
+        claimed_worker_id: str | None = None
+        claimed_at: Any = None
 
         async with acquire_with_retry(backend) as conn:
             # Check if operation exists, belongs to this bank, and is in a cancellable state
@@ -23122,7 +23516,8 @@ class MemoryEngine(MemoryEngineInterface):
             # and here wins the race rather than being reported as cancelled.
             updated = await conn.fetchrow(
                 f"UPDATE {fq_table('async_operations')} SET status = 'cancelled', updated_at = now() "
-                f"WHERE operation_id = $1 AND status IN ('pending', 'processing') RETURNING status",
+                f"WHERE operation_id = $1 AND status IN ('pending', 'processing') "
+                f"RETURNING status, worker_id, claimed_at",
                 op_uuid,
             )
             if updated is None:
@@ -23130,6 +23525,8 @@ class MemoryEngine(MemoryEngineInterface):
                     f"Operation {operation_id} cannot be cancelled: it reached a terminal state concurrently",
                     409,
                 )
+            claimed_worker_id = updated.get("worker_id")
+            claimed_at = updated.get("claimed_at")
 
             # If this was the last outstanding child of a batch_retain, terminalize the
             # parent now — nothing else will, and a parent left in 'processing' is the
@@ -23141,12 +23538,23 @@ class MemoryEngine(MemoryEngineInterface):
             except Exception as e:
                 logger.warning(f"Failed to roll cancellation of {operation_id} up to its parent: {e}")
 
-            return {
-                "success": True,
-                "message": f"Operation {operation_id} cancelled",
-                "operation_id": operation_id,
-                "bank_id": bank_id,
-            }
+        if claimed_worker_id is not None and self._active_operation_canceller is not None:
+            try:
+                self._active_operation_canceller(
+                    operation_id,
+                    cancel_schema,
+                    expected_worker_id=claimed_worker_id,
+                    expected_claimed_at=claimed_at,
+                )
+            except Exception as e:
+                logger.debug(f"In-flight operation cancellation hook failed for {operation_id}: {e}")
+
+        return {
+            "success": True,
+            "message": f"Operation {operation_id} cancelled",
+            "operation_id": operation_id,
+            "bank_id": bank_id,
+        }
 
     async def retry_operation(
         self,
@@ -23169,6 +23577,11 @@ class MemoryEngine(MemoryEngineInterface):
         # Acts on the whole bank, not narrowed to a tag scope: refuse scoped callers.
         if not _knowledge_bank:
             await self._refuse_bank_wide_if_scoped(bank_id, request_context, "retry the bank's operations")
+        if self._is_operation_active is not None and self._is_operation_active(operation_id, _current_schema.get()):
+            raise OperationValidationError(
+                f"Operation {operation_id} is still unwinding from cancellation; retry once it settles",
+                409,
+            )
         backend = await self._get_backend()
 
         op_uuid = uuid.UUID(operation_id)
@@ -23331,6 +23744,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         op_uuid = uuid.UUID(operation_id)
 
+        deleted: Any = None
         async with acquire_with_retry(backend) as conn:
             # Single status-guarded DELETE avoids TOCTOU with concurrent retry_operation.
             # Known edge: deleting a terminal child of a still-running batch removes it from
@@ -23342,32 +23756,44 @@ class MemoryEngine(MemoryEngineInterface):
                 f"""DELETE FROM {fq_table("async_operations")}
                     WHERE operation_id = $1 AND bank_id = $2
                       AND status IN ('failed', 'cancelled', 'completed')
-                    RETURNING operation_id, result_metadata""",
+                    RETURNING operation_id, operation_type, status, result_metadata, task_payload""",
                 op_uuid,
                 bank_id,
             )
-            if deleted:
-                # An export operation owns a stored archive keyed in result_metadata;
-                # delete it with the row so the blob doesn't outlive its only handle.
-                await self._delete_operation_export_archive(deleted["result_metadata"])
-                return {
-                    "success": True,
-                    "message": f"Operation {operation_id} deleted",
-                    "operation_id": operation_id,
-                }
+            if not deleted:
+                row = await conn.fetchrow(
+                    f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1 AND bank_id = $2",
+                    op_uuid,
+                    bank_id,
+                )
+                if not row:
+                    raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")
+                raise OperationValidationError(
+                    f"Operation {operation_id} cannot be deleted: status is '{row['status']}', "
+                    f"expected 'failed', 'cancelled' or 'completed'",
+                    409,
+                )
 
-            row = await conn.fetchrow(
-                f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1 AND bank_id = $2",
-                op_uuid,
-                bank_id,
-            )
-            if not row:
-                raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")
-            raise OperationValidationError(
-                f"Operation {operation_id} cannot be deleted: status is '{row['status']}', "
-                f"expected 'failed', 'cancelled' or 'completed'",
-                409,
-            )
+        # Clean up owned blobs / partial restored banks AFTER the DELETE transaction commits,
+        # so external storage / delete_bank calls never run while holding the first connection.
+        await self._delete_operation_export_archive(deleted.get("result_metadata"))
+        op_type = deleted.get("operation_type")
+        op_status = deleted.get("status")
+        if op_type in ("import_documents", "import_bank") and op_status in ("cancelled", "failed"):
+            await self._delete_operation_import_archive(deleted.get("task_payload"))
+        if op_type in ("import_bank", "clone_bank") and op_status in ("cancelled", "failed"):
+            meta = _parse_json_dict(deleted.get("result_metadata"))
+            restored_bank_id = meta.get("restored_bank_id")
+            restored_internal_id = meta.get("restored_bank_internal_id")
+            if restored_bank_id and restored_internal_id:
+                await self._cleanup_partial_restored_bank(
+                    restored_bank_id, str(restored_internal_id), request_context, None
+                )
+        return {
+            "success": True,
+            "message": f"Operation {operation_id} deleted",
+            "operation_id": operation_id,
+        }
 
     async def update_bank(
         self,

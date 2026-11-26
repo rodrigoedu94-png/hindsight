@@ -158,6 +158,9 @@ def is_transient_remote_error(exc: BaseException) -> bool:
         status = status_code_of(link)
         if status is not None:
             return status >= 500 or status in _TRANSIENT_STATUS_CODES
+        retryable_attr = getattr(link, "retryable", None)
+        if isinstance(retryable_attr, bool):
+            return retryable_attr
         if _is_transient_transport_error(link):
             return True
         link = link.__cause__

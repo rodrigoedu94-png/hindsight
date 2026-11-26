@@ -4473,6 +4473,12 @@ def create_app(
     from hindsight_api.profiling import install as _install_profiling
 
     _install_profiling()
+
+    # Optional Sentry reporting (no-op unless SENTRY_DSN is set); armed here for the same
+    # reason as profiling: spawned uvicorn workers import the app but never run main().
+    from hindsight_api.sentry_setup import install as _install_sentry
+
+    _install_sentry()
     # Load HTTP extension from environment if not provided
     if http_extension is None:
         http_extension = load_extension("HTTP", HttpExtension)
@@ -4578,6 +4584,12 @@ def create_app(
                 consolidation_bank_priority=config.worker_consolidation_bank_priority or None,
                 on_wall_timeout=memory.on_task_wall_timeout,
             )
+            memory.register_worker_cancellers(
+                cancel_operation=poller.cancel_active_operation,
+                cancel_bank_operations=poller.cancel_active_bank_operations,
+                finish_bank_delete=poller.finish_bank_delete,
+                is_operation_active=poller.is_operation_active,
+            )
             poller_task = asyncio.create_task(poller.run())
             _stop_claiming_on_sigterm(poller, asyncio.get_running_loop())
             logging.info(f"Worker poller started (worker_id={worker_id})")
@@ -4606,6 +4618,12 @@ def create_app(
 
         # Shutdown worker poller if running
         if poller is not None:
+            memory.register_worker_cancellers(
+                cancel_operation=None,
+                cancel_bank_operations=None,
+                finish_bank_delete=None,
+                is_operation_active=None,
+            )
             await poller.shutdown_graceful(timeout=config.worker_shutdown_drain_seconds)
             if poller_task is not None:
                 poller_task.cancel()
@@ -7974,10 +7992,12 @@ def _register_routes(app: FastAPI):
         summary="Cancel a pending or in-flight async operation",
         description=(
             "Cancel a queued or running async operation. A 'pending' operation is never started. "
-            "A 'processing' one is cancelled cooperatively: the row is marked 'cancelled' immediately "
-            "and the worker running it stops at its next checkpoint, so work already in flight may "
-            "finish the batch it is on. This also clears operations stranded in 'processing' by a "
-            "crashed worker. Returns 409 for operations that already reached a terminal state."
+            "A 'processing' operation is marked 'cancelled' immediately and interrupted in flight: "
+            "an in-process worker signals the running execution immediately, remote workers detect the "
+            "cancelled status on their periodic check, and long-running tasks also check cooperatively at "
+            "batch checkpoints, so already-committed batches remain while remaining work is aborted. "
+            "This also clears operations stranded in 'processing' by a crashed worker. Returns 409 for "
+            "operations that already reached a terminal state."
         ),
         operation_id="cancel_operation",
         tags=["Operations"],

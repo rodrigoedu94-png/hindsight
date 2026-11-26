@@ -1,7 +1,6 @@
 """Tests for consolidation retry budget configurability (issue #1042) and
 failure classification (issue #3684)."""
 
-from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 from hindsight_api.engine.consolidation.consolidator import _consolidate_batch_with_llm
 from hindsight_api.engine.llm_interface import OutputTooLongError, ProviderRateLimitResetError
 from hindsight_api.engine.providers.openai_compatible_llm import ProviderResponseError
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 
 
 @pytest.fixture

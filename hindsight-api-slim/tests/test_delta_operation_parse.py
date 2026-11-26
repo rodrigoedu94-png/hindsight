@@ -9,11 +9,14 @@ import pytest
 
 from hindsight_api.engine.llm_interface import OutputTooLongError
 from hindsight_api.engine.reflect.delta_ops import (
+    _RETRACTION_OPERATION_ADAPTER,
     AddSectionOp,
     AppendBlockOp,
     DeltaOperationList,
     DeltaOperationsInvalidError,
+    RemoveBlockOp,
     ReplaceSectionBlocksOp,
+    RetractionOperationList,
     apply_operations,
     parse_delta_operation_list,
     request_delta_operations,
@@ -611,3 +614,42 @@ async def test_request_delta_operations_raises_when_the_resample_runs_away_too()
     with pytest.raises(OutputTooLongError):
         await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
     assert len(llm.calls) == 2
+
+
+def test_retraction_schema_allows_only_subtraction_and_replacement():
+    allowed = {
+        "operations": [
+            {"op": "remove_block", "section_id": "s", "block_id": "b1"},
+            {"op": "remove_section", "section_id": "s2"},
+            {"op": "replace_block", "section_id": "s", "block_id": "b2", "text": "trimmed"},
+            {"op": "replace_section_blocks", "section_id": "s3", "blocks": ["only surviving"]},
+        ]
+    }
+    parsed = parse_delta_operation_list(allowed, operation_adapter=_RETRACTION_OPERATION_ADAPTER)
+    assert len(parsed.operations) == 4
+    assert isinstance(parsed.operations[0], RemoveBlockOp)
+
+    for forbidden_op in (
+        {"op": "append_block", "section_id": "s", "text": "note"},
+        {"op": "insert_block", "section_id": "s", "after_block_id": None, "text": "note"},
+        {"op": "add_section", "heading": "Added", "blocks": ["note"]},
+        {"op": "rename_section", "section_id": "s", "new_heading": "Renamed"},
+    ):
+        with pytest.raises(DeltaOperationsInvalidError):
+            parse_delta_operation_list({"operations": [forbidden_op]}, operation_adapter=_RETRACTION_OPERATION_ADAPTER)
+
+
+async def test_request_delta_operations_retraction_schema_retries_forbidden_append():
+    bad_retraction = '{"operations": [{"op": "append_block", "section_id": "prefs", "text": "Note: removed."}]}'
+    good_retraction = '{"operations": [{"op": "remove_block", "section_id": "prefs", "block_id": "b1"}]}'
+    llm = _ScriptedLLM(bad_retraction, good_retraction)
+    op_list = await request_delta_operations(
+        llm,
+        system_prompt="sys",
+        user_prompt="usr",
+        scope="mental_model_retraction_ops",
+        response_format=RetractionOperationList,
+    )
+    assert len(llm.calls) == 2
+    assert len(op_list.operations) == 1
+    assert isinstance(op_list.operations[0], RemoveBlockOp)

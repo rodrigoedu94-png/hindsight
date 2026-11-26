@@ -203,13 +203,16 @@ async def _attempt_permits(scope: str):
         await _acquire_permits(stack, scope)
         try:
             yield
-        except BaseException:
+        except Exception:
             # A failed attempt exits here with its permits released while the
             # provider classifies the error and sleeps out its backoff. Suffix
-            # the stage so `attempt=N` always means "permits held, request in
-            # flight" (#3002); the next attempt re-stamps after re-acquiring.
+            # the stage so that, except on cancellation, `attempt=N` means
+            # "permits held, request in flight" (#3002, #6673); the next attempt
+            # re-stamps after re-acquiring.
             # MemoryEngine.on_task_wall_timeout reads this suffix: a refresh cut off
             # during a backoff does not pause automatic refresh (#5561).
+            # Catching Exception (not BaseException) leaves the active attempt
+            # stage intact on asyncio.CancelledError (#6673).
             stage = get_stage()
             if stage is not None and not stage.endswith(".backoff"):
                 set_stage(f"{stage}.backoff")

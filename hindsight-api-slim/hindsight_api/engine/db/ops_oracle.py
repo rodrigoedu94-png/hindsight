@@ -6,11 +6,14 @@ columns can't appear in GROUP BY).
 """
 
 import json
+import logging
 import re
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from typing import cast
 
+from ...config import get_config
+from ...schema_context import get_current_schema
 from .base import DatabaseConnection
 from .ops import (
     ClaimedOperations,
@@ -30,8 +33,15 @@ from .result import ResultRow as DatabaseResultRow
 _VANISHED_UNIT_FK = re.compile(r"ORA-02291\b.*\.FK_ML_(?:FROM|TO)\)", re.IGNORECASE)
 
 
+_PGQ_LOGGER = logging.getLogger(__name__)
+
+
 class OracleOps(DataAccessOps):
     """Oracle-specific data access operations."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pgq_available_schemas: dict[tuple[str | None, str], bool] = {}
 
     async def fetch_reconcilable_batch_parents(self, conn: DatabaseConnection, table: str) -> list[DatabaseResultRow]:
         # Same anti-join as PostgreSQL (see PostgreSQLOps for why it is an
@@ -750,36 +760,35 @@ class OracleOps(DataAccessOps):
         per_entity_limit: int,
         window: UpdatedWindow,
     ) -> str:
-        # Oracle: can't GROUP BY CLOB columns (text, context).
-        # Restructure: count entities per unit_id in a subquery, then join to get full columns.
+        # Set-wise ROW_NUMBER() avoids CROSS JOIN LATERAL nested-loop blowup on
+        # high-fanout hub banks while still filtering target fact_type and recall
+        # window before applying the per-entity cap, then joining back to memory_units
+        # because Oracle cannot GROUP BY CLOB columns (text, context).
         return f"""
             seed_entities AS (
                 SELECT DISTINCT ue.entity_id
                 FROM {ue_table} ue
                 WHERE ue.unit_id = ANY($1::uuid[])
             ),
-            entity_scores AS (
-                SELECT t.unit_id, COUNT(DISTINCT se.entity_id) AS score
+            entity_units_ranked AS (
+                SELECT ue_target.entity_id,
+                       ue_target.unit_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY ue_target.entity_id
+                           ORDER BY ue_target.unit_id DESC
+                       ) AS rn
                 FROM seed_entities se
-                CROSS JOIN LATERAL (
-                    SELECT ue_target.unit_id
-                    FROM {ue_table} ue_target
-                    WHERE ue_target.entity_id = se.entity_id
-                      AND ue_target.unit_id != ALL($1::uuid[])
-                      -- Filter before applying the cap: candidates from other fact
-                      -- types, or outside the recall window, must not consume this
-                      -- entity's bounded fan-out.
-                      AND EXISTS (
-                          SELECT 1
-                          FROM {mu_table} mu_target
-                          WHERE mu_target.id = ue_target.unit_id
-                            AND mu_target.fact_type = $2
-                            {window.clause("mu_target")}
-                      )
-                    ORDER BY ue_target.unit_id DESC
-                    FETCH FIRST {per_entity_limit} ROWS ONLY
-                ) t
-                GROUP BY t.unit_id
+                JOIN {ue_table} ue_target ON ue_target.entity_id = se.entity_id
+                JOIN {mu_table} mu_target ON mu_target.id = ue_target.unit_id
+                WHERE ue_target.unit_id != ALL($1::uuid[])
+                  AND mu_target.fact_type = $2
+                  {window.clause("mu_target")}
+            ),
+            entity_scores AS (
+                SELECT eur.unit_id, COUNT(DISTINCT eur.entity_id) AS score
+                FROM entity_units_ranked eur
+                WHERE eur.rn <= {per_entity_limit}
+                GROUP BY eur.unit_id
             ),
             entity_expanded AS (
                 SELECT {memory_unit_columns("mu", indent=23)},
@@ -789,6 +798,210 @@ class OracleOps(DataAccessOps):
                 ORDER BY es.score DESC
                 FETCH FIRST $3 ROWS ONLY
             )"""
+
+    async def has_property_graph(
+        self,
+        conn: DatabaseConnection,
+        graph_name: str = "HINDSIGHT_MEMORY_GRAPH",
+    ) -> bool:
+        """Return whether the native Oracle 26ai SQL/PGQ property graph is readable."""
+        if not get_config().oracle_use_property_graph:
+            return False
+        schema = get_current_schema()
+        cache_key = (schema, graph_name.upper())
+        cached = self._pgq_available_schemas.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            row = await conn.fetchval(
+                """
+                SELECT 1
+                FROM all_property_graphs
+                WHERE graph_name = $1
+                  AND owner IN (
+                      COALESCE(SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'), USER),
+                      UPPER(COALESCE(SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'), USER))
+                  )
+                FETCH FIRST 1 ROW ONLY
+                """,
+                graph_name.upper(),
+            )
+            available = bool(row)
+            self._pgq_available_schemas[cache_key] = available
+            return available
+        except Exception as exc:
+            _PGQ_LOGGER.debug("SQL/PGQ capability check skipped/failed for schema=%s: %s", schema, exc)
+            return False
+
+    def build_pgq_semantic_causal_cte(
+        self,
+        graph_name: str,
+        mu_table: str,
+        window: UpdatedWindow,
+        *,
+        max_causal_hops: int = 2,
+    ) -> str:
+        """Build semantic and multi-hop causal CTEs using Oracle 26ai SQL/PGQ GRAPH_TABLE."""
+        causal_two_hop = ""
+        if max_causal_hops >= 2:
+            causal_two_hop = f"""
+                    UNION ALL
+                    SELECT id, weight
+                    FROM GRAPH_TABLE (
+                        {graph_name}
+                        MATCH (src IS memory_unit) -[l1 IS memory_link]-> (mid IS memory_unit)
+                              -[l2 IS memory_link]-> (dst IS memory_unit)
+                        WHERE src.id = ANY($1::uuid[])
+                          AND l1.link_type IN ('causes', 'caused_by', 'enables', 'prevents')
+                          AND l2.link_type IN ('causes', 'caused_by', 'enables', 'prevents')
+                          AND dst.fact_type = $2
+                          AND dst.id != ALL($1::uuid[])
+                          {window.clause("dst")}
+                        COLUMNS (
+                            dst.id AS id,
+                            (l1.weight * l2.weight * 0.7) AS weight
+                        )
+                    )"""
+
+        return f"""
+            sem_scores AS (
+                SELECT id, MAX(weight) AS score
+                FROM GRAPH_TABLE (
+                    {graph_name}
+                    MATCH (src IS memory_unit) -[l IS memory_link]- (dst IS memory_unit)
+                    WHERE src.id = ANY($1::uuid[])
+                      AND l.link_type = 'semantic'
+                      AND dst.fact_type = $2
+                      AND dst.id != ALL($1::uuid[])
+                      {window.clause("dst")}
+                    COLUMNS (
+                        dst.id AS id,
+                        l.weight AS weight
+                    )
+                )
+                GROUP BY id
+            ),
+            semantic_expanded AS (
+                SELECT {memory_unit_columns("mu", indent=23)},
+                       ss.score, 'semantic' AS source
+                FROM sem_scores ss
+                JOIN {mu_table} mu ON mu.id = ss.id
+                ORDER BY ss.score DESC
+                FETCH FIRST $3 ROWS ONLY
+            ),
+            causal_scores AS (
+                SELECT id, MAX(weight) AS score
+                FROM (
+                    SELECT id, weight
+                    FROM GRAPH_TABLE (
+                        {graph_name}
+                        MATCH (src IS memory_unit) -[l1 IS memory_link]-> (dst IS memory_unit)
+                        WHERE src.id = ANY($1::uuid[])
+                          AND l1.link_type IN ('causes', 'caused_by', 'enables', 'prevents')
+                          AND dst.fact_type = $2
+                          {window.clause("dst")}
+                        COLUMNS (
+                            dst.id AS id,
+                            l1.weight AS weight
+                        )
+                    ){causal_two_hop}
+                ) causal_raw
+                GROUP BY id
+            ),
+            causal_expanded AS (
+                SELECT {memory_unit_columns("mu", indent=23)},
+                       cs.score, 'causal' AS source
+                FROM causal_scores cs
+                JOIN {mu_table} mu ON mu.id = cs.id
+                ORDER BY cs.score DESC
+                FETCH FIRST $3 ROWS ONLY
+            )"""
+
+    async def query_entity_neighborhood_pgq(
+        self,
+        conn: DatabaseConnection,
+        *,
+        mu_table: str,
+        graph_name: str,
+        bank_id: str,
+        entity_ids: list,
+        max_hops: int = 2,
+        occurred_after: datetime | None = None,
+        occurred_before: datetime | None = None,
+        limit: int = 50,
+    ) -> list[ResultRow]:
+        """Traverse entity co-occurrences and linked bi-temporal facts via SQL/PGQ."""
+        if not entity_ids or limit <= 0:
+            return []
+        hops = max(1, min(int(max_hops), 2))
+        params: list[object] = [entity_ids, bank_id]
+        temporal_clauses: list[str] = []
+        if occurred_after is not None:
+            params.append(occurred_after)
+            temporal_clauses.append(
+                f"AND COALESCE(mu.occurred_end, mu.occurred_start, mu.mentioned_at, mu.event_date) >= ${len(params)}"
+            )
+        if occurred_before is not None:
+            params.append(occurred_before)
+            temporal_clauses.append(
+                f"AND COALESCE(mu.occurred_start, mu.mentioned_at, mu.event_date) <= ${len(params)}"
+            )
+        params.append(limit)
+        limit_param = f"${len(params)}"
+        temporal_sql = " ".join(temporal_clauses)
+
+        return cast(
+            "list[ResultRow]",
+            await conn.fetch(
+                f"""
+                SELECT {memory_unit_columns("mu", indent=23)},
+                       n.neighbor_entity_id,
+                       n.neighbor_entity_name,
+                       n.hop_distance
+                FROM (
+                    SELECT unit_id,
+                           neighbor_entity_id,
+                           MAX(neighbor_entity_name) AS neighbor_entity_name,
+                           MIN(hop_distance) AS hop_distance
+                    FROM (
+                        SELECT unit_id, neighbor_entity_id, neighbor_entity_name, 0 AS hop_distance
+                        FROM GRAPH_TABLE (
+                            {graph_name}
+                            MATCH (e1 IS entity) <-[m IS mentions]- (u IS memory_unit)
+                            WHERE e1.id = ANY($1::uuid[])
+                              AND u.bank_id = $2
+                            COLUMNS (
+                                u.id AS unit_id,
+                                e1.id AS neighbor_entity_id,
+                                e1.canonical_name AS neighbor_entity_name
+                            )
+                        )
+                        UNION ALL
+                        SELECT unit_id, neighbor_entity_id, neighbor_entity_name, 1 AS hop_distance
+                        FROM GRAPH_TABLE (
+                            {graph_name}
+                            MATCH (e1 IS entity) -[co IS cooccurs_with]-{{1,{hops}}} (e2 IS entity)
+                                  <-[m IS mentions]- (u IS memory_unit)
+                            WHERE e1.id = ANY($1::uuid[])
+                              AND u.bank_id = $2
+                            COLUMNS (
+                                u.id AS unit_id,
+                                e2.id AS neighbor_entity_id,
+                                e2.canonical_name AS neighbor_entity_name
+                            )
+                        )
+                    )
+                    GROUP BY unit_id, neighbor_entity_id
+                ) n
+                JOIN {mu_table} mu ON mu.id = n.unit_id
+                WHERE mu.bank_id = $2
+                  {temporal_sql}
+                ORDER BY n.hop_distance ASC, mu.event_date DESC
+                LIMIT {limit_param}
+                """,
+                *params,
+            ),
+        )
 
     def build_semantic_causal_cte(
         self,
@@ -1543,21 +1756,14 @@ class OracleOps(DataAccessOps):
     async def _claim_shared_tasks(self, conn, table, claimed_ids, limit) -> list:
         """Claim the shared pool oldest-first.
 
-        No bank rotation, unlike PostgreSQL (#3861). Two things rule the
-        rotation query out here rather than it being an oversight:
+        No bank rotation, unlike PostgreSQL (#3861). Before RU 23.26.4,
+        ``db/oracle.py`` must use ROWNUM before ORDER BY, so a rotation ordered
+        by bank_id would select whichever bank is scanned first. That fallback
+        also injects into the first WHERE, making a CTE-based rotation unsafe.
 
-        * Oracle rejects ``FETCH FIRST`` with ``FOR UPDATE`` (ORA-02014), so
-          ``db/oracle.py`` rewrites a limited claim into ``WHERE ROWNUM <= n``.
-          Oracle applies ``ROWNUM`` *before* ``ORDER BY``, so an ordered claim
-          returns an arbitrary n rows — a rotation ordered by ``bank_id`` would
-          land on whichever bank happens to be scanned first, which under bulk
-          ingest is overwhelmingly the bank the rotation exists to rotate away
-          from.
-        * That rewrite injects into the first ``WHERE`` it finds, which in a
-          CTE-based claim is the rotation branch, not the outer query.
-
-        Fixing that means reworking the ROWNUM rewrite, which the existing
-        ``created_at`` claim depends on just as much.
+        RU 23.26.4+ uses native FETCH FIRST with FOR UPDATE for this simple
+        claim. Keep rotation disabled until it has a separately validated query
+        that also works on older servers.
         """
         if claimed_ids:
             return await conn.fetch(
@@ -1694,7 +1900,7 @@ class OracleOps(DataAccessOps):
             return []
         # Same ``LIMIT $n ... FOR UPDATE SKIP LOCKED`` shape the claim queries
         # above use, which the Oracle SQL translation layer rewrites into the
-        # row-limited form Oracle accepts (a bare one raises ORA-02014).
+        # native FETCH FIRST form on RU 23.26.4+, or ROWNUM on older servers.
         return await conn.fetch(
             f"""
             SELECT operation_id, task_payload, retry_count

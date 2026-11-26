@@ -503,8 +503,33 @@ class TestOracleDialect:
         assert "VECTOR_DISTANCE" in arm
         assert ">= 0.58" in arm
         assert "fact_type = 'world'" in arm
-        assert "FETCH FIRST 100 ROWS ONLY" in arm
+        # EXACT is spelled out: on Autonomous Database a bare FETCH FIRST is answered from a
+        # vector index when one exists, i.e. approximately.
+        assert "FETCH EXACT FIRST 100 ROWS ONLY" in arm
+        assert "APPROX" not in arm
         assert "'semantic' AS source" in arm
+
+    def test_build_semantic_arm_approx_uses_fetch_approx(self, d, monkeypatch):
+        """FETCH APPROX is what lets Oracle answer from the embedding's vector index."""
+        from hindsight_api.config import clear_config_cache
+
+        monkeypatch.setenv("HINDSIGHT_API_ORACLE_VECTOR_SEARCH", "approx")
+        monkeypatch.setenv("HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY", "90")
+        clear_config_cache()
+        try:
+            arm = d.build_semantic_arm(
+                table="memory_units",
+                cols="id, text",
+                fact_type="world",
+                embedding_param=":1",
+                bank_id_param=":2",
+                fetch_limit=100,
+                min_similarity=0.58,
+            )
+        finally:
+            clear_config_cache()
+        assert "FETCH APPROX FIRST 100 ROWS ONLY WITH TARGET ACCURACY 90" in arm
+        assert "bank_id = :2" in arm
 
     def test_build_bm25_arm(self, d):
         arm = d.build_bm25_arm(
@@ -546,12 +571,37 @@ class TestOracleDialect:
 
     def test_prepare_bm25_text(self, d):
         result = d.prepare_bm25_text(["hello", "world"], "hello world")
-        assert result == "hello OR world"
+        assert result == "{hello} ACCUM {world}"
 
-    def test_prepare_bm25_text_special_chars_filtered(self, d):
-        result = d.prepare_bm25_text(["hello", "$special", "world"], "hello $special world")
-        assert "$special" not in result
-        assert "hello" in result
+    def test_prepare_bm25_text_escapes_underscore_wildcard(self, d):
+        """`_` is Oracle Text's one-character wildcard, so a bare snake_case term matches nothing.
+
+        On a live 26ai index, CONTAINS(text, 'hindsight_api') found 0 rows while
+        '{hindsight_api}' found 584, and a lone '_' matched every one-letter token.
+        """
+        assert d.prepare_bm25_text(["hindsight_api", "__init__"], "") == "{hindsight_api} ACCUM {__init__}"
+
+    def test_prepare_bm25_text_escapes_reserved_words_and_operators(self, d):
+        result = d.prepare_bm25_text(["near", "about", "$special", "a&b"], "")
+        assert result == "{near} ACCUM {about} ACCUM {$special} ACCUM {a&b}"
+
+    def test_prepare_bm25_text_cannot_close_the_escape(self, d):
+        """A brace inside a term would end the escape and let the rest act as operators."""
+        result = d.prepare_bm25_text(["a}", "OR", "x%{"], "")
+        assert result == "{a} ACCUM {OR} ACCUM {x%}"
+
+    def test_prepare_bm25_text_never_binds_the_raw_query(self, d):
+        result = d.prepare_bm25_text(["{}"], "} OR mem% {")
+        assert "mem%" not in result
+
+    def test_prepare_bm25_text_dedupes_case_insensitively(self, d):
+        assert d.prepare_bm25_text(["Oracle", "oracle", "text"], "") == "{Oracle} ACCUM {text}"
+
+    @pytest.mark.parametrize(
+        ("cap", "expected"), [(2, "{a} ACCUM {b}"), (0, "{a} ACCUM {b} ACCUM {c}"), (None, "{a} ACCUM {b} ACCUM {c}")]
+    )
+    def test_prepare_bm25_text_respects_max_query_terms(self, d, cap, expected):
+        assert d.prepare_bm25_text(["a", "b", "a", "c"], "", max_query_terms=cap) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +658,155 @@ class TestOracleQueryRewriter:
         assert "::jsonb" not in query
         assert ":1" in query
 
+    def test_vector_ordered_limit_is_an_exact_fetch(self):
+        """On Autonomous Database a bare FETCH FIRST over a vector index is approximate.
+
+        The temporal arm and link expansion order by `embedding <=> $1 LIMIT n`; measured on
+        Oracle AI Database 26ai (ADB) with the baseline IVF index present, that plain FETCH FIRST
+        returned 42% of the true top-20, so vector-ordered limits must ask for EXACT.
+        """
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT id FROM memory_units WHERE bank_id = $2 ORDER BY embedding <=> $1::vector LIMIT 5"
+        )
+        assert "ORDER BY VECTOR_DISTANCE(embedding, :1, COSINE) FETCH EXACT FIRST 5 ROWS ONLY" in query
+
+        query, _, _ = _rewrite_pg_to_oracle("SELECT id FROM t ORDER BY created_at LIMIT 5 OFFSET 10")
+        assert query.endswith("OFFSET 10 ROWS FETCH FIRST 5 ROWS ONLY")
+
+    def test_vector_distance_params_bind_as_native_vectors(self):
+        """A query embedding bound as text fails with ORA-01460 once it passes 32,767 bytes.
+
+        str() of a 1536-dimension embedding with full-precision floats is ~33 KB, so recall
+        failed on every query with such a provider; a native VECTOR bind has no such limit.
+        Other JSON-looking params (tag lists) keep their text/CLOB binding.
+        """
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        params = {"1": "[0.123456789, -0.5]", "2": "bank", "3": '["tag"]'}
+        OracleConnection._bind_vectors_natively(
+            "SELECT id FROM memory_units WHERE bank_id = :2 AND tags = :3 "
+            "ORDER BY VECTOR_DISTANCE(mu.embedding, :1, COSINE)",
+            params,
+        )
+        assert isinstance(params["1"], array.array)
+        assert params["1"].typecode == "f"
+        assert list(params["1"]) == pytest.approx([0.123456789, -0.5])
+        assert params["2"] == "bank"
+        assert params["3"] == '["tag"]'
+
+    def test_vector_distance_operand_wrapped_in_to_vector_binds_natively(self):
+        """The retain link probe (link_utils) wraps the operand: VECTOR_DISTANCE(embedding, TO_VECTOR($3), ...)."""
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection, _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT id, 1 - VECTOR_DISTANCE(embedding, TO_VECTOR($3), COSINE) AS similarity "
+            "FROM memory_units WHERE bank_id = $1 AND id <> $2 "
+            "ORDER BY VECTOR_DISTANCE(embedding, TO_VECTOR($3), COSINE)"
+        )
+        params = {"1": "bank", "2": "id", "3": "[0.5, -0.25]"}
+        OracleConnection._bind_vectors_natively(query, params)
+        assert isinstance(params["3"], array.array)
+        assert params["1"] == "bank"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "INSERT INTO memory_units (\n id, bank_id, text, fact_type, embedding, tags\n)\n"
+            "VALUES (:1, :2, :3, 'observation', :4, :5) RETURNING id INTO :ret_0",
+            "UPDATE memory_units SET text = :3, embedding = :4, tags = :5 WHERE id = :1 AND bank_id = :2",
+        ],
+    )
+    def test_embedding_column_writes_bind_as_native_vectors(self, query):
+        """Writing a ~33 KB embedding string into the column failed with ORA-01461 (consolidation)."""
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        params = {"1": "id", "2": "bank", "3": "text", "4": "[0.5, -0.25]", "5": '["t"]'}
+        OracleConnection._bind_vectors_natively(query, params)
+        assert isinstance(params["4"], array.array)
+        assert params["5"] == '["t"]'
+
+    def test_executemany_binds_embeddings_as_native_vectors(self):
+        """The batch write path (insert_facts_batch) carried the same str() embeddings but
+        never ran the conversion, so an oversized embedding still failed on retain."""
+        import array
+        from unittest.mock import MagicMock
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        cursor = AsyncMock()
+        cursor.setinputsizes = MagicMock()
+        cursor.close = MagicMock()
+        raw = MagicMock()
+        raw.cursor.return_value = cursor
+        conn = OracleConnection(raw)
+
+        asyncio.run(
+            conn.executemany(
+                "INSERT INTO memory_units (id, bank_id, text, embedding, tags) VALUES ($1, $2, $3, $4, $5)",
+                [
+                    ("id-1", "bank", "text a", "[0.123456789, -0.5]", "t1"),
+                    ("id-2", "bank", "text b", "[0.25, 0.5]", "t2"),
+                ],
+            )
+        )
+
+        query, rows = cursor.executemany.call_args.args
+        assert "embedding" in query
+        assert [type(row["4"]) for row in rows] == [array.array, array.array]
+        assert rows[0]["4"].typecode == "f"
+        assert list(rows[0]["4"]) == pytest.approx([0.123456789, -0.5])
+        assert rows[0]["5"] == "t1"
+
+    def test_merge_upsert_binds_the_using_embedding_as_native_vector(self):
+        """ON CONFLICT DO UPDATE rewrites to MERGE: the bind key hides in `SELECT :N AS
+        embedding` — not in an assignment or INSERT column list — so a SET clause that
+        only touches other columns left the embedding a text bind (ORA-01461 again)."""
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection, _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "INSERT INTO memory_units (id, bank_id, embedding) VALUES ($1, $2, $3) "
+            "ON CONFLICT (id, bank_id) DO UPDATE SET bank_id = EXCLUDED.bank_id"
+        )
+        params = {"1": "id", "2": "bank", "3": "[0.5, -0.25]"}
+        OracleConnection._bind_vectors_natively(query, params)
+        assert isinstance(params["3"], array.array)
+
+    def test_multi_row_insert_binds_every_row_group_embedding(self):
+        """VALUES (:1,:2),(:3,:4) mispaired the column/value lists: the greedy capture
+        swallowed the second row group and the embedding param stayed a text bind."""
+        import array
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        params = {"1": "id-1", "2": "[0.5, -0.25]", "3": "id-2", "4": "[0.25, 0.5]"}
+        OracleConnection._bind_vectors_natively(
+            "INSERT INTO memory_units (id, embedding) VALUES (:1, :2), (:3, :4)",
+            params,
+        )
+        assert isinstance(params["2"], array.array)
+        assert isinstance(params["4"], array.array)
+
+    def test_vector_distance_detection_is_case_insensitive(self):
+        """`vector_distance ( ... )` — lowercase or spaced — must still fetch EXACT."""
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        for query in (
+            "SELECT id FROM t ORDER BY vector_distance (embedding, :1, COSINE) LIMIT 5",
+            "SELECT id FROM t ORDER BY VECTOR_DISTANCE(embedding, :1, COSINE) LIMIT 5",
+        ):
+            rewritten, _, _ = _rewrite_pg_to_oracle(query)
+            assert "FETCH EXACT FIRST 5 ROWS ONLY" in rewritten
+
     def test_multiple_casts(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
@@ -624,6 +823,11 @@ class TestOracleQueryRewriter:
         assert "<@" not in query
         assert "NOT EXISTS (SELECT 1 FROM JSON_TABLE(tags," in query
         assert "JSON_TABLE(:2," in query
+
+        qualified, _, _ = _rewrite_pg_to_oracle("WHERE mu.bank_id = $1 AND (mu.tags @> $2 AND mu.tags <@ $2)")
+        assert "<@" not in qualified
+        assert "mu.NOT EXISTS" not in qualified
+        assert "NOT EXISTS (SELECT 1 FROM JSON_TABLE(mu.tags," in qualified
 
     def test_jsonb_merge_returns_clob(self):
         # Without RETURNING CLOB, JSON_MERGEPATCH returns VARCHAR2(4000) with
@@ -1011,68 +1215,86 @@ class TestConfig:
 
         assert DEFAULT_DATABASE_BACKEND == "postgresql"
 
+    def test_oracle_vector_search_defaults_to_exact(self, monkeypatch):
+        from hindsight_api.config import HindsightConfig
+
+        monkeypatch.delenv("HINDSIGHT_API_ORACLE_VECTOR_SEARCH", raising=False)
+        monkeypatch.delenv("HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY", raising=False)
+        config = HindsightConfig.from_env()
+        assert config.oracle_vector_search == "exact"
+        assert config.oracle_vector_target_accuracy == 95
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("HINDSIGHT_API_ORACLE_VECTOR_SEARCH", "fuzzy"),
+            ("HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY", "0"),
+            ("HINDSIGHT_API_ORACLE_VECTOR_TARGET_ACCURACY", "101"),
+        ],
+    )
+    def test_oracle_vector_search_settings_are_validated(self, monkeypatch, name, value):
+        from hindsight_api.config import HindsightConfig
+
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ValueError, match="oracle_vector"):
+            HindsightConfig.from_env().validate()
+
 
 # ---------------------------------------------------------------------------
 # Entity expansion CTE tests
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("ops_module", "ops_class", "limit_clause"),
-    [
-        ("hindsight_api.engine.db.ops_postgresql", "PostgreSQLOps", "LIMIT 7"),
-        ("hindsight_api.engine.db.ops_oracle", "OracleOps", "FETCH FIRST 7 ROWS ONLY"),
-    ],
-)
-def test_entity_expansion_filters_fact_type_before_per_entity_cap(
-    ops_module: str, ops_class: str, limit_clause: str
-) -> None:
+def test_entity_expansion_filters_fact_type_before_per_entity_cap() -> None:
     """The cap is per entity *and target fact type*, preventing mixed types from
     exhausting a target type's candidate budget before the outer query sees it.
     """
-    from importlib import import_module
+    from hindsight_api.engine.db.ops_oracle import OracleOps
+    from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
 
-    ops = getattr(import_module(ops_module), ops_class)()
-    cte = ops.build_entity_expansion_cte("memory_units", "unit_entities", 7, _UNBOUNDED_WINDOW)
-
-    lateral_start = cte.index("CROSS JOIN LATERAL")
-    lateral_end = cte.index(") t", lateral_start)
-    lateral_query = cte[lateral_start:lateral_end]
-
+    pg_cte = PostgreSQLOps().build_entity_expansion_cte("memory_units", "unit_entities", 7, _UNBOUNDED_WINDOW)
+    lateral_start = pg_cte.index("CROSS JOIN LATERAL")
+    lateral_query = pg_cte[lateral_start : pg_cte.index(") t", lateral_start)]
     assert "mu_target.fact_type = $2" in lateral_query
-    assert lateral_query.index("mu_target.fact_type = $2") < lateral_query.index(limit_clause)
+    assert lateral_query.index("mu_target.fact_type = $2") < lateral_query.index("LIMIT 7")
+
+    oracle_cte = OracleOps().build_entity_expansion_cte("memory_units", "unit_entities", 7, _UNBOUNDED_WINDOW)
+    assert "CROSS JOIN LATERAL" not in oracle_cte
+    ranked_start = oracle_cte.index("entity_units_ranked AS (")
+    scores_start = oracle_cte.index("entity_scores AS (")
+    ranked_query = oracle_cte[ranked_start:scores_start]
+    assert "ROW_NUMBER() OVER (" in ranked_query
+    assert "mu_target.fact_type = $2" in ranked_query
+    assert "eur.rn <= 7" in oracle_cte[scores_start:]
 
 
-@pytest.mark.parametrize(
-    "ops_module,ops_class,limit_clause",
-    [
-        ("hindsight_api.engine.db.ops_postgresql", "PostgreSQLOps", "LIMIT 7"),
-        ("hindsight_api.engine.db.ops_oracle", "OracleOps", "FETCH FIRST 7 ROWS ONLY"),
-    ],
-)
-def test_entity_expansion_applies_updated_window_before_per_entity_cap(
-    ops_module: str, ops_class: str, limit_clause: str
-) -> None:
+def test_entity_expansion_applies_updated_window_before_per_entity_cap() -> None:
     """Recall's time window bounds the entity fan-out, not just the graph seeds.
 
     Placement matters as much as presence: filtering after the cap would let
     out-of-window neighbours eat an entity's bounded budget and starve the
     in-window ones.
     """
-    from importlib import import_module
-
     from hindsight_api.engine.db.ops import UpdatedWindow
+    from hindsight_api.engine.db.ops_oracle import OracleOps
+    from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
 
-    ops = getattr(import_module(ops_module), ops_class)()
     window = UpdatedWindow(after=datetime(2026, 1, 1), before=datetime(2026, 2, 1), first_param_index=4)
-    cte = ops.build_entity_expansion_cte("memory_units", "unit_entities", 7, window)
 
-    lateral_start = cte.index("CROSS JOIN LATERAL")
-    lateral_query = cte[lateral_start : cte.index(") t", lateral_start)]
-
+    pg_cte = PostgreSQLOps().build_entity_expansion_cte("memory_units", "unit_entities", 7, window)
+    lateral_start = pg_cte.index("CROSS JOIN LATERAL")
+    lateral_query = pg_cte[lateral_start : pg_cte.index(") t", lateral_start)]
     assert "mu_target.updated_at > $4" in lateral_query
     assert "mu_target.updated_at < $5" in lateral_query
-    assert lateral_query.index("mu_target.updated_at > $4") < lateral_query.index(limit_clause)
+    assert lateral_query.index("mu_target.updated_at > $4") < lateral_query.index("LIMIT 7")
+
+    oracle_cte = OracleOps().build_entity_expansion_cte("memory_units", "unit_entities", 7, window)
+    ranked_start = oracle_cte.index("entity_units_ranked AS (")
+    scores_start = oracle_cte.index("entity_scores AS (")
+    ranked_query = oracle_cte[ranked_start:scores_start]
+    assert "mu_target.updated_at > $4" in ranked_query
+    assert "mu_target.updated_at < $5" in ranked_query
+    assert "eur.rn <= 7" in oracle_cte[scores_start:]
 
 
 @pytest.mark.parametrize(
@@ -1391,6 +1613,34 @@ class TestNormalizeSchema:
         assert backend.normalize_schema(None) is None
 
 
+@pytest.mark.parametrize("backend_type", ["postgresql", "oracle"])
+def test_backend_migrations_run_with_the_migration_database_url(backend_type, monkeypatch):
+    """Startup migrations use HINDSIGHT_API_MIGRATION_DATABASE_URL on every backend.
+
+    The migration URL is what lets DDL run as a schema-owner account while the API
+    connects as a runtime account without DDL privileges. The Oracle backend used to
+    drop it and migrate with the runtime DSN, so a least-privilege runtime user could
+    not boot with migrations on.
+    """
+    from hindsight_api import migrations
+    from hindsight_api.config import clear_config_cache
+
+    monkeypatch.setenv("HINDSIGHT_API_MIGRATION_DATABASE_URL", "migration-url")
+    clear_config_cache()
+    calls: list[tuple[str, str | None, str | None]] = []
+
+    def _fake_run_migrations(dsn, *, schema=None, migration_database_url=None, **_kwargs):
+        calls.append((dsn, schema, migration_database_url))
+
+    monkeypatch.setattr(migrations, "run_migrations", _fake_run_migrations)
+    try:
+        create_database_backend(backend_type).run_migrations("runtime-url", schema="S1")
+    finally:
+        clear_config_cache()
+
+    assert calls == [("runtime-url", "S1", "migration-url")]
+
+
 # ---------------------------------------------------------------------------
 # OracleBackend._set_session_schema regression
 # ---------------------------------------------------------------------------
@@ -1482,6 +1732,102 @@ class TestOracleSetSessionSchema:
         assert closed["count"] == 1
         assert any('ALTER SESSION SET CURRENT_SCHEMA = "APP_USER"' in s for s in executed)
 
+    @pytest.mark.asyncio
+    async def test_native_current_schema_piggybacks_and_skips_noop(self):
+        """oracledb's ``conn.current_schema`` avoids ALTER SESSION round-trips."""
+        from hindsight_api import schema_context
+        from hindsight_api.engine.db.oracle import OracleBackend
+
+        executed: list[str] = []
+
+        class _FakeAsyncCursor:
+            async def execute(self, sql: str) -> None:
+                executed.append(sql)
+
+            async def fetchone(self):
+                return ("APP_USER",)
+
+            def close(self) -> None:
+                pass
+
+        class _FakeOracleConn:
+            def __init__(self) -> None:
+                self.current_schema: str | None = None
+                self.assignments: list[str] = []
+
+            def __setattr__(self, name: str, value) -> None:
+                if name == "current_schema" and hasattr(self, "assignments"):
+                    self.assignments.append(value)
+                super().__setattr__(name, value)
+
+            def cursor(self) -> "_FakeAsyncCursor":
+                return _FakeAsyncCursor()
+
+        backend = OracleBackend()
+        conn = _FakeOracleConn()
+
+        # Default schema on fresh session: caches SESSION_USER once, zero assignments.
+        token = schema_context._current_schema.set("public")
+        try:
+            await backend._set_session_schema(conn)
+            await backend._set_session_schema(conn)
+        finally:
+            schema_context._current_schema.reset(token)
+        assert executed == ["SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') FROM DUAL"]
+        assert conn.assignments == []
+
+        # Tenant schema: piggybacks once, second checkout on same tenant is a no-op.
+        token = schema_context._current_schema.set("TENANT_X")
+        try:
+            await backend._set_session_schema(conn)
+            await backend._set_session_schema(conn)
+        finally:
+            schema_context._current_schema.reset(token)
+        assert conn.assignments == ["TENANT_X"]
+        assert conn.current_schema == "TENANT_X"
+
+        # Returning to public resets current_schema back to APP_USER with zero SQL.
+        token = schema_context._current_schema.set("public")
+        try:
+            await backend._set_session_schema(conn)
+        finally:
+            schema_context._current_schema.reset(token)
+        assert conn.assignments == ["TENANT_X", "APP_USER"]
+        assert conn.current_schema == "APP_USER"
+        assert len(executed) == 1
+
+    @pytest.mark.asyncio
+    async def test_initialize_uses_oracle_statement_cache_size_when_zero_passed(self, monkeypatch):
+        """MemoryEngine's statement_cache_size=0 falls back to oracle_statement_cache_size."""
+        from hindsight_api.config import clear_config_cache
+        from hindsight_api.engine.db import oracle as oracle_mod
+
+        captured: dict = {}
+
+        class _FakeOracledb:
+            class defaults:
+                fetch_lobs = True
+
+            @staticmethod
+            def create_pool_async(**kwargs):
+                captured.update(kwargs)
+                return object()
+
+        monkeypatch.setattr(oracle_mod, "_import_oracledb", lambda: _FakeOracledb)
+        monkeypatch.delenv("HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE", raising=False)
+        clear_config_cache()
+        try:
+            backend = oracle_mod.OracleBackend()
+            await backend.initialize("oracle+oracledb://u:p@h:1521/svc", statement_cache_size=0)
+            assert captured["stmtcachesize"] == 0
+
+            monkeypatch.setenv("HINDSIGHT_API_ORACLE_STATEMENT_CACHE_SIZE", "50")
+            clear_config_cache()
+            await backend.initialize("oracle+oracledb://u:p@h:1521/svc", statement_cache_size=0)
+            assert captured["stmtcachesize"] == 50
+        finally:
+            clear_config_cache()
+
 
 # ---------------------------------------------------------------------------
 # Oracle session setup and CLOB binding (#4630, #4632)
@@ -1537,6 +1883,57 @@ class TestOracleSessionAndClobBinding:
         assert not _needs_blob_bind("x" * 5000)
         assert not _needs_blob_bind(None)
 
+    @pytest.mark.asyncio
+    async def test_long_embedding_binds_as_vector_not_clob(self):
+        # A 1536-dimension embedding at full float precision is ~33 KB of text: it must be
+        # bound as a native VECTOR before the temporary-LOB pass, or it becomes a CLOB.
+        pytest.importorskip("oracledb")
+        import array
+        import json
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        class FakeCursor:
+            def __init__(self):
+                self.params = None
+
+            def setinputsizes(self, **kwargs):
+                pass
+
+            async def execute(self, query, params):
+                self.params = dict(params)
+
+            async def fetchall(self):
+                return []
+
+            def close(self):
+                pass
+
+            description = None
+            rowcount = 0
+
+        class FakeConn:
+            def __init__(self):
+                self.cursor_obj = FakeCursor()
+                self.created = []
+
+            def cursor(self):
+                return self.cursor_obj
+
+            async def createlob(self, lob_type):
+                self.created.append(lob_type)
+                raise AssertionError("an embedding must not be bound as a LOB")
+
+        conn = OracleConnection.__new__(OracleConnection)
+        conn._conn = FakeConn()
+        embedding = json.dumps([-0.1234567890123456789 - i * 1e-9 for i in range(1536)])
+        assert len(embedding.encode()) > 32767
+        await conn.execute("UPDATE memory_units SET embedding = $1 WHERE id = $2", embedding, "unit-1")
+
+        bound = conn._conn.cursor_obj.params["1"]
+        assert isinstance(bound, array.array) and len(bound) == 1536
+        assert conn._conn.created == []
+
     def test_clob_lob_covers_text_past_32k_bytes(self):
         from hindsight_api.engine.db.oracle import _needs_clob_lob
 
@@ -1580,3 +1977,78 @@ class TestOracleSessionAndClobBinding:
         assert params["4"].lob_type == oracledb.DB_TYPE_CLOB and params["4"].data == text
         assert params["1"] == "doc-id" and params["3"] == bytes(16)  # a UUID stays RAW(16)
         assert params["5"] == "x" * 5000  # 4 000-32 767 bytes stay a string with a CLOB input size
+
+    def test_expand_any_lists_chunks_past_1000_items_for_ora_01795(self):
+        from hindsight_api.engine.db.oracle import OracleConnection, _rewrite_pg_to_oracle
+
+        items = [f"id-{i}" for i in range(2050)]
+
+        q_in, _, _ = _rewrite_pg_to_oracle("SELECT id FROM memory_units WHERE mu.id = ANY($1)")
+        expanded_in, params_in = OracleConnection._expand_any_lists(q_in, {"1": list(items)})
+        assert expanded_in.count("mu.id IN (") == 3
+        assert " OR mu.id IN (" in expanded_in
+        assert "1" not in params_in
+        assert len(params_in) == 2050
+
+        q_not_in, _, _ = _rewrite_pg_to_oracle("SELECT id FROM memory_units WHERE mu.id != ALL($1)")
+        expanded_not_in, params_not_in = OracleConnection._expand_any_lists(q_not_in, {"1": list(items)})
+        assert expanded_not_in.count("mu.id NOT IN (") == 3
+        assert " AND mu.id NOT IN (" in expanded_not_in
+        assert len(params_not_in) == 2050
+
+    @pytest.mark.asyncio
+    async def test_purge_bank_rows_deletes_memory_links_before_memory_units(self):
+        from hindsight_api.engine.memories.pg.engine_curation import purge_bank_rows
+
+        executed: list[str] = []
+
+        class FakeConn:
+            async def fetch(self, query, *args):
+                return []
+
+            async def execute(self, query, *args):
+                executed.append(query)
+                return "DELETE 0"
+
+        await purge_bank_rows(conn=FakeConn(), fq_table=lambda t: t, bank_id="b1")
+        links_idx = next(i for i, q in enumerate(executed) if "DELETE FROM memory_links" in q)
+        docs_idx = next(i for i, q in enumerate(executed) if "DELETE FROM documents" in q)
+        units_idx = next(i for i, q in enumerate(executed) if "DELETE FROM memory_units" in q)
+        entities_idx = next(i for i, q in enumerate(executed) if "DELETE FROM entities" in q)
+        assert links_idx < docs_idx < units_idx < entities_idx
+
+    @pytest.mark.asyncio
+    async def test_purge_bank_rows_oracle_locks_links_in_canonical_order_before_documents(self):
+        from hindsight_api.engine.memories.postgres import PostgresMemories
+
+        events: list[tuple[str, str]] = []
+
+        class FakeOracleConn:
+            backend_type = "oracle"
+
+            async def fetch(self, query, *args):
+                events.append(("fetch", " ".join(query.split())))
+                return []
+
+            async def execute(self, query, *args):
+                events.append(("execute", " ".join(query.split())))
+                return "DELETE 0"
+
+        from unittest.mock import patch
+
+        with patch("hindsight_api.engine.memories.postgres.fq_store_table", side_effect=lambda t: t):
+            await PostgresMemories({}).purge_bank_rows(conn=FakeOracleConn(), fq_table=lambda t: t, bank_id="b1")
+        lock_idx = next(
+            i
+            for i, (kind, q) in enumerate(events)
+            if kind == "fetch"
+            and "FROM memory_links" in q
+            and "ORDER BY from_unit_id, to_unit_id, link_type, entity_id FOR UPDATE" in q
+        )
+        del_links_idx = next(
+            i for i, (kind, q) in enumerate(events) if kind == "execute" and "DELETE FROM memory_links" in q
+        )
+        del_docs_idx = next(
+            i for i, (kind, q) in enumerate(events) if kind == "execute" and "DELETE FROM documents" in q
+        )
+        assert lock_idx < del_links_idx < del_docs_idx
