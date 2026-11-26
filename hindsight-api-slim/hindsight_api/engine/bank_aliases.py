@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 from ..config import get_config
 from ..schema_context import get_current_schema
 from .bank_stats_cache import BankStatsCache
+from .db.oracle import OracleLiteralStr
 from .db_utils import acquire_with_retry
 from .schema import fq_table
 
@@ -145,7 +146,10 @@ async def refuse_alias_as_bank_id_on_conn(conn: "DatabaseConnection", bank_id: s
     prefers a real bank. Deliberately not cached: it guards a write, and a stale "no"
     here would create exactly the collision it exists to prevent.
     """
-    if await conn.fetchval(f"SELECT 1 FROM {fq_table('bank_aliases')} WHERE alias = $1", bank_id) is not None:
+    if (
+        await conn.fetchval(f"SELECT 1 FROM {fq_table('bank_aliases')} WHERE alias = $1", OracleLiteralStr(bank_id))
+        is not None
+    ):
         from hindsight_api.extensions import OperationValidationError
 
         raise OperationValidationError(f"'{bank_id}' is an alias of another bank", status_code=409)

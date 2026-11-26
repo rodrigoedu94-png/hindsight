@@ -1019,7 +1019,7 @@ class KnowledgeService:
             await conn.execute(
                 f"UPDATE {fq_table('async_operations')} SET status = 'cancelled', updated_at = now() "
                 "WHERE bank_id = $1 AND status IN ('pending', 'processing')",
-                bank_id,
+                OracleLiteralStr(bank_id),
             )
         deadline = time.monotonic() + DELETE_WAIT_SECONDS
         while time.monotonic() < deadline:
@@ -1038,7 +1038,9 @@ class KnowledgeService:
     async def _overrides(self, bank_id: str) -> KnowledgeBankOverrides:
         async with acquire_with_retry(await self._engine._get_backend()) as conn:
             raw = await conn.fetchval(
-                f"SELECT config FROM {fq_table('banks')} WHERE bank_id = $1 AND kind = $2", bank_id, KIND
+                f"SELECT config FROM {fq_table('banks')} WHERE bank_id = $1 AND kind = $2",
+                OracleLiteralStr(bank_id),
+                KIND,
             )
         return bank_config.stored_overrides(raw)
 
@@ -1062,7 +1064,9 @@ class KnowledgeService:
         await self._open_bank(bank_id, KnowledgeBankWriteOperation.UPDATE_KNOWLEDGE_BANK_CONFIG, request_context)
         async with acquire_with_retry(await self._engine._get_backend()) as conn, conn.transaction():
             raw = await conn.fetchval(
-                f"SELECT config FROM {fq_table('banks')} WHERE bank_id = $1 AND kind = $2 FOR UPDATE", bank_id, KIND
+                f"SELECT config FROM {fq_table('banks')} WHERE bank_id = $1 AND kind = $2 FOR UPDATE",
+                OracleLiteralStr(bank_id),
+                KIND,
             )
             try:
                 overrides = bank_config.validate_overrides(bank_config.stored_overrides(raw), updates)
@@ -1083,7 +1087,7 @@ class KnowledgeService:
         if getattr(conn, "backend_type", None) == "oracle":
             raw = await conn.fetchval(
                 f"SELECT config FROM {fq_table('banks')} WHERE bank_id = $1 AND kind = $2 FOR UPDATE",
-                bank_id,
+                OracleLiteralStr(bank_id),
                 KIND,
             )
             if isinstance(raw, dict):
@@ -1099,7 +1103,7 @@ class KnowledgeService:
             await conn.execute(
                 f"UPDATE {fq_table('banks')} SET config = $1, updated_at = SYSTIMESTAMP WHERE bank_id = $2 AND kind = $3",
                 json.dumps(current),
-                bank_id,
+                OracleLiteralStr(bank_id),
                 KIND,
             )
             return
@@ -1111,7 +1115,7 @@ class KnowledgeService:
             """,
             [bank_config.STORED_PREFIX + f for f in bank_config.OVERRIDABLE_FIELDS],
             json.dumps(bank_config.to_stored(overrides)),
-            bank_id,
+            OracleLiteralStr(bank_id),
             KIND,
         )
 
@@ -1275,13 +1279,18 @@ class KnowledgeService:
         # children would be pending forever (no task runs it, no child ever completes it).
         async with acquire_with_retry(backend) as conn:
             async with conn.transaction():
-                if await conn.fetchval(f"SELECT 1 FROM {fq_table('banks')} WHERE bank_id = $1", bank_id) is None:
+                if (
+                    await conn.fetchval(
+                        f"SELECT 1 FROM {fq_table('banks')} WHERE bank_id = $1", OracleLiteralStr(bank_id)
+                    )
+                    is None
+                ):
                     raise KnowledgeBankError(f"knowledge bank '{bank_id}' not found", status_code=404)
                 await conn.execute(
                     f"INSERT INTO {table} (operation_id, bank_id, operation_type, result_metadata, status) "
                     "VALUES ($1, $2, $3, $4, $5)",
                     parent_id,
-                    bank_id,
+                    OracleLiteralStr(bank_id),
                     TASK_TYPE,
                     json.dumps(
                         KnowledgeIngestParentMetadata(
@@ -1312,7 +1321,7 @@ class KnowledgeService:
                         f"INSERT INTO {table} (operation_id, bank_id, operation_type, result_metadata, status, "
                         "task_payload) VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
                         child_id,
-                        bank_id,
+                        OracleLiteralStr(bank_id),
                         TASK_TYPE,
                         json.dumps(meta.to_dict()),
                         "pending",
@@ -2149,7 +2158,7 @@ class KnowledgeService:
             bank_id, KnowledgeBankReadOperation.LIST_KNOWLEDGE_BANK_OPERATIONS, request_context, needs_vectors=False
         )
         return await self._engine.list_operations(
-            bank_id,
+            OracleLiteralStr(bank_id),
             status=status,
             task_type=task_type,
             limit=limit,
@@ -2166,7 +2175,7 @@ class KnowledgeService:
             bank_id, KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK_OPERATION, request_context, needs_vectors=False
         )
         return await self._engine.get_operation_status(
-            bank_id,
+            OracleLiteralStr(bank_id),
             operation_id,
             request_context=request_context,
             include_payload=include_payload,
@@ -2180,7 +2189,9 @@ class KnowledgeService:
             bank_id, KnowledgeBankWriteOperation.CANCEL_KNOWLEDGE_BANK_OPERATION, request_context, needs_vectors=False
         )
         return await self._job_call(
-            self._engine.cancel_operation(bank_id, operation_id, request_context=request_context, _knowledge_bank=True)
+            self._engine.cancel_operation(
+                OracleLiteralStr(bank_id), operation_id, request_context=request_context, _knowledge_bank=True
+            )
         )
 
     async def retry_operation(self, bank_id: str, operation_id: str, request_context: RequestContext) -> dict[str, Any]:
@@ -2188,7 +2199,9 @@ class KnowledgeService:
             bank_id, KnowledgeBankWriteOperation.RETRY_KNOWLEDGE_BANK_OPERATION, request_context, needs_vectors=False
         )
         return await self._job_call(
-            self._engine.retry_operation(bank_id, operation_id, request_context=request_context, _knowledge_bank=True)
+            self._engine.retry_operation(
+                OracleLiteralStr(bank_id), operation_id, request_context=request_context, _knowledge_bank=True
+            )
         )
 
     async def delete_operation(
@@ -2198,7 +2211,9 @@ class KnowledgeService:
             bank_id, KnowledgeBankWriteOperation.DELETE_KNOWLEDGE_BANK_OPERATION, request_context, needs_vectors=False
         )
         return await self._job_call(
-            self._engine.delete_operation(bank_id, operation_id, request_context=request_context, _knowledge_bank=True)
+            self._engine.delete_operation(
+                OracleLiteralStr(bank_id), operation_id, request_context=request_context, _knowledge_bank=True
+            )
         )
 
     @staticmethod
