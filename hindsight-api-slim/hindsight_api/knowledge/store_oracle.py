@@ -50,10 +50,8 @@ from .store import (
     _chunks,
     _merged_ranges,
     _passage,
-    final_scores,
-    is_reference_page,
+    fuse_keyword,
     page_score,
-    page_text_weight,
     with_document_prior,
 )
 
@@ -896,7 +894,7 @@ class OracleKnowledgeStore(KnowledgeStore):
 
             roles = [role_scores.get((r["document_id"], int(r["idx"])), {}) for r in rows]
             first = [
-                page_score(float(r["score"] or 0.0), ro, page_text_weight(r["text"], text_weight))
+                page_score(float(r["score"] or 0.0), ro, text_weight)
                 for r, ro in zip(rows, roles, strict=True)
             ]
 
@@ -926,9 +924,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                     sentence = best.get((rows[i]["document_id"], int(rows[i]["idx"])))
                     if sentence is not None:
                         roles[i]["sentence"] = [sentence]
-                        first[i] = page_score(
-                            float(rows[i]["score"] or 0.0), roles[i], page_text_weight(rows[i]["text"], text_weight)
-                        )
+                        first[i] = page_score(float(rows[i]["score"] or 0.0), roles[i], text_weight)
 
             dense = with_document_prior([r["document_id"] for r in rows], first)
             keyword_scores: list[float] = []
@@ -939,9 +935,8 @@ class OracleKnowledgeStore(KnowledgeStore):
                     doc_words = {w.lower() for w in _WORD_RE.findall(r["text"])}
                     keyword_scores.append(sum(idf for term, idf in terms_idf.items() if term in doc_words))
 
-            reference = [r["page"] is not None and is_reference_page(r["text"]) for r in rows]
             has_text = [bool((r["text"] or "").strip()) for r in rows]
-            scores = final_scores(dense, keyword_scores, keyword_weight, reference=reference, has_text=has_text)
+            scores = fuse_keyword(dense, keyword_scores, keyword_weight, has_text)
             hits = [
                 SearchHit(
                     passage=_passage(r),
@@ -954,7 +949,6 @@ class OracleKnowledgeStore(KnowledgeStore):
                         passage_score=first[i],
                         with_document=dense[i],
                         keyword=keyword_scores[i],
-                        reference_page=reference[i],
                     ),
                 )
                 for i, r in enumerate(rows)
