@@ -64,6 +64,44 @@ def build_pgq_entity_expansion_cte(
             )"""
 
 
+def _pgq_semantic_scores_cte(graph_name: str, fact_type_sql: str, window: UpdatedWindow) -> str:
+    """``sem_scores``: best semantic-link weight per non-seed neighbour, both link directions.
+
+    One directed GRAPH_TABLE per direction, like the relational CTE's two arms, so each
+    seeks its own ``memory_links`` index (from_unit_id / to_unit_id, link_type, weight).
+    An undirected ``-[l]-`` match returns the same rows, but in a statement that also holds
+    the SQL/PGQ entity arm the optimizer OR-expands it and full-scans ``memory_links`` for
+    the incoming side: ~8.5x the logical reads of the relational CTE on a 36k-link bank.
+    """
+    arms = []
+    for pattern in (
+        "(src IS memory_unit) -[l IS memory_link]-> (dst IS memory_unit)",
+        "(dst IS memory_unit) -[l IS memory_link]-> (src IS memory_unit)",
+    ):
+        arms.append(f"""
+                    SELECT id, weight
+                    FROM GRAPH_TABLE (
+                        {graph_name}
+                        MATCH {pattern}
+                        WHERE src.id = ANY($1::uuid[])
+                          AND l.link_type = 'semantic'
+                          AND dst.fact_type = {fact_type_sql}
+                          AND dst.id != ALL($1::uuid[])
+                          {window.clause("dst")}
+                        COLUMNS (
+                            dst.id AS id,
+                            l.weight AS weight
+                        )
+                    )""")
+    union = "\n                    UNION ALL".join(arms)
+    return f"""sem_scores AS (
+                SELECT id, MAX(weight) AS score
+                FROM ({union}
+                ) sem_raw
+                GROUP BY id
+            )"""
+
+
 def build_pgq_semantic_causal_cte(
     graph_name: str,
     mu_table: str,
@@ -94,23 +132,7 @@ def build_pgq_semantic_causal_cte(
                     )"""
 
     return f"""
-            sem_scores AS (
-                SELECT id, MAX(weight) AS score
-                FROM GRAPH_TABLE (
-                    {graph_name}
-                    MATCH (src IS memory_unit) -[l IS memory_link]- (dst IS memory_unit)
-                    WHERE src.id = ANY($1::uuid[])
-                      AND l.link_type = 'semantic'
-                      AND dst.fact_type = $2
-                      AND dst.id != ALL($1::uuid[])
-                      {window.clause("dst")}
-                    COLUMNS (
-                        dst.id AS id,
-                        l.weight AS weight
-                    )
-                )
-                GROUP BY id
-            ),
+            {_pgq_semantic_scores_cte(graph_name, "$2", window)},
             semantic_expanded AS (
                 SELECT {memory_unit_columns("mu", indent=23)},
                        ss.score, 'semantic' AS source
@@ -160,7 +182,12 @@ async def expand_observations_pgq(
     *,
     max_causal_hops: int = 2,
 ) -> LinkExpansionRows:
-    """Expand observation memories via Oracle 26ai SQL/PGQ (derived_from, mentions, memory_link)."""
+    """Expand observation memories via Oracle 26ai SQL/PGQ (derived_from, mentions, memory_link).
+
+    The entity arm ranks every unit that mentions a seed source's entities, the seed
+    sources included, and drops those only after the per-entity cap (``connected_sources``),
+    as ``OracleOps.expand_observations`` does, so both pick the same units under the cap.
+    """
     if not seed_ids or budget <= 0:
         return LinkExpansionRows(entity=[], semantic=[], causal=[])
     safe_limit = max(1, int(per_entity_limit))
@@ -206,7 +233,6 @@ async def expand_observations_pgq(
                           -[m1 IS mentions]-> (e IS entity)
                           <-[m2 IS mentions]- (tgt IS memory_unit)
                     WHERE obs.id = ANY($1::uuid[])
-                      AND tgt.id != src.id
                     COLUMNS (
                         e.id AS entity_id,
                         tgt.id AS unit_id
@@ -260,23 +286,7 @@ async def expand_observations_pgq(
                 ORDER BY s.score DESC
                 FETCH FIRST $2 ROWS ONLY
             ),
-            sem_scores AS (
-                SELECT id, MAX(weight) AS score
-                FROM GRAPH_TABLE (
-                    {graph_name}
-                    MATCH (src IS memory_unit) -[l IS memory_link]- (dst IS memory_unit)
-                    WHERE src.id = ANY($1::uuid[])
-                      AND l.link_type = 'semantic'
-                      AND dst.fact_type = 'observation'
-                      AND dst.id != ALL($1::uuid[])
-                      {window.clause("dst")}
-                    COLUMNS (
-                        dst.id AS id,
-                        l.weight AS weight
-                    )
-                )
-                GROUP BY id
-            ),
+            {_pgq_semantic_scores_cte(graph_name, "'observation'", window)},
             semantic_expanded AS (
                 SELECT {memory_unit_columns("mu", indent=23)},
                        ss.score, 'semantic' AS source
@@ -355,9 +365,7 @@ async def query_entity_neighborhood_pgq(
         )
     if occurred_before is not None:
         params.append(occurred_before)
-        temporal_clauses.append(
-            f"AND COALESCE(mu.occurred_start, mu.mentioned_at, mu.event_date) <= ${len(params)}"
-        )
+        temporal_clauses.append(f"AND COALESCE(mu.occurred_start, mu.mentioned_at, mu.event_date) <= ${len(params)}")
     params.append(limit)
     limit_param = f"${len(params)}"
     temporal_sql = " ".join(temporal_clauses)

@@ -48,9 +48,13 @@ def test_pgq_semantic_causal_cte_excludes_seeds_and_preserves_projection(max_hop
         assert arms[name] == list(MEMORY_UNIT_COLUMNS), f"Unexpected projection on {name}: {arms.get(name)}"
     assert "MATCH (src IS memory_unit) -[m1 IS mentions]-> (e IS entity)" in cte
     assert "WHERE eur.rn <= 7" in cte
-    # entity + semantic + 1-hop causal (+ optional 2-hop causal)
-    expected_exclusions = 4 if max_hops == 2 else 3
+    # entity + semantic (outgoing, incoming) + 1-hop causal (+ optional 2-hop causal)
+    expected_exclusions = 5 if max_hops == 2 else 4
     assert cte.count("dst.id != ALL($1::uuid[])") == expected_exclusions
+    # Semantic links are matched one direction per GRAPH_TABLE, never undirected.
+    assert "-[l IS memory_link]- (" not in cte
+    assert "MATCH (src IS memory_unit) -[l IS memory_link]-> (dst IS memory_unit)" in cte
+    assert "MATCH (dst IS memory_unit) -[l IS memory_link]-> (src IS memory_unit)" in cte
     if max_hops == 2:
         assert "l1.weight * l2.weight * 0.7" in cte
     else:
@@ -92,6 +96,8 @@ async def test_expand_observations_pgq_uses_derived_from_and_guards_empty(max_ho
     assert "-[d IS derived_from]->" in sql
     assert "-[m1 IS mentions]-> (e IS entity)" in sql
     assert "obs.id != ALL($1::uuid[])" in sql
+    assert "-[l IS memory_link]- (" not in sql
+    assert "MATCH (dst IS memory_unit) -[l IS memory_link]-> (src IS memory_unit)" in sql
     assert "WHERE eur.rn <= 5" in sql
     arms = _arm_projections(sql)
     for name in ("observation_entity_expanded", "semantic_expanded", "causal_expanded"):
@@ -143,7 +149,7 @@ async def test_oracle_link_expansion_retriever_uses_pgq_and_falls_back(monkeypat
 
     conn = MagicMock()
     conn.backend_type = "oracle"
-    conn.fetch = AsyncMock(return_value=[{"source": "entity", "id": "obs-10"}]_)
+    conn.fetch = AsyncMock(return_value=[{"source": "entity", "id": "obs-10"}])
 
     retriever = OracleLinkExpansionRetriever()
     res_obs = await retriever._expand_observations(conn, ["seed-obs"], 20, ops=ops)
@@ -157,3 +163,189 @@ async def test_oracle_link_expansion_retriever_uses_pgq_and_falls_back(monkeypat
 
     conn.fetch = AsyncMock(side_effect=asyncio.TimeoutError())
     assert await retriever._expand_observations(conn, ["seed-obs"], 20, ops=ops) is fallback_rows
+
+
+# ---------------------------------------------------------------------------
+# Oracle 26ai integration: the GRAPH_TABLE arms run and match the relational CTEs
+# ---------------------------------------------------------------------------
+
+
+def _ids(rows) -> dict[str, float]:
+    return {str(r["id"]): round(float(r["score"]), 6) for r in rows}
+
+
+@pytest.mark.oracle
+@pytest.mark.asyncio
+async def test_pgq_expansion_matches_relational_on_oracle(oracle_memory, request_context, monkeypatch, caplog):
+    """On a real ADB every SQL/PGQ arm runs, without fallback, and agrees with the relational CTEs.
+
+    The retriever turns any SQL/PGQ error into the relational fallback, so a GRAPH_TABLE query
+    that Oracle rejects would still pass every mocked test above. This seeds a small graph and
+    runs both shapes. Unit ids are pinned so the seed's source ranks first under every entity:
+    with a small per-entity cap it then takes the only slot, which is where a ranking that
+    skips the seed's sources would return more than the relational CTE.
+    """
+    from hindsight_api.engine.retain.types import embedding_to_pgvector
+    from hindsight_api.engine.schema import fq_store_table as fq_table
+
+    bank_id = f"test-pgq-{uuid.uuid4().hex[:8]}"
+    dim = oracle_memory.embeddings.dimension
+    # Highest id first: ORDER BY unit_id DESC ranks them in this order.
+    names = ["w_seed", "w_a", "w_b", "x_other", "w_c", "w_far", "o_seed", "o_two", "o_one", "o_none"]
+    fact_types = ["world", "world", "world", "experience", "world", "world"] + ["observation"] * 4
+    pinned = [uuid.UUID(f"{0xF0 - 0x10 * i:02x}" + uuid.uuid4().hex[2:]) for i in range(len(names))]
+    e1, e2, e3 = (str(uuid.uuid4()) for _ in range(3))
+    n = len(names)
+    graph = "hindsight_memory_graph"
+    mu, ue, ml = fq_table("memory_units"), fq_table("unit_entities"), fq_table("memory_links")
+    try:
+        await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+        backend = await oracle_memory._get_backend()
+        ops = backend.ops
+        async with backend.transaction() as conn:
+            with monkeypatch.context() as m:
+                m.setattr(uuid, "uuid4", iter(pinned).__next__)
+                ids = await ops.insert_facts_batch(
+                    conn,
+                    bank_id,
+                    fact_texts=[f"pgq {name}" for name in names],
+                    embeddings=[embedding_to_pgvector([1.0] + [0.0] * (dim - 1))] * n,
+                    event_dates=[datetime(2024, 1, 1, tzinfo=timezone.utc)] * n,
+                    occurred_starts=[None] * n,
+                    occurred_ends=[None] * n,
+                    mentioned_ats=[None] * n,
+                    contexts=[""] * n,
+                    fact_types=fact_types,
+                    metadata_jsons=["{}"] * n,
+                    chunk_ids=[None] * n,
+                    document_ids=[None] * n,
+                    tags_list=["[]"] * n,
+                    observation_scopes_list=[None] * n,
+                    text_signals_list=[None] * n,
+                    attachment_ids_list=[None] * n,
+                )
+            u = dict(zip(names, (str(i) for i in ids)))
+            assert u["w_seed"] == str(pinned[0])
+            for eid, name in ((e1, "e1"), (e2, "e2"), (e3, "e3")):
+                await conn.execute(
+                    f"INSERT INTO {fq_table('entities')} (id, bank_id, canonical_name) VALUES ($1, $2, $3)",
+                    eid,
+                    bank_id,
+                    f"pgq {name}",
+                )
+            for unit, eid in (
+                ("w_seed", e1), ("w_a", e1), ("w_b", e1), ("x_other", e1),
+                ("w_seed", e2), ("w_c", e2),
+                ("w_far", e3),
+            ):  # fmt: skip
+                await conn.execute(f"INSERT INTO {ue} (unit_id, entity_id) VALUES ($1, $2)", u[unit], eid)
+            for a, b in ((e1, e2), (e2, e3)):
+                await conn.execute(
+                    f"INSERT INTO {fq_table('entity_cooccurrences')} (entity_id_1, entity_id_2) VALUES ($1, $2)", a, b
+                )
+            for src, dst, link_type, weight in (
+                ("w_seed", "w_a", "semantic", 0.9),
+                ("w_b", "w_seed", "semantic", 0.8),
+                ("w_seed", "w_c", "causes", 0.7),
+                ("w_c", "w_far", "enables", 0.5),
+                ("o_seed", "o_one", "semantic", 0.6),
+                ("o_seed", "o_two", "causes", 0.4),
+            ):
+                await conn.execute(
+                    f"INSERT INTO {ml} (from_unit_id, to_unit_id, link_type, weight, bank_id) VALUES ($1, $2, $3, $4, $5)",
+                    u[src],
+                    u[dst],
+                    link_type,
+                    weight,
+                    bank_id,
+                )
+            for obs, src in (
+                ("o_seed", "w_seed"),
+                ("o_two", "w_a"),
+                ("o_two", "w_b"),
+                ("o_one", "w_c"),
+                ("o_none", "w_far"),
+            ):
+                await conn.execute(
+                    f"INSERT INTO {fq_table('observation_sources')} (observation_id, source_id) VALUES ($1, $2)",
+                    u[obs],
+                    u[src],
+                )
+
+        by_id = {v: k for k, v in u.items()}
+
+        def named(rows) -> dict[str, float]:
+            return {by_id[i]: s for i, s in _ids(rows).items()}
+
+        window = UpdatedWindow(after=None, before=None, first_param_index=4)
+        obs_window = UpdatedWindow(after=None, before=None, first_param_index=3)
+        async with backend.acquire() as conn:
+            if not await ops.has_property_graph(conn):
+                # The migration skips the graph without CREATE PROPERTY GRAPH (ORA-01031).
+                pytest.skip("hindsight_memory_graph is absent: the test user lacks CREATE PROPERTY GRAPH")
+
+            for cap, want_entity, want_obs in (
+                (1, {"w_a": 1.0, "w_c": 1.0}, {}),
+                (2, {"w_a": 1.0, "w_b": 1.0, "w_c": 1.0}, {"o_two": 1.0, "o_one": 1.0}),
+                (4, {"w_a": 1.0, "w_b": 1.0, "w_c": 1.0}, {"o_two": 2.0, "o_one": 1.0}),
+            ):
+                rel_rows = await conn.fetch(
+                    f"""WITH {ops.build_entity_expansion_cte(mu, ue, cap, window)},
+                    {ops.build_semantic_causal_cte(ml, mu, window)}
+                    SELECT * FROM entity_expanded UNION ALL SELECT * FROM semantic_expanded
+                    UNION ALL SELECT * FROM causal_expanded""",
+                    [u["w_seed"]],
+                    "world",
+                    10,
+                )
+                pgq_rows = await conn.fetch(
+                    f"""WITH {build_pgq_entity_expansion_cte(graph, mu, cap, window)},
+                    {build_pgq_semantic_causal_cte(graph, mu, window, max_causal_hops=2)}
+                    SELECT * FROM entity_expanded UNION ALL SELECT * FROM semantic_expanded
+                    UNION ALL SELECT * FROM causal_expanded""",
+                    [u["w_seed"]],
+                    "world",
+                    10,
+                )
+                arm = {"rel": {}, "pgq": {}}
+                for key, rows in (("rel", rel_rows), ("pgq", pgq_rows)):
+                    for source in ("entity", "semantic", "causal"):
+                        arm[key][source] = named([r for r in rows if r["source"] == source])
+                assert arm["pgq"]["entity"] == arm["rel"]["entity"] == want_entity, (cap, arm)
+                assert arm["pgq"]["semantic"] == arm["rel"]["semantic"] == {"w_a": 0.9, "w_b": 0.8}
+                # The relational causal arm is one hop; SQL/PGQ adds the 2-hop w_seed -> w_c -> w_far.
+                assert arm["rel"]["causal"] == {"w_c": 0.7}
+                assert arm["pgq"]["causal"] == {"w_c": 0.7, "w_far": round(0.7 * 0.5 * 0.7, 6)}
+
+                rel_obs = await ops.expand_observations(conn, mu, ue, ml, [u["o_seed"]], 10, cap, obs_window)
+                pgq_obs = await expand_observations_pgq(
+                    conn, graph, mu, [u["o_seed"]], 10, cap, obs_window, max_causal_hops=2
+                )
+                assert named(pgq_obs.entity) == named(rel_obs.entity) == want_obs, cap
+                assert named(pgq_obs.semantic) == named(rel_obs.semantic) == {"o_one": 0.6}
+                assert named(pgq_obs.causal) == named(rel_obs.causal) == {"o_two": 0.4}
+
+            neighborhood = await query_entity_neighborhood_pgq(
+                conn, mu_table=mu, graph_name=graph, bank_id=bank_id, entity_ids=[e1], max_hops=2, limit=50
+            )
+            hops = {(by_id[str(r["id"])], str(r["neighbor_entity_id"])): int(r["hop_distance"]) for r in neighborhood}
+            assert hops == {
+                ("w_seed", e1): 0, ("w_a", e1): 0, ("w_b", e1): 0, ("x_other", e1): 0,
+                ("w_seed", e2): 1, ("w_c", e2): 1,
+                ("w_far", e3): 2,
+            }  # fmt: skip
+
+            # The retriever takes the SQL/PGQ path end to end, with no fallback.
+            caplog.clear()
+            with caplog.at_level("WARNING", logger="hindsight_api.engine.memories.ora.link_expansion"):
+                retriever = OracleLinkExpansionRetriever()
+                combined = await retriever._expand_combined(conn, [u["w_seed"]], "world", 10, ops=ops)
+                observed = await retriever._expand_observations(conn, [u["o_seed"]], 10, ops=ops)
+            assert not [r for r in caplog.records if "falling back" in r.getMessage()], caplog.text
+            assert named(combined.causal) == {"w_c": 0.7, "w_far": round(0.7 * 0.5 * 0.7, 6)}
+            assert named(observed.entity) == {"o_two": 2.0, "o_one": 1.0}
+    finally:
+        try:
+            await oracle_memory.delete_bank(bank_id, request_context=request_context)
+        except Exception:
+            pass
