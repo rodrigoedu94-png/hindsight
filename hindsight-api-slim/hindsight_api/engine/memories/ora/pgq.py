@@ -21,7 +21,8 @@ def build_pgq_entity_expansion_cte(
     window: UpdatedWindow,
 ) -> str:
     """Build entity expansion CTE using Oracle 26ai SQL/PGQ GRAPH_TABLE over mentions edges."""
-    safe_limit = max(1, int(per_entity_limit))
+    # As the relational CTEs: a cap of 0 (or less) keeps no entity-linked units.
+    safe_limit = int(per_entity_limit)
     return f"""
             entity_units_raw AS (
                 SELECT DISTINCT entity_id, unit_id
@@ -181,16 +182,25 @@ async def expand_observations_pgq(
     window: UpdatedWindow,
     *,
     max_causal_hops: int = 2,
+    os_table: str = "observation_sources",
 ) -> LinkExpansionRows:
     """Expand observation memories via Oracle 26ai SQL/PGQ (derived_from, mentions, memory_link).
 
     The entity arm ranks every unit that mentions a seed source's entities, the seed
     sources included, and drops those only after the per-entity cap (``connected_sources``),
     as ``OracleOps.expand_observations`` does, so both pick the same units under the cap.
+
+    The last hop, from the connected sources back to their observations, joins
+    ``observation_sources`` on ``source_id`` instead of matching ``derived_from`` again.
+    A GRAPH_TABLE cannot be seeded from a CTE, so that match enumerated every
+    observation-to-source edge and joined ``memory_units`` once per edge to bind its
+    ``src`` vertex: 6.2k buffer gets for this arm against 0.8k relational, on an
+    8.5k-unit bank. The join reads only the candidate sources' rows (0.9k).
     """
     if not seed_ids or budget <= 0:
         return LinkExpansionRows(entity=[], semantic=[], causal=[])
-    safe_limit = max(1, int(per_entity_limit))
+    # As the relational CTEs: a cap of 0 (or less) keeps no entity-linked units.
+    safe_limit = int(per_entity_limit)
     causal_two_hop = ""
     if max_causal_hops >= 2:
         causal_two_hop = f"""
@@ -255,25 +265,12 @@ async def expand_observations_pgq(
                       SELECT 1 FROM seed_sources ss WHERE ss.source_id = eur.unit_id
                   )
             ),
-            obs_derived_edges AS (
-                SELECT observation_id, source_id
-                FROM GRAPH_TABLE (
-                    {graph_name}
-                    MATCH (obs IS memory_unit) -[d IS derived_from]-> (src IS memory_unit)
-                    WHERE obs.fact_type = 'observation'
-                      AND obs.id != ALL($1::uuid[])
-                      {window.clause("obs")}
-                    COLUMNS (
-                        obs.id AS observation_id,
-                        src.id AS source_id
-                    )
-                )
-            ),
             obs_scores AS (
-                SELECT ode.observation_id, COUNT(DISTINCT cs.source_id) AS score
+                SELECT os.observation_id, COUNT(DISTINCT cs.source_id) AS score
                 FROM connected_sources cs
-                JOIN obs_derived_edges ode ON ode.source_id = cs.source_id
-                GROUP BY ode.observation_id
+                JOIN {os_table} os ON os.source_id = cs.source_id
+                WHERE os.observation_id != ALL($1::uuid[])
+                GROUP BY os.observation_id
             ),
             observation_entity_expanded AS (
                 SELECT {memory_unit_columns("mu", indent=23)},

@@ -19,6 +19,24 @@ from .pgq import (
 logger = logging.getLogger(__name__)
 
 
+async def _use_pgq(conn, ops) -> bool:
+    """Whether the SQL/PGQ path applies: an Oracle connection whose schema exposes the graph.
+
+    OracleOps caches the capability per schema, but the first check is still a query, so it
+    gets the expansion's deadline too: a probe that stalls means relational expansion.
+    """
+    if getattr(conn, "backend_type", None) != "oracle" or not callable(getattr(ops, "has_property_graph", None)):
+        return False
+    timeout = get_config().link_expansion_timeout
+    try:
+        return bool(await asyncio.wait_for(ops.has_property_graph(conn), timeout=timeout))
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[LinkExpansion] SQL/PGQ capability check timed out after %ss, using relational expansion", timeout
+        )
+        return False
+
+
 class OracleLinkExpansionRetriever(LinkExpansionRetriever):
     """LinkExpansionRetriever that uses Oracle 26ai SQL/PGQ when available, with relational fallback."""
 
@@ -33,11 +51,7 @@ class OracleLinkExpansionRetriever(LinkExpansionRetriever):
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> LinkExpansionRows:
-        use_pgq = (
-            getattr(conn, "backend_type", None) == "oracle"
-            and callable(getattr(ops, "has_property_graph", None))
-            and await ops.has_property_graph(conn)
-        )
+        use_pgq = await _use_pgq(conn, ops)
         if not use_pgq:
             return await super()._expand_combined(
                 conn,
@@ -141,11 +155,7 @@ class OracleLinkExpansionRetriever(LinkExpansionRetriever):
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> LinkExpansionRows:
-        use_pgq = (
-            getattr(conn, "backend_type", None) == "oracle"
-            and callable(getattr(ops, "has_property_graph", None))
-            and await ops.has_property_graph(conn)
-        )
+        use_pgq = await _use_pgq(conn, ops)
         if not use_pgq:
             return await super()._expand_observations(
                 conn,
@@ -173,23 +183,20 @@ class OracleLinkExpansionRetriever(LinkExpansionRetriever):
                     per_entity_limit,
                     window,
                     max_causal_hops=getattr(config, "oracle_pgq_max_hops", 2),
+                    os_table=fq_table("observation_sources"),
                 ),
                 timeout=config.link_expansion_timeout,
             )
         except asyncio.TimeoutError:
+            # The deadline is spent: like the relational path on timeout, the graph arm yields
+            # nothing and recall continues on its other strategies. Running the relational
+            # query now would let observation expansion take twice link_expansion_timeout.
             logger.warning(
                 "[LinkExpansion] Oracle SQL/PGQ observation expansion timed out after %ss, "
-                "falling back to relational expansion",
+                "skipping graph results for fact_type=observation",
                 config.link_expansion_timeout,
             )
-            return await super()._expand_observations(
-                conn,
-                seed_ids,
-                budget,
-                ops=ops,
-                created_after=created_after,
-                created_before=created_before,
-            )
+            return LinkExpansionRows(entity=[], semantic=[], causal=[])
         except Exception as pgq_err:
             logger.warning(
                 "[LinkExpansion] Oracle SQL/PGQ observation expansion failed (%s), "

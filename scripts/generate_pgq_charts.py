@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["matplotlib>=3.8"]
+# ///
 """Generate Oracle 26ai SQL/PGQ topology diagrams and benchmark comparison charts (LIN-273).
+
+matplotlib is not a hindsight-api dependency: the script declares it inline (PEP 723),
+so ``uv run`` installs it into a throwaway environment.
 
 Usage:
     # 1. Generate the hindsight_memory_graph architecture & query-path diagram only:
-    python3 scripts/generate_pgq_charts.py --topology-only --output-dir docs/oracle/charts
+    uv run scripts/generate_pgq_charts.py --topology-only --output-dir docs/oracle/charts
 
     # 2. Generate both topology diagram and benchmark comparison charts from JSON:
-    python3 scripts/generate_pgq_charts.py --input pgq_benchmark_results.json --output-dir docs/oracle/charts
+    uv run scripts/generate_pgq_charts.py --input pgq_benchmark_results.json --output-dir docs/oracle/charts
 """
 
 from __future__ import annotations
@@ -16,7 +23,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-import matplotlib
+try:
+    import matplotlib
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "generate_pgq_charts.py needs matplotlib: run it with `uv run scripts/generate_pgq_charts.py ...` "
+        "(it declares its dependencies inline) or `pip install matplotlib`."
+    ) from exc
 
 matplotlib.use("Agg")
 import matplotlib.patches as mpatches

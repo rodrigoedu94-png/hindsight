@@ -95,7 +95,9 @@ async def test_expand_observations_pgq_uses_derived_from_and_guards_empty(max_ho
     sql = conn.fetch.await_args.args[0]
     assert "-[d IS derived_from]->" in sql
     assert "-[m1 IS mentions]-> (e IS entity)" in sql
-    assert "obs.id != ALL($1::uuid[])" in sql
+    # The last hop back to observations reads observation_sources by source_id.
+    assert "JOIN observation_sources os ON os.source_id = cs.source_id" in sql
+    assert "os.observation_id != ALL($1::uuid[])" in sql
     assert "-[l IS memory_link]- (" not in sql
     assert "MATCH (dst IS memory_unit) -[l IS memory_link]-> (src IS memory_unit)" in sql
     assert "WHERE eur.rn <= 5" in sql
@@ -156,18 +158,71 @@ async def test_oracle_link_expansion_retriever_uses_pgq_and_falls_back(monkeypat
     assert len(res_obs.entity) == 1
     assert "-[d IS derived_from]->" in conn.fetch.await_args.args[0]
 
+    # A SQL/PGQ error falls back to the relational expansion.
     conn.fetch = AsyncMock(side_effect=RuntimeError("ORA-49022: graph unavailable"))
     fallback_rows = MagicMock()
-    monkeypatch.setattr(LinkExpansionRetriever, "_expand_observations", AsyncMock(return_value=fallback_rows))
+    relational = AsyncMock(return_value=fallback_rows)
+    monkeypatch.setattr(LinkExpansionRetriever, "_expand_observations", relational)
     assert await retriever._expand_observations(conn, ["seed-obs"], 20, ops=ops) is fallback_rows
 
+    # A SQL/PGQ timeout has spent the deadline: no graph rows, and no second (relational) query.
+    relational.reset_mock()
     conn.fetch = AsyncMock(side_effect=asyncio.TimeoutError())
-    assert await retriever._expand_observations(conn, ["seed-obs"], 20, ops=ops) is fallback_rows
+    timed_out = await retriever._expand_observations(conn, ["seed-obs"], 20, ops=ops)
+    assert timed_out.entity == [] and timed_out.semantic == [] and timed_out.causal == []
+    relational.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oracle_link_expansion_retriever_bounds_the_capability_probe(monkeypatch):
+    """A stalled has_property_graph() probe is cut at the expansion deadline and means relational."""
+    monkeypatch.setattr(ora_le, "fq_table", lambda t: t)
+    monkeypatch.setattr(ora_le, "get_config", lambda: MagicMock(link_expansion_timeout=0.05))
+    ops = OracleOps()
+
+    async def stalled(_conn):
+        await asyncio.sleep(5)
+        return True
+
+    monkeypatch.setattr(ops, "has_property_graph", stalled)
+    conn = MagicMock()
+    conn.backend_type = "oracle"
+    conn.fetch = AsyncMock()
+    observations, combined = MagicMock(), MagicMock()
+    monkeypatch.setattr(LinkExpansionRetriever, "_expand_observations", AsyncMock(return_value=observations))
+    monkeypatch.setattr(LinkExpansionRetriever, "_expand_combined", AsyncMock(return_value=combined))
+
+    retriever = OracleLinkExpansionRetriever()
+    assert await asyncio.wait_for(retriever._expand_observations(conn, ["s"], 20, ops=ops), 1) is observations
+    assert await asyncio.wait_for(retriever._expand_combined(conn, ["s"], "world", 20, ops=ops), 1) is combined
+    conn.fetch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("cap", [0, -3])
+def test_pgq_entity_caps_of_zero_or_less_keep_no_units(cap):
+    """Like the relational CTEs, a non-positive per-entity cap is not raised to 1."""
+    window = UpdatedWindow(after=None, before=None, first_param_index=4)
+    assert f"WHERE eur.rn <= {cap}" in build_pgq_entity_expansion_cte("g", "mu_t", cap, window)
 
 
 # ---------------------------------------------------------------------------
 # Oracle 26ai integration: the GRAPH_TABLE arms run and match the relational CTEs
 # ---------------------------------------------------------------------------
+
+
+class _RecordingConnection:
+    """Delegates to a real connection and records the SQL each fetch() sends."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.queries: list[str] = []
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    async def fetch(self, query, *args, **kwargs):
+        self.queries.append(query)
+        return await self._conn.fetch(query, *args, **kwargs)
 
 
 def _ids(rows) -> dict[str, float]:
@@ -285,6 +340,7 @@ async def test_pgq_expansion_matches_relational_on_oracle(oracle_memory, request
                 pytest.skip("hindsight_memory_graph is absent: the test user lacks CREATE PROPERTY GRAPH")
 
             for cap, want_entity, want_obs in (
+                (0, {}, {}),
                 (1, {"w_a": 1.0, "w_c": 1.0}, {}),
                 (2, {"w_a": 1.0, "w_b": 1.0, "w_c": 1.0}, {"o_two": 1.0, "o_one": 1.0}),
                 (4, {"w_a": 1.0, "w_b": 1.0, "w_c": 1.0}, {"o_two": 2.0, "o_one": 1.0}),
@@ -335,15 +391,26 @@ async def test_pgq_expansion_matches_relational_on_oracle(oracle_memory, request
                 ("w_far", e3): 2,
             }  # fmt: skip
 
-            # The retriever takes the SQL/PGQ path end to end, with no fallback.
+            # The retriever takes the SQL/PGQ path end to end, with no fallback: each call sends
+            # exactly one query, and it is the SQL/PGQ one (the relational rows are the same).
+            recorded = _RecordingConnection(conn)
             caplog.clear()
             with caplog.at_level("WARNING", logger="hindsight_api.engine.memories.ora.link_expansion"):
                 retriever = OracleLinkExpansionRetriever()
-                combined = await retriever._expand_combined(conn, [u["w_seed"]], "world", 10, ops=ops)
-                observed = await retriever._expand_observations(conn, [u["o_seed"]], 10, ops=ops)
+                combined = await retriever._expand_combined(recorded, [u["w_seed"]], "world", 10, ops=ops)
+                combined_sql = list(recorded.queries)
+                recorded.queries.clear()
+                observed = await retriever._expand_observations(recorded, [u["o_seed"]], 10, ops=ops)
+                observed_sql = list(recorded.queries)
             assert not [r for r in caplog.records if "falling back" in r.getMessage()], caplog.text
+            assert len(combined_sql) == 1 and "MATCH (src IS memory_unit) -[m1 IS mentions]->" in combined_sql[0]
+            assert len(observed_sql) == 1 and "-[d IS derived_from]->" in observed_sql[0]
+            assert named(combined.entity) == {"w_a": 1.0, "w_b": 1.0, "w_c": 1.0}
+            assert named(combined.semantic) == {"w_a": 0.9, "w_b": 0.8}
             assert named(combined.causal) == {"w_c": 0.7, "w_far": round(0.7 * 0.5 * 0.7, 6)}
             assert named(observed.entity) == {"o_two": 2.0, "o_one": 1.0}
+            assert named(observed.semantic) == {"o_one": 0.6}
+            assert named(observed.causal) == {"o_two": 0.4}
     finally:
         try:
             await oracle_memory.delete_bank(bank_id, request_context=request_context)
