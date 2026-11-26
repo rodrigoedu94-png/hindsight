@@ -225,7 +225,7 @@ def render_benchmark_charts(data: dict[str, Any], output_path: Path) -> Path:
         ax1.set_title("Logical Reads (V$SQL buffer_gets / exec)", fontsize=11.5, fontweight="bold", color="#0F172A")
         ax1.set_ylabel("Buffer Gets (lower is better)", color="#334155")
         ax1.set_xticks(x)
-    ax1.set_xticklabels(labels, fontsize=8.5, rotation=12, ha="right")
+        ax1.set_xticklabels(labels, fontsize=8.5, rotation=12, ha="right")
         ax1.grid(axis="y", linestyle="--", alpha=0.4)
         for bar, raw in zip(bars_g, gets):
             if raw is not None:
