@@ -3011,6 +3011,19 @@ def _assemble_graph_data(
     return {"nodes": nodes, "edges": edges, "table_rows": table_rows, "total_units": total_count, "limit": limit}
 
 
+def _stored_embedding_vector(value: Any) -> np.ndarray:
+    """A stored embedding as a float32 vector, whatever the backend handed back.
+
+    Postgres casts it to pgvector text (``"[0.1,0.2,...]"``); Oracle's rewriter drops that cast
+    and python-oracledb returns the ``VECTOR`` column as an ``array.array`` (or a list), which
+    has no ``.split`` — slicing it as text raised and silently disabled recall dedup's cosine
+    pre-filter on Oracle.
+    """
+    if isinstance(value, str):
+        return np.array(value.strip()[1:-1].split(","), dtype=np.float32)
+    return np.asarray(value, dtype=np.float32)
+
+
 class MemoryEngine(MemoryEngineInterface):
     """
     Advanced memory system using temporal and semantic linking with PostgreSQL.
@@ -10521,11 +10534,10 @@ class MemoryEngine(MemoryEngineInterface):
                 rows = await get_memories().unit_embeddings(
                     conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids
                 )
-            # pgvector text, "[0.1,0.2,...]". Parsed inside the try: a malformed row must not fail the recall.
+            # pgvector text on Postgres, a VECTOR array on Oracle. Parsed inside the try: a malformed
+            # row must not fail the recall.
             vectors = {
-                row["id"]: np.array(row["embedding"][1:-1].split(","), dtype=np.float32)
-                for row in rows
-                if row["embedding"] is not None
+                row["id"]: _stored_embedding_vector(row["embedding"]) for row in rows if row["embedding"] is not None
             }
         except Exception:
             logger.warning("recall dedup: embeddings unavailable, asking every pair", exc_info=True)
