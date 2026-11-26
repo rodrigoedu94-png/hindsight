@@ -217,6 +217,7 @@ class TestEveryRemoteRerankerRetries:
             ("google", {"reranker_google_project_id": "p"}),
             ("litellm", {"reranker_litellm_api_base": "https://example.invalid"}),
             ("litellm-sdk", {"reranker_litellm_sdk_api_key": "k"}),
+            ("oracle", {"database_url": "oracle://u:p@localhost:1521/FREEPDB1"}),
         ],
     )
     def test_factory_gives_every_remote_provider_a_policy(self, provider, extra):

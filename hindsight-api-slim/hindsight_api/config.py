@@ -610,6 +610,11 @@ ENV_EMBEDDINGS_ONNX_DEVICE = "HINDSIGHT_API_EMBEDDINGS_ONNX_DEVICE"
 ENV_EMBEDDINGS_ONNX_CUDA_DEVICE_ID = "HINDSIGHT_API_EMBEDDINGS_ONNX_CUDA_DEVICE_ID"
 ENV_EMBEDDINGS_TEI_URL = "HINDSIGHT_API_EMBEDDINGS_TEI_URL"
 ENV_EMBEDDINGS_TEI_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_TEI_BATCH_SIZE"
+ENV_EMBEDDINGS_ORACLE_MODEL = "HINDSIGHT_API_EMBEDDINGS_ORACLE_MODEL"
+ENV_EMBEDDINGS_ORACLE_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_ORACLE_BATCH_SIZE"
+ENV_EMBEDDINGS_ORACLE_MAX_CONCURRENT = "HINDSIGHT_API_EMBEDDINGS_ORACLE_MAX_CONCURRENT"
+ENV_EMBEDDINGS_ORACLE_DIMENSIONS = "HINDSIGHT_API_EMBEDDINGS_ORACLE_DIMENSIONS"
+ENV_EMBEDDINGS_ORACLE_DATABASE_URL = "HINDSIGHT_API_EMBEDDINGS_ORACLE_DATABASE_URL"
 ENV_EMBEDDINGS_OPENAI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
 ENV_EMBEDDINGS_OPENAI_MODEL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"
 ENV_EMBEDDINGS_OPENAI_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"
@@ -737,6 +742,12 @@ ENV_RERANKER_TEI_URL = "HINDSIGHT_API_RERANKER_TEI_URL"
 ENV_RERANKER_TEI_BATCH_SIZE = "HINDSIGHT_API_RERANKER_TEI_BATCH_SIZE"
 ENV_RERANKER_TEI_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT"
 ENV_RERANKER_TEI_HTTP_TIMEOUT = "HINDSIGHT_API_RERANKER_TEI_HTTP_TIMEOUT"
+ENV_RERANKER_ORACLE_MODEL = "HINDSIGHT_API_RERANKER_ORACLE_MODEL"
+ENV_RERANKER_ORACLE_BATCH_SIZE = "HINDSIGHT_API_RERANKER_ORACLE_BATCH_SIZE"
+ENV_RERANKER_ORACLE_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_ORACLE_MAX_CONCURRENT"
+ENV_RERANKER_ORACLE_MAX_CHARS = "HINDSIGHT_API_RERANKER_ORACLE_MAX_CHARS"
+ENV_RERANKER_ORACLE_TIMEOUT = "HINDSIGHT_API_RERANKER_ORACLE_TIMEOUT"
+ENV_RERANKER_ORACLE_DATABASE_URL = "HINDSIGHT_API_RERANKER_ORACLE_DATABASE_URL"
 ENV_RERANKER_COHERE_TIMEOUT = "HINDSIGHT_API_RERANKER_COHERE_TIMEOUT"
 ENV_RERANKER_COHERE_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_COHERE_MAX_CONCURRENT"
 ENV_RERANKER_OPENROUTER_TIMEOUT = "HINDSIGHT_API_RERANKER_OPENROUTER_TIMEOUT"
@@ -1500,6 +1511,9 @@ DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE = 100
 # throughput actually came from. Lower it per-deployment if a sweep on your own hardware
 # says so.
 DEFAULT_EMBEDDINGS_TEI_BATCH_SIZE = 32
+DEFAULT_EMBEDDINGS_ORACLE_MODEL = "HS_EMBED_1"
+DEFAULT_EMBEDDINGS_ORACLE_BATCH_SIZE = 32
+DEFAULT_EMBEDDINGS_ORACLE_MAX_CONCURRENT = 4
 # Embedding requests a remote provider issues concurrently for one encode() call. This
 # is what actually buys embedder throughput: the same TEI server measured 903 texts/s at
 # one in-flight request and 2,080 at eight. Bounded here rather than at the caller
@@ -1546,6 +1560,11 @@ DEFAULT_RERANKER_LOCAL_TIMEOUT = 300.0
 DEFAULT_RERANKER_TEI_BATCH_SIZE = 128
 DEFAULT_RERANKER_TEI_MAX_CONCURRENT = 8
 DEFAULT_RERANKER_TEI_HTTP_TIMEOUT = 30.0  # HTTP timeout for TEI reranker requests (seconds)
+DEFAULT_RERANKER_ORACLE_MODEL = "HS_RERANK_1"
+DEFAULT_RERANKER_ORACLE_BATCH_SIZE = 32
+DEFAULT_RERANKER_ORACLE_MAX_CONCURRENT = 4
+DEFAULT_RERANKER_ORACLE_MAX_CHARS = 4000
+DEFAULT_RERANKER_ORACLE_TIMEOUT = 60.0
 # HTTP timeout (seconds) for remote rerank providers. Defaults match the previous
 # hardcoded constructor defaults so unset envs keep current behavior.
 DEFAULT_RERANKER_COHERE_TIMEOUT = 60.0
@@ -3256,6 +3275,35 @@ class OnnxRerankerConfig:
         )
 
 
+@dataclass(frozen=True)
+class OracleRerankerConfig:
+    """Settings for an Oracle 26ai in-database ONNX reranker member.
+
+    Bundled like :class:`OnnxRerankerConfig` so adding Oracle in-DB options does
+    not widen :class:`HindsightConfig` and primary/indexed members share one
+    parser.
+    """
+
+    model: str
+    batch_size: int
+    max_concurrent: int
+    max_chars: int
+    timeout: float
+    database_url: str | None
+
+    @classmethod
+    def from_env(cls, base: str) -> "OracleRerankerConfig":
+        """Read one member's Oracle in-DB reranker settings from *base*."""
+        return cls(
+            model=_member_str(base, "ORACLE_MODEL", DEFAULT_RERANKER_ORACLE_MODEL),
+            batch_size=_member_int(base, "ORACLE_BATCH_SIZE", DEFAULT_RERANKER_ORACLE_BATCH_SIZE),
+            max_concurrent=_member_int(base, "ORACLE_MAX_CONCURRENT", DEFAULT_RERANKER_ORACLE_MAX_CONCURRENT),
+            max_chars=_member_int(base, "ORACLE_MAX_CHARS", DEFAULT_RERANKER_ORACLE_MAX_CHARS),
+            timeout=_member_float(base, "ORACLE_TIMEOUT", DEFAULT_RERANKER_ORACLE_TIMEOUT),
+            database_url=_member_opt_str(base, "ORACLE_DATABASE_URL"),
+        )
+
+
 @dataclass
 class RerankerMemberConfig:
     """One reranker in the failover chain.
@@ -3308,6 +3356,7 @@ class RerankerMemberConfig:
     flashrank_cpu_mem_arena: bool
     flashrank_batch_size: int
     onnx: OnnxRerankerConfig
+    oracle: OracleRerankerConfig
     # litellm (proxy)
     litellm_api_base: str
     litellm_api_key: str | None
@@ -3480,6 +3529,7 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
                 ),
                 flashrank_batch_size=_member_int(base, "FLASHRANK_BATCH_SIZE", DEFAULT_RERANKER_FLASHRANK_BATCH_SIZE),
                 onnx=OnnxRerankerConfig.from_env(base),
+                oracle=OracleRerankerConfig.from_env(base),
                 litellm_api_base=_member_str(base, "LITELLM_API_BASE", DEFAULT_LITELLM_API_BASE),
                 litellm_api_key=_member_opt_str(base, "LITELLM_API_KEY"),
                 litellm_model=_member_str(base, "LITELLM_MODEL", DEFAULT_RERANKER_LITELLM_MODEL),
@@ -4413,6 +4463,11 @@ class HindsightConfig:
     oracle_statement_cache_size: int = DEFAULT_ORACLE_STATEMENT_CACHE_SIZE
     oracle_use_property_graph: bool = DEFAULT_ORACLE_USE_PROPERTY_GRAPH
     oracle_pgq_max_hops: int = DEFAULT_ORACLE_PGQ_MAX_HOPS
+    embeddings_oracle_model: str = DEFAULT_EMBEDDINGS_ORACLE_MODEL
+    embeddings_oracle_batch_size: int = DEFAULT_EMBEDDINGS_ORACLE_BATCH_SIZE
+    embeddings_oracle_max_concurrent: int = DEFAULT_EMBEDDINGS_ORACLE_MAX_CONCURRENT
+    embeddings_oracle_dimensions: int | None = None
+    embeddings_oracle_database_url: str | None = None
 
     # Webhook SSRF hardening (static, server-level only — deliberately NOT
     # per-bank configurable: a tenant must not be able to re-open the private
@@ -4584,6 +4639,7 @@ class HindsightConfig:
         "reranker_siliconflow_base_url",
         "reranker_nvidia_base_url",
         "reranker_typesafe_base_url",
+        "embeddings_oracle_database_url",
         # Service Account Keys
         "llm_vertexai_service_account_key",
         "embeddings_vertexai_service_account_key",
@@ -4788,6 +4844,7 @@ class HindsightConfig:
             ),
             # onnx, like flashrank, has no HindsightConfig fields — read from the env directly
             onnx=OnnxRerankerConfig.from_env("HINDSIGHT_API_RERANKER_"),
+            oracle=OracleRerankerConfig.from_env("HINDSIGHT_API_RERANKER_"),
             litellm_api_base=self.reranker_litellm_api_base,
             litellm_api_key=self.reranker_litellm_api_key,
             litellm_model=self.reranker_litellm_model,
@@ -5457,6 +5514,22 @@ class HindsightConfig:
                 getenv(ENV_EMBEDDINGS_TEI_BATCH_SIZE),
                 DEFAULT_EMBEDDINGS_TEI_BATCH_SIZE,
             ),
+            embeddings_oracle_model=getenv(ENV_EMBEDDINGS_ORACLE_MODEL, DEFAULT_EMBEDDINGS_ORACLE_MODEL),
+            embeddings_oracle_batch_size=_parse_positive_int(
+                ENV_EMBEDDINGS_ORACLE_BATCH_SIZE,
+                getenv(ENV_EMBEDDINGS_ORACLE_BATCH_SIZE),
+                DEFAULT_EMBEDDINGS_ORACLE_BATCH_SIZE,
+            ),
+            embeddings_oracle_max_concurrent=_parse_positive_int(
+                ENV_EMBEDDINGS_ORACLE_MAX_CONCURRENT,
+                getenv(ENV_EMBEDDINGS_ORACLE_MAX_CONCURRENT),
+                DEFAULT_EMBEDDINGS_ORACLE_MAX_CONCURRENT,
+            ),
+            embeddings_oracle_dimensions=_parse_optional_positive_int(
+                ENV_EMBEDDINGS_ORACLE_DIMENSIONS,
+                getenv(ENV_EMBEDDINGS_ORACLE_DIMENSIONS),
+            ),
+            embeddings_oracle_database_url=getenv(ENV_EMBEDDINGS_ORACLE_DATABASE_URL) or None,
             embeddings_max_concurrent_requests=_parse_positive_int(
                 ENV_EMBEDDINGS_MAX_CONCURRENT_REQUESTS,
                 getenv(ENV_EMBEDDINGS_MAX_CONCURRENT_REQUESTS),

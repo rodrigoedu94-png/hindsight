@@ -2302,6 +2302,98 @@ class MultiCrossEncoder(CrossEncoderModel):
         raise last_exc
 
 
+class OracleInDbCrossEncoder(CrossEncoderModel):
+    """In-database Oracle AI Database 26ai ONNX reranker via ``PREDICTION``."""
+
+    def __init__(
+        self,
+        *,
+        database_url: str | None,
+        schema: str | None = None,
+        model_name: str = "HS_RERANK_1",
+        batch_size: int = 32,
+        max_concurrent: int = 4,
+        max_chars: int = 4000,
+        timeout: float = 60.0,
+    ) -> None:
+        from .oracle_indb import OracleInDbClient, validate_oracle_model_name
+
+        self.model_name = validate_oracle_model_name(model_name)
+        self.batch_size = max(1, batch_size)
+        self.max_concurrent = max(1, max_concurrent)
+        self.max_chars = max(1, max_chars)
+        self.timeout = timeout
+        self._database_url = database_url
+        self._schema = schema
+        self._client: OracleInDbClient | None = (
+            OracleInDbClient(database_url, schema=schema, max_concurrent=self.max_concurrent) if database_url else None
+        )
+        self._slots: LoopLocal[asyncio.Semaphore] | None = None
+        self._initialized = False
+
+    @property
+    def provider_name(self) -> str:
+        return "oracle"
+
+    def _get_slots(self) -> asyncio.Semaphore:
+        if self._slots is None:
+            limit = self.max_concurrent
+            self._slots = LoopLocal(lambda: asyncio.Semaphore(limit))
+        return self._slots.get()
+
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+        if not self._database_url or self._client is None:
+            raise ValueError(
+                "HINDSIGHT_API_RERANKER_ORACLE_DATABASE_URL or HINDSIGHT_API_DATABASE_URL is required "
+                "when HINDSIGHT_API_RERANKER_PROVIDER is 'oracle'"
+            )
+        await self._client.verify_mining_model(self.model_name, "REGRESSION")
+        probe = await self._client.fetch_single(
+            f"SELECT PREDICTION({self.model_name} USING :q AS DATA1, :d AS DATA2) FROM DUAL",
+            {"q": "hindsight startup probe", "d": "hindsight startup probe"},
+        )
+        if probe is None:
+            raise RuntimeError(f"Oracle PREDICTION({self.model_name}) probe returned NULL")
+        self._initialized = True
+        logger.info("Reranker: Oracle in-DB model %s initialized (probe=%.4f)", self.model_name, float(probe))
+
+    async def _score_batch(self, batch: list[tuple[str, str]]) -> list[float]:
+        assert self._client is not None
+        async with self._get_slots():
+            if len(batch) == 1:
+                q, d = batch[0]
+                score = await asyncio.wait_for(
+                    self._client.fetch_single(
+                        f"SELECT PREDICTION({self.model_name} USING :q AS DATA1, :d AS DATA2) FROM DUAL",
+                        {"q": q[: self.max_chars], "d": d[: self.max_chars]},
+                    ),
+                    timeout=self.timeout,
+                )
+                return [float(score)]
+            items = [{"q": q[: self.max_chars], "d": d[: self.max_chars]} for q, d in batch]
+            scores = await asyncio.wait_for(
+                self._client.fetch_json_table_batch(
+                    f"SELECT jt.idx, PREDICTION({self.model_name} USING jt.q AS DATA1, jt.d AS DATA2) "
+                    "FROM JSON_TABLE(:payload, '$[*]' COLUMNS (idx FOR ORDINALITY, q CLOB PATH '$.q', d CLOB PATH '$.d')) jt "
+                    "ORDER BY jt.idx",
+                    items,
+                ),
+                timeout=self.timeout,
+            )
+            return [float(s) for s in scores]
+
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        if not self._initialized:
+            raise RuntimeError("OracleInDbCrossEncoder not initialized. Call initialize() first.")
+        if not pairs:
+            return []
+        batches = [pairs[i : i + self.batch_size] for i in range(0, len(pairs), self.batch_size)]
+        results = await asyncio.gather(*(self._score_batch(batch) for batch in batches))
+        return [score for batch_scores in results for score in batch_scores]
+
+
 # Reranker providers that must NOT be given a retry policy, and why. Everything
 # else is a remote API whose transient failures are worth retrying.
 _RERANKER_PROVIDERS_WITHOUT_RETRY = {
@@ -2559,9 +2651,23 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
         return RRFPassthroughCrossEncoder()
     elif provider == "jina-mlx":
         return JinaMLXCrossEncoder()
+    elif provider == "oracle":
+        from ..config import get_config
+
+        cfg = get_config()
+        oracle_cfg = member.oracle
+        return OracleInDbCrossEncoder(
+            database_url=oracle_cfg.database_url or cfg.database_url,
+            schema=cfg.database_schema,
+            model_name=oracle_cfg.model,
+            batch_size=oracle_cfg.batch_size,
+            max_concurrent=oracle_cfg.max_concurrent,
+            max_chars=oracle_cfg.max_chars,
+            timeout=oracle_cfg.timeout,
+        )
     else:
         raise ValueError(
-            f"Unknown reranker provider: {provider}. Supported: 'local', 'tei', 'cohere', 'zeroentropy', 'siliconflow', 'nvidia', 'typesafe', 'hindsight', 'alibaba', 'google', 'flashrank', 'onnx', 'litellm', 'litellm-sdk', 'rrf', 'jina-mlx'"
+            f"Unknown reranker provider: {provider}. Supported: 'local', 'tei', 'cohere', 'zeroentropy', 'siliconflow', 'nvidia', 'typesafe', 'hindsight', 'alibaba', 'google', 'flashrank', 'onnx', 'oracle', 'litellm', 'litellm-sdk', 'rrf', 'jina-mlx'"
         )
 
 

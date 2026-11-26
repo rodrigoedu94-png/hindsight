@@ -60,6 +60,7 @@ from ..config import (
     ENV_EMBEDDINGS_LITELLM_DIMENSIONS,
     ENV_EMBEDDINGS_NVIDIA_API_KEY,
     ENV_EMBEDDINGS_OPENAI_API_KEY,
+    ENV_EMBEDDINGS_ORACLE_DATABASE_URL,
     ENV_EMBEDDINGS_PROVIDER,
     ENV_EMBEDDINGS_TEI_URL,
     ENV_EMBEDDINGS_ZEROENTROPY_API_KEY,
@@ -2567,6 +2568,98 @@ def embedding_model_id(embeddings: Embeddings) -> str:
     return f"{embeddings.provider_name}:{model}:{embeddings.dimension}"
 
 
+class OracleInDbEmbeddings(Embeddings):
+    """In-database Oracle AI Database 26ai ONNX embeddings via ``VECTOR_EMBEDDING``."""
+
+    def __init__(
+        self,
+        *,
+        database_url: str | None,
+        schema: str | None = None,
+        model_name: str = "HS_EMBED_1",
+        batch_size: int = 32,
+        max_concurrent: int = 4,
+        dimensions: int | None = None,
+        query_prefix: str = "",
+        passage_prefix: str = "",
+    ) -> None:
+        from .oracle_indb import OracleInDbClient, validate_oracle_model_name
+
+        self.model_name = validate_oracle_model_name(model_name)
+        self.batch_size = max(1, batch_size)
+        self.max_concurrent_requests = max(1, max_concurrent)
+        self.query_prefix = query_prefix
+        self.passage_prefix = passage_prefix
+        self._database_url = database_url
+        self._schema = schema
+        self._explicit_dimensions = dimensions
+        self._dimension: int | None = dimensions
+        self._client: OracleInDbClient | None = (
+            OracleInDbClient(database_url, schema=schema, max_concurrent=self.max_concurrent_requests)
+            if database_url
+            else None
+        )
+        self._initialized = False
+
+    @property
+    def provider_name(self) -> str:
+        return "oracle"
+
+    @property
+    def dimension(self) -> int:
+        if self._dimension is None:
+            raise RuntimeError("OracleInDbEmbeddings not initialized. Call initialize() first.")
+        return self._dimension
+
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+        if not self._database_url or self._client is None:
+            raise ValueError(
+                f"{ENV_EMBEDDINGS_ORACLE_DATABASE_URL} or HINDSIGHT_API_DATABASE_URL is required "
+                "when HINDSIGHT_API_EMBEDDINGS_PROVIDER is 'oracle'"
+            )
+        await self._client.verify_mining_model(self.model_name, "EMBEDDING")
+        probe = await self._client.fetch_single(
+            f"SELECT VECTOR_EMBEDDING({self.model_name} USING :txt AS DATA) FROM DUAL",
+            {"txt": "hindsight startup probe"},
+        )
+        if probe is None:
+            raise RuntimeError(f"Oracle VECTOR_EMBEDDING({self.model_name}) probe returned NULL")
+        detected = len(probe)
+        if self._explicit_dimensions is not None and detected != self._explicit_dimensions:
+            raise ValueError(
+                f"Oracle model {self.model_name} produced {detected}d vectors, expected {self._explicit_dimensions}d"
+            )
+        self._dimension = detected
+        self._initialized = True
+        logger.info("Embeddings: Oracle in-DB model %s initialized (dim=%d)", self.model_name, detected)
+
+    async def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+        assert self._client is not None
+        if len(batch) == 1:
+            txt = batch[0]
+            vec = await self._client.fetch_single(
+                f"SELECT VECTOR_EMBEDDING({self.model_name} USING :txt AS DATA) FROM DUAL",
+                {"txt": txt},
+            )
+            return [[float(x) for x in vec]]
+        rows = await self._client.fetch_json_table_batch(
+            f"SELECT jt.idx, VECTOR_EMBEDDING({self.model_name} USING jt.txt AS DATA) "
+            "FROM JSON_TABLE(:payload, '$[*]' COLUMNS (idx FOR ORDINALITY, txt CLOB PATH '$')) jt "
+            "ORDER BY jt.idx",
+            batch,
+        )
+        return [[float(x) for x in vec] for vec in rows]
+
+    async def encode(self, texts: list[str]) -> list[list[float]]:
+        if not self._initialized:
+            raise RuntimeError("OracleInDbEmbeddings not initialized. Call initialize() first.")
+        if not texts:
+            return []
+        return await self._encode_batched(texts, self._embed_batch)
+
+
 def create_embeddings_from_env() -> Embeddings:
     """
     Create an Embeddings instance based on configuration.
@@ -2647,6 +2740,17 @@ def _create_embeddings(config: "ConfigLike") -> Embeddings:
             cpu_mem_arena=config.embeddings_onnx_cpu_mem_arena,
             device=config.embeddings_onnx_device,
             cuda_device_id=config.embeddings_onnx_cuda_device_id,
+        )
+    elif provider == "oracle":
+        return OracleInDbEmbeddings(
+            database_url=config.embeddings_oracle_database_url or config.database_url,
+            schema=config.database_schema,
+            model_name=config.embeddings_oracle_model,
+            batch_size=config.embeddings_oracle_batch_size,
+            max_concurrent=config.embeddings_oracle_max_concurrent,
+            dimensions=config.embeddings_oracle_dimensions,
+            query_prefix=query_prefix,
+            passage_prefix=passage_prefix,
         )
     elif provider == "openai":
         # Use dedicated embeddings API key, or fall back to LLM API key
@@ -2859,6 +2963,6 @@ def _create_embeddings(config: "ConfigLike") -> Embeddings:
     else:
         raise ValueError(
             f"Unknown embeddings provider: {provider}. "
-            f"Supported: 'local', 'onnx', 'tei', 'openai', 'openai-codex', 'openrouter', 'requesty', 'cohere', 'google', "
+            f"Supported: 'local', 'onnx', 'oracle', 'tei', 'openai', 'openai-codex', 'openrouter', 'requesty', 'cohere', 'google', "
             f"'zeroentropy', 'hindsight', 'nvidia', 'litellm', 'litellm-sdk'"
         )
