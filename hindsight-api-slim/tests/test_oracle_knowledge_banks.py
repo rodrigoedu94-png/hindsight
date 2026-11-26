@@ -5,6 +5,7 @@ from __future__ import annotations
 import array
 import importlib.util
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,19 +33,32 @@ from hindsight_api.knowledge.store import (
 from hindsight_api.knowledge.store_oracle import OracleKnowledgeStore
 
 
-def _load_migration_module():
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "hindsight_api"
-        / "alembic"
-        / "versions"
-        / "e3c4d5e6f7a8_oracle_knowledge_banks.py"
-    )
-    spec = importlib.util.spec_from_file_location("e3c4d5e6f7a8_oracle_knowledge_banks", path)
+def _load_migration_module(name: str = "e3c4d5e6f7a8_oracle_knowledge_banks"):
+    path = Path(__file__).resolve().parents[1] / "hindsight_api" / "alembic" / "versions" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _grantee_queries(plsql: str) -> list[str]:
+    """The dynamic SQL each ``OPEN l_rc FOR`` in a grant block runs, with its PL/SQL quoting undone."""
+    queries = []
+    for stmt in re.findall(r"OPEN l_rc FOR(.*?);", plsql, re.S):
+        pieces = re.findall(r"'((?:[^']|'')*)'", stmt)
+        queries.append("".join(pieces).replace("''", "'"))
+    return queries
+
+
+def _assert_grantees_scoped_to_current_schema(plsql: str, privilege: str) -> None:
+    schema = "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"
+    dba, fallback = _grantee_queries(plsql)
+    assert dba.startswith(f"SELECT DISTINCT grantee FROM dba_tab_privs WHERE owner = {schema} ")
+    assert fallback.startswith(f"SELECT DISTINCT grantee FROM all_tab_privs WHERE table_schema = {schema} ")
+    for query in (dba, fallback):
+        assert f"AND table_name = 'MEMORY_UNITS' AND privilege = '{privilege}' " in query
+        assert query.endswith(f"grantee NOT IN ('PUBLIC', SYS_CONTEXT('USERENV', 'SESSION_USER'), {schema})")
 
 
 class _FakeConn:
@@ -146,6 +160,41 @@ def test_oracle_knowledge_banks_migration_ddl_and_dialect():
     assert "FROM dba_tab_privs" in joined and "FROM all_tab_privs" in joined
     assert "user_tab_privs_made" not in joined
     assert "GRANT SELECT, INSERT, UPDATE, DELETE ON" in joined
+    # A separate migration user sets CURRENT_SCHEMA to the owner: both lookups must scope to it.
+    _assert_grantees_scoped_to_current_schema(mod._GRANT_KB_TABLES_PLSQL, "INSERT")
+
+    pg_bind = MagicMock()
+    pg_bind.dialect.name = "postgresql"
+    with patch.object(mod.op, "get_bind", return_value=pg_bind):
+        mod.upgrade()
+        mod.downgrade()
+    pg_bind.exec_driver_sql.assert_not_called()
+
+
+def test_property_graph_grant_scoped_to_current_schema():
+    from hindsight_api.alembic._oracle_grants import GRANT_PROPERTY_GRAPH_PLSQL
+
+    _assert_grantees_scoped_to_current_schema(GRANT_PROPERTY_GRAPH_PLSQL, "SELECT")
+    assert "GRANT READ ON PROPERTY GRAPH hindsight_memory_graph" in GRANT_PROPERTY_GRAPH_PLSQL
+    assert "-42421" in GRANT_PROPERTY_GRAPH_PLSQL  # ORA-42421 (graph absent) is tolerated
+
+
+def test_reapply_runtime_grants_migration_reruns_both_blocks_on_oracle_only():
+    from hindsight_api.alembic._oracle_grants import GRANT_KB_TABLES_PLSQL, GRANT_PROPERTY_GRAPH_PLSQL
+
+    mod = _load_migration_module("f7a8b9c0d1e2_oracle_reapply_runtime_grants")
+    assert mod.revision == "f7a8b9c0d1e2"
+    assert mod.down_revision == "e3c4d5e6f7a8"
+    # The original revisions run the same shared blocks.
+    assert _load_migration_module()._GRANT_KB_TABLES_PLSQL is GRANT_KB_TABLES_PLSQL
+
+    ora_bind = MagicMock()
+    ora_bind.dialect.name = "oracle"
+    with patch.object(mod.op, "get_bind", return_value=ora_bind):
+        mod.upgrade()
+        mod.downgrade()
+    executed = [c.args[0] for c in ora_bind.exec_driver_sql.call_args_list]
+    assert executed == [GRANT_PROPERTY_GRAPH_PLSQL, GRANT_KB_TABLES_PLSQL]
 
     pg_bind = MagicMock()
     pg_bind.dialect.name = "postgresql"
