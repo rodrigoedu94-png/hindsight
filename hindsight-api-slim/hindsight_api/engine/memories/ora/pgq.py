@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from ...db.ops import LinkExpansionRows, UpdatedWindow, memory_unit_columns
+from ...db.oracle import OracleLiteralStr
 
 
 def build_pgq_entity_expansion_cte(
@@ -349,11 +350,16 @@ async def query_entity_neighborhood_pgq(
     occurred_before: datetime | None = None,
     limit: int = 50,
 ) -> list[Any]:
-    """Traverse entity co-occurrences and linked bi-temporal facts with explicit 0/1/2 hop distances."""
+    """Traverse entity co-occurrences and linked bi-temporal facts with explicit 0/1/2 hop distances.
+
+    ``max_hops`` is clamped to [0, 2]: 0 returns only the units mentioning ``entity_ids``,
+    1 adds their co-occurring entities' units, 2 the entities one co-occurrence further.
+    """
     if not entity_ids or limit <= 0:
         return []
-    hops = max(1, min(int(max_hops), 2))
-    params: list[object] = [entity_ids, bank_id]
+    hops = max(0, min(int(max_hops), 2))
+    # bank_id is VARCHAR2: keep a UUID-shaped bank id a string, not a RAW(16) bind.
+    params: list[object] = [entity_ids, OracleLiteralStr(bank_id)]
     temporal_clauses: list[str] = []
     if occurred_after is not None:
         params.append(occurred_after)
@@ -367,6 +373,24 @@ async def query_entity_neighborhood_pgq(
     limit_param = f"${len(params)}"
     temporal_sql = " ".join(temporal_clauses)
 
+    one_hop_arm = ""
+    if hops >= 1:
+        one_hop_arm = f"""
+                        UNION ALL
+                        SELECT unit_id, neighbor_entity_id, neighbor_entity_name, 1 AS hop_distance
+                        FROM GRAPH_TABLE (
+                            {graph_name}
+                            MATCH (e1 IS entity) -[co1 IS cooccurs_with]- (e2 IS entity)
+                                  <-[m IS mentions]- (u IS memory_unit)
+                            WHERE e1.id = ANY($1::uuid[])
+                              AND e2.id != e1.id
+                              AND u.bank_id = $2
+                            COLUMNS (
+                                u.id AS unit_id,
+                                e2.id AS neighbor_entity_id,
+                                e2.canonical_name AS neighbor_entity_name
+                            )
+                        )"""
     two_hop_arm = ""
     if hops >= 2:
         two_hop_arm = f"""
@@ -414,22 +438,7 @@ async def query_entity_neighborhood_pgq(
                                 e1.id AS neighbor_entity_id,
                                 e1.canonical_name AS neighbor_entity_name
                             )
-                        )
-                        UNION ALL
-                        SELECT unit_id, neighbor_entity_id, neighbor_entity_name, 1 AS hop_distance
-                        FROM GRAPH_TABLE (
-                            {graph_name}
-                            MATCH (e1 IS entity) -[co1 IS cooccurs_with]- (e2 IS entity)
-                                  <-[m IS mentions]- (u IS memory_unit)
-                            WHERE e1.id = ANY($1::uuid[])
-                              AND e2.id != e1.id
-                              AND u.bank_id = $2
-                            COLUMNS (
-                                u.id AS unit_id,
-                                e2.id AS neighbor_entity_id,
-                                e2.canonical_name AS neighbor_entity_name
-                            )
-                        ){two_hop_arm}
+                        ){one_hop_arm}{two_hop_arm}
                     )
                     GROUP BY unit_id, neighbor_entity_id
                 ) n

@@ -39,6 +39,10 @@ class WorkloadMetrics:
     max_ms: float
     row_count: int
     buffer_gets_per_exec: float | None = None
+    # Server-side time per execution and the plan it ran, from the same V$SQL cursors.
+    # Pass a plan_hash_value's sql_id to DBMS_XPLAN.DISPLAY_CURSOR for the full plan.
+    elapsed_ms_per_exec: float | None = None
+    plan_hash_values: list[int] | None = None
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -59,6 +63,8 @@ def summarize_timings(
     row_count: int,
     *,
     buffer_gets_per_exec: float | None = None,
+    elapsed_ms_per_exec: float | None = None,
+    plan_hash_values: list[int] | None = None,
 ) -> WorkloadMetrics:
     return WorkloadMetrics(
         name=name,
@@ -71,6 +77,8 @@ def summarize_timings(
         max_ms=round(max(latencies_ms), 3) if latencies_ms else 0.0,
         row_count=row_count,
         buffer_gets_per_exec=round(buffer_gets_per_exec, 2) if buffer_gets_per_exec is not None else None,
+        elapsed_ms_per_exec=round(elapsed_ms_per_exec, 3) if elapsed_ms_per_exec is not None else None,
+        plan_hash_values=plan_hash_values,
     )
 
 
@@ -85,22 +93,33 @@ class _MarkedConnection:
         return await self._conn.fetch(f"/* {self._marker} */ {query}", *args)
 
 
-async def _try_fetch_buffer_gets(conn: Any, marker: str) -> float | None:
+async def _try_fetch_sql_stats(conn: Any, marker: str) -> dict[str, Any]:
+    """buffer_gets and elapsed_time per execution, and the plan hash values, for one marker.
+
+    Needs SELECT on V$SQL; without it every field stays None and only client latency is kept.
+    """
     try:
-        row = await conn.fetchrow(
+        rows = await conn.fetch(
             """
-            SELECT ROUND(SUM(buffer_gets) / NULLIF(SUM(executions), 0), 2) AS avg_gets
+            SELECT plan_hash_value, SUM(buffer_gets) AS gets, SUM(elapsed_time) AS elapsed_us,
+                   SUM(executions) AS execs
             FROM v$sql
             WHERE sql_text LIKE $1
               AND sql_text NOT LIKE '%v$sql%'
+            GROUP BY plan_hash_value
             """,
             f"%{marker}%",
         )
-        if row and row["avg_gets"] is not None:
-            return float(row["avg_gets"])
     except Exception:
-        return None
-    return None
+        return {}
+    execs = sum(int(r["execs"] or 0) for r in rows)
+    if not execs:
+        return {}
+    return {
+        "buffer_gets_per_exec": sum(float(r["gets"] or 0) for r in rows) / execs,
+        "elapsed_ms_per_exec": sum(float(r["elapsed_us"] or 0) for r in rows) / execs / 1000.0,
+        "plan_hash_values": sorted(int(r["plan_hash_value"]) for r in rows),
+    }
 
 
 async def _benchmark_coro(
@@ -127,8 +146,8 @@ async def _benchmark_coro(
         else:
             last_count = len(result)
 
-    buffer_gets = await _try_fetch_buffer_gets(conn, sql_marker) if (conn and sql_marker) else None
-    return summarize_timings(label, mode, timings_ms, last_count, buffer_gets_per_exec=buffer_gets)
+    stats = await _try_fetch_sql_stats(conn, sql_marker) if (conn and sql_marker) else {}
+    return summarize_timings(label, mode, timings_ms, last_count, **stats)
 
 
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
@@ -140,7 +159,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     from hindsight_api.engine.db.ops import UpdatedWindow
     from hindsight_api.engine.db.ops_oracle import OracleOps
-    from hindsight_api.engine.db.oracle import OracleBackend
+    from hindsight_api.engine.db.oracle import OracleBackend, OracleLiteralStr
     from hindsight_api.engine.memories.ora import pgq as ora_pgq
     from hindsight_api.engine.schema import fq_store_table as fq_table
 
@@ -162,7 +181,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
             seed_rows = await conn.fetch(
                 f"SELECT id FROM {mu} WHERE bank_id = $1 AND fact_type = $2 ORDER BY updated_at DESC FETCH FIRST $3 ROWS ONLY",
-                args.bank_id,
+                OracleLiteralStr(args.bank_id),  # VARCHAR2: a UUID-shaped bank id must not bind as RAW(16)
                 args.fact_type,
                 args.seed_count,
             )
@@ -174,7 +193,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
             obs_seed_rows = await conn.fetch(
                 f"SELECT id FROM {mu} WHERE bank_id = $1 AND fact_type = 'observation' ORDER BY updated_at DESC FETCH FIRST $2 ROWS ONLY",
-                args.bank_id,
+                OracleLiteralStr(args.bank_id),
                 args.seed_count,
             )
             obs_seed_ids = [r["id"] for r in obs_seed_rows]

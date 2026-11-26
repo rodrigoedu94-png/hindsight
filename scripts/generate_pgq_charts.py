@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["matplotlib>=3.8"]
+# dependencies = ["matplotlib>=3.8", "pydantic>=2"]
 # ///
 """Generate Oracle 26ai SQL/PGQ topology diagrams and benchmark comparison charts (LIN-273).
 
@@ -19,21 +19,42 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from typing import Any
 
 try:
     import matplotlib
+    from pydantic import BaseModel, ConfigDict, Field, ValidationError
 except ModuleNotFoundError as exc:
     raise SystemExit(
-        "generate_pgq_charts.py needs matplotlib: run it with `uv run scripts/generate_pgq_charts.py ...` "
-        "(it declares its dependencies inline) or `pip install matplotlib`."
+        "generate_pgq_charts.py needs matplotlib and pydantic: run it with `uv run scripts/generate_pgq_charts.py ...` "
+        "(it declares its dependencies inline) or `pip install matplotlib pydantic`."
     ) from exc
 
 matplotlib.use("Agg")
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
+
+
+class BenchmarkWorkload(BaseModel):
+    """One workload row of benchmark_oracle_pgq.py's JSON (only the fields the charts read)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    mode: str = "relational"
+    p50_ms: float
+    p95_ms: float
+    buffer_gets_per_exec: float | None = None
+
+
+class BenchmarkReport(BaseModel):
+    """benchmark_oracle_pgq.py's JSON, validated before anything is drawn."""
+
+    model_config = ConfigDict(extra="allow")
+
+    bank_id: str | None = None
+    seed_count: int | None = None
+    workloads: list[BenchmarkWorkload] = Field(min_length=1)
 
 
 def render_topology_diagram(output_path: Path) -> Path:
@@ -177,17 +198,16 @@ def render_topology_diagram(output_path: Path) -> Path:
     return output_path
 
 
-def render_benchmark_charts(data: dict[str, Any], output_path: Path) -> Path:
+def render_benchmark_charts(report: BenchmarkReport, output_path: Path) -> Path:
     """Render side-by-side latency (p50/p95) and buffer_gets comparison charts from benchmark JSON."""
-    workloads = data.get("workloads", [])
-    if not workloads:
-        raise ValueError("Benchmark JSON contains no workloads.")
+    workloads = report.workloads
+    data = {"bank_id": report.bank_id or "n/a", "seed_count": report.seed_count or "n/a"}
 
-    labels = [w["name"].replace(" (", "\n(") for w in workloads]
-    p50 = [float(w["p50_ms"]) for w in workloads]
-    p95 = [float(w["p95_ms"]) for w in workloads]
-    modes = [w.get("mode", "relational") for w in workloads]
-    gets = [w.get("buffer_gets_per_exec") for w in workloads]
+    labels = [w.name.replace(" (", "\n(") for w in workloads]
+    p50 = [w.p50_ms for w in workloads]
+    p95 = [w.p95_ms for w in workloads]
+    modes = [w.mode for w in workloads]
+    gets = [w.buffer_gets_per_exec for w in workloads]
     has_gets = any(g is not None for g in gets)
 
     ncols = 2 if has_gets else 1
@@ -206,7 +226,7 @@ def render_benchmark_charts(data: dict[str, Any], output_path: Path) -> Path:
     bars1 = ax0.bar([i - width / 2 for i in x], p50, width, label="p50 (ms)", color=colors_p50)
     bars2 = ax0.bar([i + width / 2 for i in x], p95, width, label="p95 (ms)", color=colors_p95)
     ax0.set_title(
-        f"Latency: Relational CTE vs Oracle 26ai SQL/PGQ\n(bank={data.get('bank_id', 'n/a')}, seeds={data.get('seed_count', 'n/a')})",
+        f"Latency: Relational CTE vs Oracle 26ai SQL/PGQ\n(bank={data['bank_id']}, seeds={data['seed_count']})",
         fontsize=11.5,
         fontweight="bold",
         color="#0F172A",
@@ -232,27 +252,40 @@ def render_benchmark_charts(data: dict[str, Any], output_path: Path) -> Path:
     if has_gets:
         ax1 = axes[1]
         ax1.set_facecolor("#FFFFFF")
-        vals = [float(g) if g is not None else 0.0 for g in gets]
-        bar_colors = ["#059669" if m == "pgq" else "#94A3B8" for m in modes]
-        bars_g = ax1.bar(x, vals, width=0.52, color=bar_colors)
+        # Only measured workloads get a bar: a missing V$SQL reading is not a zero-read result.
+        measured = [i for i, g in enumerate(gets) if g is not None]
+        bar_colors = ["#059669" if modes[i] == "pgq" else "#94A3B8" for i in measured]
+        bars_g = ax1.bar(measured, [float(gets[i]) for i in measured], width=0.52, color=bar_colors)
+        for i, g in enumerate(gets):
+            if g is None:
+                ax1.annotate(
+                    "not measured",
+                    xy=(i, 0),
+                    xytext=(0, 4),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7.5,
+                    rotation=90,
+                    color="#64748B",
+                )
         ax1.set_title("Logical Reads (V$SQL buffer_gets / exec)", fontsize=11.5, fontweight="bold", color="#0F172A")
         ax1.set_ylabel("Buffer Gets (lower is better)", color="#334155")
         ax1.set_xticks(x)
         ax1.set_xticklabels(labels, fontsize=8.5, rotation=12, ha="right")
         ax1.grid(axis="y", linestyle="--", alpha=0.4)
-        for bar, raw in zip(bars_g, gets):
-            if raw is not None:
-                h = bar.get_height()
-                ax1.annotate(
-                    f"{h:,.0f}",
-                    xy=(bar.get_x() + bar.get_width() / 2, h),
-                    xytext=(0, 3),
-                    textcoords="offset points",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                    color="#1E293B",
-                )
+        for bar in bars_g:
+            h = bar.get_height()
+            ax1.annotate(
+                f"{h:,.0f}",
+                xy=(bar.get_x() + bar.get_width() / 2, h),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#1E293B",
+            )
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -278,8 +311,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.topology_only:
         if not args.input:
             raise SystemExit("Pass --input <benchmark.json> or use --topology-only.")
-        data = json.loads(Path(args.input).read_text(encoding="utf-8"))
-        bench_path = render_benchmark_charts(data, out_dir / "oracle_pgq_benchmark_comparison.png")
+        try:
+            report = BenchmarkReport.model_validate_json(Path(args.input).read_text(encoding="utf-8"))
+        except ValidationError as exc:
+            raise SystemExit(f"{args.input} is not a benchmark_oracle_pgq.py result:\n{exc}") from exc
+        bench_path = render_benchmark_charts(report, out_dir / "oracle_pgq_benchmark_comparison.png")
         print(f"Generated benchmark comparison chart: {bench_path}")
 
     return 0

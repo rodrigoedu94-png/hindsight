@@ -111,6 +111,23 @@ async def test_expand_observations_pgq_uses_derived_from_and_guards_empty(max_ho
 
 
 @pytest.mark.asyncio
+async def test_query_entity_neighborhood_pgq_zero_hops_keeps_only_direct_mentions():
+    from hindsight_api.engine.db.oracle import OracleLiteralStr
+
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[])
+    uuid_bank = "11111111-2222-3333-4444-555555555555"
+    await query_entity_neighborhood_pgq(
+        conn, mu_table="mu_t", graph_name="g", bank_id=uuid_bank, entity_ids=[uuid.uuid4()], max_hops=0
+    )
+    sql = conn.fetch.await_args.args[0]
+    assert "0 AS hop_distance" in sql
+    assert "cooccurs_with" not in sql and "1 AS hop_distance" not in sql
+    # A UUID-shaped bank id stays a VARCHAR2 string bind.
+    assert isinstance(conn.fetch.await_args.args[2], OracleLiteralStr)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("max_hops", [1, 2])
 async def test_query_entity_neighborhood_pgq_emits_explicit_hop_distances(max_hops):
     conn = MagicMock()
@@ -390,6 +407,17 @@ async def test_pgq_expansion_matches_relational_on_oracle(oracle_memory, request
                 ("w_seed", e2): 1, ("w_c", e2): 1,
                 ("w_far", e3): 2,
             }  # fmt: skip
+            via_ops = await ops.query_entity_neighborhood_pgq(
+                conn, mu_table=mu, graph_name=graph, bank_id=bank_id, entity_ids=[e1], max_hops=2, limit=50
+            )
+            assert {
+                (by_id[str(r["id"])], str(r["neighbor_entity_id"])): int(r["hop_distance"]) for r in via_ops
+            } == hops
+            direct = await query_entity_neighborhood_pgq(
+                conn, mu_table=mu, graph_name=graph, bank_id=bank_id, entity_ids=[e1], max_hops=0, limit=50
+            )
+            assert {by_id[str(r["id"])] for r in direct} == {"w_seed", "w_a", "w_b", "x_other"}
+            assert {int(r["hop_distance"]) for r in direct} == {0}
 
             # The retriever takes the SQL/PGQ path end to end, with no fallback: each call sends
             # exactly one query, and it is the SQL/PGQ one (the relational rows are the same).
