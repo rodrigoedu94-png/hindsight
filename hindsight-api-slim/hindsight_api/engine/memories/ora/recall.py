@@ -79,27 +79,22 @@ def _build_semantic_arms(
     min_similarity: float,
     filters: _RecallFilterClauses,
 ) -> list[str]:
-    build_single_pass = getattr(dialect, "build_semantic_single_pass_arm", None)
-    use_oracle_single_pass = (
-        len(fact_types) > 1
-        and callable(build_single_pass)
-        and getattr(config, "oracle_vector_search", "exact") != "approx"
-    )
-    if use_oracle_single_pass and callable(build_single_pass):
-        return [
-            build_single_pass(
-                table=table,
-                cols=cols,
-                fact_types=fact_types,
-                embedding_param="$1",
-                bank_id_param="$2",
-                fetch_limit=fetch_limit,
-                min_similarity=min_similarity,
-                tags_clause=filters.tags_clause,
-                groups_clause=filters.groups_clause,
-                extra_where=filters.updated_range_clause,
-            )
-        ]
+    # Exact mode: the dialect's own build_semantic_arms (upstream #6771) ranks every fact type
+    # in one partition scan. APPROX keeps one arm per type: each needs its own FETCH APPROX
+    # against the vector index, which a ROW_NUMBER window over all types cannot use.
+    if getattr(config, "oracle_vector_search", "exact") != "approx":
+        return dialect.build_semantic_arms(
+            table=table,
+            cols=cols,
+            fact_types=fact_types,
+            embedding_param="$1",
+            bank_id_param="$2",
+            fetch_limit=fetch_limit,
+            min_similarity=min_similarity,
+            tags_clause=filters.tags_clause,
+            groups_clause=filters.groups_clause,
+            extra_where=filters.updated_range_clause,
+        )
     return [
         dialect.build_semantic_arm(
             table=table,

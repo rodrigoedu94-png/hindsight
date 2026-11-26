@@ -101,7 +101,7 @@ class TestOracleQueryPlansAndRecall:
         assert "CONTAINS(m.text, $4, 11)" in arm
 
     def test_single_pass_semantic_arm_uses_window_partition(self):
-        sql = OracleDialect().build_semantic_single_pass_arm(
+        arms = OracleDialect().build_semantic_arms(
             table="memory_units",
             cols="id, text",
             fact_types=["world", "experience", "observation"],
@@ -110,6 +110,8 @@ class TestOracleQueryPlansAndRecall:
             fetch_limit=50,
             min_similarity=0.3,
         )
+        assert len(arms) == 1
+        sql = arms[0]
         assert "PARTITION BY fact_type" in sql
         assert "fact_type IN ('world', 'experience', 'observation')" in sql
         assert "WHERE rn_ <= 50" in sql

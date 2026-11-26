@@ -230,42 +230,6 @@ class OracleDialect(SQLDialect):
             f" {fetch}) t"
         )
 
-    def build_semantic_single_pass_arm(
-        self,
-        *,
-        table: str,
-        cols: str,
-        fact_types: list[str],
-        embedding_param: str,
-        bank_id_param: str,
-        fetch_limit: int,
-        min_similarity: float,
-        tags_clause: str = "",
-        groups_clause: str = "",
-        extra_where: str = "",
-    ) -> str:
-        """Scan a bank's partition once for all requested fact_types in exact mode."""
-        ft_list = ", ".join(f"'{ft}'" for ft in fact_types)
-        return (
-            f"SELECT * FROM (SELECT {cols}, similarity, NULL AS bm25_score, 'semantic' AS source"
-            f" FROM (SELECT {cols},"
-            f"        1 - VECTOR_DISTANCE(embedding, {embedding_param}, COSINE) AS similarity,"
-            f"        ROW_NUMBER() OVER ("
-            f"            PARTITION BY fact_type"
-            f"            ORDER BY VECTOR_DISTANCE(embedding, {embedding_param}, COSINE)"
-            f"        ) AS rn_"
-            f" FROM {table}"
-            f" WHERE bank_id = {bank_id_param}"
-            f"   AND fact_type IN ({ft_list})"
-            f"   AND embedding IS NOT NULL"
-            f"   AND (1 - VECTOR_DISTANCE(embedding, {embedding_param}, COSINE)) >= {min_similarity}"
-            f"   {tags_clause}"
-            f"   {groups_clause}"
-            f"   {extra_where})"
-            f" WHERE rn_ <= {fetch_limit}"
-            f" ORDER BY fact_type, rn_) t_sem"
-        )
-
     def build_semantic_arms(
         self,
         *,
