@@ -748,13 +748,23 @@ class OracleKnowledgeStore(KnowledgeStore):
                 for grp in filters.tag_groups:
                     where += " AND " + _oracle_tag_group_expr(grp, filter_params, "d.")
 
+            # Join kb_documents only when a document-level filter is active (#6747).
+            needs_doc_join = bool(
+                filters.media_types or filters.tags or filters.tags_match == "exact" or filters.tag_groups
+            )
+            join_docs = (
+                f"JOIN {docs_table} d ON d.bank_id = x.bank_id AND d.document_id = x.document_id "
+                if needs_doc_join
+                else ""
+            )
+
             # Arm 1: primary passage embeddings (EXACT cosine distance).
             vec_params = [qvec, *filter_params]
             p_where = re.sub(r"\$(\d+)", lambda m: f"${int(m.group(1)) + 1}", where)
             primary_rows = await conn.fetch(
                 f"SELECT x.document_id, x.idx, 1 - VECTOR_DISTANCE(x.embedding, $1, COSINE) AS arm_score "
                 f"FROM {passages_table} x "
-                f"JOIN {docs_table} d ON d.bank_id = x.bank_id AND d.document_id = x.document_id "
+                f"{join_docs}"
                 f"WHERE x.bank_id = $2{p_where} "
                 f"ORDER BY VECTOR_DISTANCE(x.embedding, $1, COSINE) "
                 f"FETCH EXACT FIRST {pool_size} ROWS ONLY",
@@ -766,7 +776,7 @@ class OracleKnowledgeStore(KnowledgeStore):
             extra_rows = await conn.fetch(
                 f"SELECT x.document_id, x.idx, MAX(1 - VECTOR_DISTANCE(x.embedding, $1, COSINE)) AS arm_score "
                 f"FROM {vectors_table} x "
-                f"JOIN {docs_table} d ON d.bank_id = x.bank_id AND d.document_id = x.document_id "
+                f"{join_docs}"
                 f"WHERE x.bank_id = $2{p_where} AND {extra_roles_sql} "
                 f"GROUP BY x.document_id, x.idx "
                 f"ORDER BY MAX(1 - VECTOR_DISTANCE(x.embedding, $1, COSINE)) DESC "
@@ -840,7 +850,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                             keyword_rows = await conn.fetch(
                                 f"SELECT x.document_id, x.idx, SCORE(1) AS arm_score "
                                 f"FROM {passages_table} x "
-                                f"JOIN {docs_table} d ON d.bank_id = x.bank_id AND d.document_id = x.document_id "
+                                f"{join_docs}"
                                 f"WHERE x.bank_id = $1{where} AND CONTAINS(x.text, ${kw_pos}, 1) > 0 "
                                 f"ORDER BY SCORE(1) DESC "
                                 f"FETCH FIRST {pool_size} ROWS ONLY",
@@ -895,6 +905,8 @@ class OracleKnowledgeStore(KnowledgeStore):
 
             if not rows:
                 return StoreSearchResult([])
+            # Break equal-score ties deterministically by (document_id, idx) (#6697).
+            rows.sort(key=lambda r: (r["document_id"], int(r["idx"])))
 
             # Fetch extra non-sentence vector role scores for candidates.
             role_scores: dict[tuple[str, int], dict[str, list[float]]] = {}

@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from ..._vector_index import index_using_clause, per_bank_indexes_are_eager, uses_per_bank_vector_indexes
 from ...config import get_config
 from ...schema_context import get_current_schema
+from ..db.oracle import OracleLiteralStr
 from ..db_utils import acquire_with_retry, retry_with_backoff
 from ..response_models import DispositionTraits, id_problem
 from ..schema import fq_table
@@ -258,7 +259,7 @@ async def bank_exists_on_conn(conn: "DatabaseConnection", bank_id: str) -> bool:
 
 async def bank_kind_on_conn(conn: "DatabaseConnection", bank_id: str) -> str | None:
     """The bank's kind ('memory' or 'knowledge'), or None when there is no such bank."""
-    return await conn.fetchval(f"SELECT kind FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
+    return await conn.fetchval(f"SELECT kind FROM {fq_table('banks')} WHERE bank_id = $1", OracleLiteralStr(bank_id))
 
 
 async def bank_kind(pool, bank_id: str) -> str | None:
