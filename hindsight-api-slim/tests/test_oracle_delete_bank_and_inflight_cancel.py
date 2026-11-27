@@ -249,6 +249,7 @@ async def test_oracle_connection_fetch_call_timeout_and_cancel_invalidates_and_d
 @_requires_oracledb
 @pytest.mark.asyncio
 async def test_oracle_backend_session_drops_on_schema_or_commit_cancel_and_refuses_silent_rollback() -> None:
+    from hindsight_api.engine.db._oracle_helpers import mark_conn_cancelled
     from hindsight_api.engine.db.oracle import OracleBackend
 
     # 1) Cancelled during _set_session_schema drops the connection without releasing or rolling back.
@@ -292,7 +293,7 @@ async def test_oracle_backend_session_drops_on_schema_or_commit_cancel_and_refus
 
     with pytest.raises(ConnectionError, match="invalidated by cancellation"):
         async with backend3.acquire() as acquired_conn:
-            acquired_conn.mark_cancelled()
+            mark_conn_cancelled(acquired_conn, swallow_raw)
 
     assert swallow_raw.commits == 0
     assert swallow_raw.rollbacks == 0

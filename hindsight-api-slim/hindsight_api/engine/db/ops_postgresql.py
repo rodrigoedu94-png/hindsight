@@ -1175,8 +1175,6 @@ class PostgreSQLOps(DataAccessOps):
         budget: int,
         per_entity_limit: int,
         window: UpdatedWindow,
-        *,
-        timeout: float | None = None,
     ) -> LinkExpansionRows:
         # Array ops on source_memory_ids: unnest, a per-source @> GIN probe, COUNT(DISTINCT).
         #

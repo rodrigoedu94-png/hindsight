@@ -1035,8 +1035,6 @@ class OracleOps(DataAccessOps):
         budget: int,
         per_entity_limit: int,
         window: UpdatedWindow,
-        *,
-        timeout: float | None = None,
     ) -> LinkExpansionRows:
         import logging
 
@@ -1063,7 +1061,6 @@ class OracleOps(DataAccessOps):
         from ..schema import fq_table
 
         obs_sources_table = fq_table("observation_sources")
-        fetch_kwargs: dict[str, Any] = {"timeout": timeout} if timeout is not None else {}
         all_rows = await conn.fetch(
             f"""
             WITH seed_sources AS (
@@ -1168,7 +1165,6 @@ class OracleOps(DataAccessOps):
             seed_ids,
             budget,
             *window.params,
-            **fetch_kwargs,
         )
         entity_rows = [r for r in all_rows if r["source"] == "entity"]
         logger.debug(f"[LinkExpansion] observation graph (Oracle): found {len(entity_rows)} connected observations")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from typing import Any
 
 from ....config import get_config
 from ...db.ops import LinkExpansionRows, UpdatedWindow
@@ -69,65 +70,75 @@ async def _use_pgq(conn, ops) -> bool:
         raise
 
 
-class OracleLinkExpansionRetriever(LinkExpansionRetriever):
-    """LinkExpansionRetriever that uses Oracle 26ai SQL/PGQ when available, with relational fallback."""
+async def _fetch_pgq_fallback_rows(conn, semantic_causal_cte: str, params: list, timeout: float) -> list | None:
+    """Run semantic+causal PGQ query after timeout; return ``[]`` on timeout or ``None`` for relational."""
+    fallback_query = f"""
+        WITH {semantic_causal_cte}
+        SELECT * FROM semantic_expanded
+        UNION ALL
+        SELECT * FROM causal_expanded
+        LIMIT $3
+        """
+    try:
+        return list(await conn.fetch(fallback_query, *params, timeout=timeout))
+    except Exception as fb_err:
+        if _is_oracle_timeout_error(fb_err):
+            logger.warning("[LinkExpansion] Oracle SQL/PGQ timeout fallback timed out after %ss, skipping graph results", timeout)
+            return []
+        if _is_pgq_oracle_error(fb_err):
+            logger.warning("[LinkExpansion] Oracle SQL/PGQ timeout fallback failed (%r), falling back to relational expansion", fb_err)
+            return None
+        raise
 
-    async def _expand_combined_pgq_fallback(
-        self,
-        conn,
-        seed_ids: list,
-        fact_type: str,
-        budget: int,
-        *,
-        ops,
-        semantic_causal_cte: str,
-        params: list,
-        timeout: float,
-        created_after: datetime | None,
-        created_before: datetime | None,
-    ) -> LinkExpansionRows:
-        """Run semantic+causal PGQ query after an entity+PGQ timeout, falling back if needed."""
+
+def _build_pgq_combined_queries(
+    created_after: datetime | None, created_before: datetime | None
+) -> tuple[str, str, list]:
+    """Build combined SQL/PGQ query, semantic+causal fallback CTE, and trailing window params."""
+    config = get_config()
+    mu = fq_table("memory_units")
+    graph_name = fq_table("hindsight_memory_graph")
+    window = UpdatedWindow(after=created_after, before=created_before, first_param_index=4)
+    entity_cte = build_pgq_entity_expansion_cte(
+        graph_name, mu, config.link_expansion_per_entity_limit, window
+    )
+    semantic_causal_cte = build_pgq_semantic_causal_cte(
+        graph_name, mu, window, max_causal_hops=getattr(config, "oracle_pgq_max_hops", 2)
+    )
+    full_query = f"""
+        WITH {entity_cte},
+        {semantic_causal_cte}
+        SELECT * FROM entity_expanded
+        UNION ALL
+        SELECT * FROM semantic_expanded
+        UNION ALL
+        SELECT * FROM causal_expanded
+        """
+    return full_query, semantic_causal_cte, window.params
+
+
+async def _handle_pgq_combined_error(
+    pgq_err: Exception,
+    fact_type: str,
+    fallback_ctx: tuple[Any, str, list, float],
+) -> list | None:
+    """Resolve a SQL/PGQ error into fallback rows, or return None when relational fallback should run."""
+    conn, semantic_causal_cte, params, timeout = fallback_ctx
+    if _is_oracle_timeout_error(pgq_err):
         logger.warning(
-            "[LinkExpansion] Entity expansion timed out after %ss for fact_type=%s, "
-            "falling back to semantic+causal only",
+            "[LinkExpansion] Entity expansion timed out after %ss for fact_type=%s, falling back to semantic+causal only",
             timeout,
             fact_type,
         )
-        fallback_query = f"""
-            WITH {semantic_causal_cte}
-            SELECT * FROM semantic_expanded
-            UNION ALL
-            SELECT * FROM causal_expanded
-            LIMIT $3
-            """
-        try:
-            all_rows = await conn.fetch(fallback_query, *params, timeout=timeout)
-            return _split_expansion_rows(all_rows)
-        except Exception as fb_err:
-            if _is_oracle_timeout_error(fb_err):
-                logger.warning(
-                    "[LinkExpansion] Oracle SQL/PGQ timeout fallback timed out after %ss "
-                    "for fact_type=%s, skipping graph results",
-                    timeout,
-                    fact_type,
-                )
-                return LinkExpansionRows(entity=[], semantic=[], causal=[])
-            if _is_pgq_oracle_error(fb_err):
-                logger.warning(
-                    "[LinkExpansion] Oracle SQL/PGQ timeout fallback failed (%r), "
-                    "falling back to relational expansion",
-                    fb_err,
-                )
-                return await super()._expand_combined(
-                    conn,
-                    seed_ids,
-                    fact_type,
-                    budget,
-                    ops=ops,
-                    created_after=created_after,
-                    created_before=created_before,
-                )
-            raise
+        return await _fetch_pgq_fallback_rows(conn, semantic_causal_cte, params, timeout)
+    if _is_pgq_oracle_error(pgq_err):
+        logger.warning("[LinkExpansion] Oracle SQL/PGQ query failed (%s), falling back to relational expansion", pgq_err)
+        return None
+    raise pgq_err
+
+
+class OracleLinkExpansionRetriever(LinkExpansionRetriever):
+    """LinkExpansionRetriever that uses Oracle 26ai SQL/PGQ when available, with relational fallback."""
 
     async def _expand_combined(
         self,
@@ -143,73 +154,28 @@ class OracleLinkExpansionRetriever(LinkExpansionRetriever):
         if not seed_ids or budget <= 0:
             return LinkExpansionRows(entity=[], semantic=[], causal=[])
 
-        if not await _use_pgq(conn, ops):
-            return await super()._expand_combined(
-                conn,
-                seed_ids,
-                fact_type,
-                budget,
-                ops=ops,
-                created_after=created_after,
-                created_before=created_before,
-            )
+        if await _use_pgq(conn, ops):
+            timeout = get_config().link_expansion_timeout
+            full_query, semantic_causal_cte, window_params = _build_pgq_combined_queries(created_after, created_before)
+            params = [seed_ids, fact_type, budget, *window_params]
+            try:
+                return _split_expansion_rows(await conn.fetch(full_query, *params, timeout=timeout))
+            except Exception as pgq_err:
+                rows = await _handle_pgq_combined_error(
+                    pgq_err, fact_type, (conn, semantic_causal_cte, params, timeout)
+                )
+                if rows is not None:
+                    return _split_expansion_rows(rows)
 
-        config = get_config()
-        mu = fq_table("memory_units")
-        graph_name = fq_table("hindsight_memory_graph")
-        window = UpdatedWindow(after=created_after, before=created_before, first_param_index=4)
-        entity_cte = build_pgq_entity_expansion_cte(
-            graph_name, mu, config.link_expansion_per_entity_limit, window
+        return await super()._expand_combined(
+            conn,
+            seed_ids,
+            fact_type,
+            budget,
+            ops=ops,
+            created_after=created_after,
+            created_before=created_before,
         )
-        semantic_causal_cte = build_pgq_semantic_causal_cte(
-            graph_name,
-            mu,
-            window,
-            max_causal_hops=getattr(config, "oracle_pgq_max_hops", 2),
-        )
-        full_query = f"""
-            WITH {entity_cte},
-            {semantic_causal_cte}
-            SELECT * FROM entity_expanded
-            UNION ALL
-            SELECT * FROM semantic_expanded
-            UNION ALL
-            SELECT * FROM causal_expanded
-            """
-        params = [seed_ids, fact_type, budget, *window.params]
-
-        try:
-            all_rows = await conn.fetch(full_query, *params, timeout=config.link_expansion_timeout)
-            return _split_expansion_rows(all_rows)
-        except Exception as pgq_err:
-            if _is_oracle_timeout_error(pgq_err):
-                return await self._expand_combined_pgq_fallback(
-                    conn,
-                    seed_ids,
-                    fact_type,
-                    budget,
-                    ops=ops,
-                    semantic_causal_cte=semantic_causal_cte,
-                    params=params,
-                    timeout=config.link_expansion_timeout,
-                    created_after=created_after,
-                    created_before=created_before,
-                )
-            if _is_pgq_oracle_error(pgq_err):
-                logger.warning(
-                    "[LinkExpansion] Oracle SQL/PGQ query failed (%s), falling back to relational expansion",
-                    pgq_err,
-                )
-                return await super()._expand_combined(
-                    conn,
-                    seed_ids,
-                    fact_type,
-                    budget,
-                    ops=ops,
-                    created_after=created_after,
-                    created_before=created_before,
-                )
-            raise
 
     async def _expand_observations(
         self,

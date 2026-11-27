@@ -262,3 +262,40 @@ class RefreshMentalModelFailureMetadata:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""
         return asdict(self)
+
+
+def is_parent_operation_row(operation_type: str | None, result_metadata: Mapping[str, Any]) -> bool:
+    """Return whether an async operation row represents a parent batch aggregator (including legacy rows)."""
+    if result_metadata.get("is_parent"):
+        return True
+    if operation_type != "knowledge_ingest" or "parent_operation_id" in result_metadata:
+        return False
+    return "num_sub_batches" in result_metadata or "document_ids" in result_metadata
+
+
+def summarize_child_statuses(child_rows: Any, parse_json: Any) -> tuple[list[dict[str, Any]], str | None]:
+    """Build serialized child status entries and compute target parent status if all children are terminal."""
+    child_statuses: list[dict[str, Any]] = []
+    statuses_seen: set[str] = set()
+    all_done = True
+
+    for child_row in child_rows:
+        child_metadata = parse_json(child_row["result_metadata"]) or {}
+        child_status = child_row["status"]
+        child_statuses.append(
+            {
+                "operation_id": str(child_row["operation_id"]),
+                "status": child_status,
+                "sub_batch_index": child_metadata.get("sub_batch_index"),
+                "items_count": child_metadata.get("items_count"),
+                "error_message": child_row["error_message"],
+            }
+        )
+        statuses_seen.add(child_status)
+        if child_status not in ("completed", "failed", "cancelled"):
+            all_done = False
+
+    if not all_done:
+        return child_statuses, None
+    target_status = "failed" if "failed" in statuses_seen else ("cancelled" if "cancelled" in statuses_seen else "completed")
+    return child_statuses, target_status

@@ -964,21 +964,42 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
     assert isinstance(status_conn.executed[0][1][1], OracleLiteralStr)
     assert isinstance(status_conn.executed[1][1][0], OracleLiteralStr)
 
-    # 4) cancel_operation, retry_operation, delete_operation wrap UUID bank_id in OracleLiteralStr.
+
+def _kb_cm_backend(c: Any, ops_obj: Any = None) -> Any:
+    @asynccontextmanager
+    async def _acquire():
+        yield c
+
+    return SimpleNamespace(_wraps_backend=True, acquire=_acquire, ops=ops_obj)
+
+
+@pytest.mark.asyncio
+async def test_uuid_bank_cancel_retry_delete_bind_oracle_literal_str():
+    import uuid
+
+    from hindsight_api.engine.memory_engine import MemoryEngine
+    from hindsight_api.models import RequestContext
+
+    uuid_bank = "11111111-2222-3333-4444-555555555555"
+    child_op_id = str(uuid.uuid4())
+    eng = MemoryEngine.__new__(MemoryEngine)
+    eng._authenticate_tenant = AsyncMock(return_value=None)
     eng._active_operation_canceller = None
     eng._is_operation_active = None
+    eng._operation_validator = None
+
     cancel_conn = _FakeConn()
     cancel_conn.fetchrow_responses.extend(
         [{"bank_id": uuid_bank, "status": "pending"}, {"status": "cancelled", "worker_id": None, "claimed_at": None}]
     )
-    eng._get_backend = AsyncMock(return_value=_cm_backend(cancel_conn))
+    eng._get_backend = AsyncMock(return_value=_kb_cm_backend(cancel_conn))
     eng._maybe_update_parent_operation = AsyncMock()
     await eng.cancel_operation(uuid_bank, child_op_id, request_context=RequestContext(), _knowledge_bank=True)
     assert isinstance(cancel_conn.executed[0][1][1], OracleLiteralStr)
 
     retry_conn = _FakeConn()
     retry_conn.fetchrow_responses.append({"operation_id": child_op_id})
-    eng._get_backend = AsyncMock(return_value=_cm_backend(retry_conn))
+    eng._get_backend = AsyncMock(return_value=_kb_cm_backend(retry_conn))
     await eng.retry_operation(uuid_bank, child_op_id, request_context=RequestContext(), _knowledge_bank=True)
     assert isinstance(retry_conn.executed[0][1][1], OracleLiteralStr)
 
@@ -986,19 +1007,34 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
     del_conn.fetchrow_responses.append(
         {"operation_id": child_op_id, "operation_type": "knowledge_ingest", "status": "completed", "result_metadata": {}, "task_payload": None}
     )
-    eng._get_backend = AsyncMock(return_value=_cm_backend(del_conn))
+    eng._get_backend = AsyncMock(return_value=_kb_cm_backend(del_conn))
     eng._delete_operation_export_archive = AsyncMock()
     await eng.delete_operation(uuid_bank, child_op_id, request_context=RequestContext(), _knowledge_bank=True)
     assert isinstance(del_conn.executed[0][1][1], OracleLiteralStr)
 
-    # 5) Cancelled children reconcile to cancelled in poller + ops_oracle, legacy knowledge_ingest
-    #    parents without is_parent still expose child_operations, and concurrent cancel wins over self-heal.
+
+@pytest.mark.asyncio
+async def test_cancelled_children_legacy_parent_and_concurrent_cancel_status():
+    import uuid
+
+    from hindsight_api.engine.db.ops_oracle import OracleOps
+    from hindsight_api.engine.memory_engine import MemoryEngine
+    from hindsight_api.models import RequestContext
+    from hindsight_api.worker.poller import WorkerPoller
+
+    uuid_bank = "11111111-2222-3333-4444-555555555555"
+    parent_op_id = str(uuid.uuid4())
+    child_op_id = str(uuid.uuid4())
+
+    ops_conn = _FakeConn()
+    await OracleOps().fetch_reconcilable_batch_parents(ops_conn, "async_operations")  # type: ignore[arg-type]
     assert "NOT IN ('completed', 'failed', 'cancelled')" in ops_conn.executed[-1][0]
+
     rec_cancel_conn = _FakeConn()
     rec_cancel_conn.fetchrow_responses.append({"status": "pending"})
     rec_cancel_conn.fetch_responses.append([{"status": "cancelled", "error_message": None}])
     rec_cancel_poller = WorkerPoller(
-        backend=_cm_backend(
+        backend=_kb_cm_backend(
             rec_cancel_conn,
             SimpleNamespace(
                 fetch_reconcilable_batch_parents=AsyncMock(
@@ -1012,6 +1048,8 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
     assert await rec_cancel_poller._reconcile_orphaned_parents(None) == 1
     assert any("SET status = 'cancelled'" in sql for sql, _ in rec_cancel_conn.executed)
 
+    eng = MemoryEngine.__new__(MemoryEngine)
+    eng._authenticate_tenant = AsyncMock(return_value=None)
     legacy_conn = _FakeConn()
     legacy_conn.parse_json = lambda v: json.loads(v) if isinstance(v, str) else v  # type: ignore[attr-defined]
     legacy_conn.fetchrow_responses.extend(
@@ -1035,7 +1073,7 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
         [{"operation_id": child_op_id, "status": "completed", "error_message": None, "result_metadata": {"sub_batch_index": 0}}]
     )
     legacy_conn.fetchval_responses.append("cancelled")
-    eng._get_backend = AsyncMock(return_value=_cm_backend(legacy_conn))
+    eng._get_backend = AsyncMock(return_value=_kb_cm_backend(legacy_conn))
     legacy_status = await eng.get_operation_status(
         uuid_bank, parent_op_id, request_context=RequestContext(), _knowledge_bank=True
     )
@@ -1043,11 +1081,17 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
     assert legacy_status["status"] == "cancelled"
 
 
-async def _seed_small_and_big_banks(
-    backend: Any, big: str, small: str, dim: int, big_vec: Any, small_vecs: list[list[float]], kind: str
-) -> None:
+async def _seed_small_and_big_banks(backend: Any, seed_spec: dict[str, Any]) -> None:
     """Populate a large bank (3,000 rows) and small bank (3 rows) for vector cursor regression."""
+    import uuid
+
     from hindsight_api.engine.schema import fq_table
+
+    big = seed_spec["big"]
+    small = seed_spec["small"]
+    big_vec = seed_spec["big_vec"]
+    small_vecs = seed_spec["small_vecs"]
+    kind = seed_spec["kind"]
 
     async with backend.acquire() as conn:
         async with conn.transaction():
@@ -1104,6 +1148,8 @@ async def _seed_small_and_big_banks(
 @pytest.mark.asyncio
 async def test_oracle_small_bank_finds_its_passages_next_to_a_big_one(oracle_db_url, monkeypatch):
     """Live Oracle 26ai check for #6731: a small bank finds its passages after a 3,000-row big bank."""
+    import uuid
+
     from hindsight_api.config import clear_config_cache
     from hindsight_api.engine.db.oracle import OracleBackend
     from hindsight_api.engine.schema import fq_table
@@ -1127,7 +1173,10 @@ async def test_oracle_small_bank_finds_its_passages_next_to_a_big_one(oracle_db_
     ]
     store = OracleKnowledgeStore(AsyncMock(return_value=backend))
     try:
-        await _seed_small_and_big_banks(backend, big, small, dim, big_vec, small_vecs, KIND)
+        await _seed_small_and_big_banks(
+            backend,
+            {"big": big, "small": small, "big_vec": big_vec, "small_vecs": small_vecs, "kind": KIND},
+        )
 
         # Warm the shared cursor on the big bank first, then search the small bank.
         big_res = await store.search(big, list(big_vec), top_k=10, filters=SearchFilters(), query_text="red")

@@ -23288,6 +23288,32 @@ class MemoryEngine(MemoryEngineInterface):
                 "operations": operation_list,
             }
 
+    async def _self_heal_parent_operation_status(
+        self, conn: Any, op_uuid: uuid.UUID, operation_id: str, correct_status: str
+    ) -> str:
+        """Atomically reconcile a pending parent operation while preserving concurrent cancellations."""
+        logger.warning(
+            f"Parent operation {operation_id} status out of sync (DB: pending, should be: {correct_status}). Fixing."
+        )
+        completed_clause = "" if correct_status == "cancelled" else ", completed_at = NOW()"
+        healed = await conn.fetchrow(
+            f"""
+            UPDATE {fq_table("async_operations")}
+            SET status = $2, updated_at = NOW(){completed_clause}
+            WHERE operation_id = $1 AND status = 'pending'
+            RETURNING status
+            """,
+            op_uuid,
+            correct_status,
+        )
+        if healed is not None:
+            return healed["status"]
+        current_status = await conn.fetchval(
+            f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1",
+            op_uuid,
+        )
+        return current_status if current_status is not None else "pending"
+
     async def get_operation_status(
         self,
         bank_id: str,
@@ -23339,13 +23365,11 @@ class MemoryEngine(MemoryEngineInterface):
 
             if row:
                 # Check if this is a parent operation
+                from .operation_metadata import is_parent_operation_row, summarize_child_statuses
+
                 raw_rm = row["result_metadata"]
                 result_metadata = conn.parse_json(raw_rm) or {}
-                is_parent = bool(result_metadata.get("is_parent")) or (
-                    row["operation_type"] == "knowledge_ingest"
-                    and "parent_operation_id" not in result_metadata
-                    and ("num_sub_batches" in result_metadata or "document_ids" in result_metadata)
-                )
+                is_parent = is_parent_operation_row(row["operation_type"], result_metadata)
                 raw_tp = row["task_payload"] if include_payload else None
                 task_payload = conn.parse_json(raw_tp) if include_payload else None
 
@@ -23367,60 +23391,11 @@ class MemoryEngine(MemoryEngineInterface):
                         json.dumps({"parent_operation_id": operation_id}),
                     )
 
-                    # Build child operations list and check if parent status needs updating
-                    child_statuses = []
-                    all_done = True
-                    any_failed = False
-                    any_cancelled = False
-
-                    for child_row in child_rows:
-                        raw_crm = child_row["result_metadata"]
-                        child_metadata = conn.parse_json(raw_crm) or {}
-                        child_status = child_row["status"]
-
-                        child_statuses.append(
-                            {
-                                "operation_id": str(child_row["operation_id"]),
-                                "status": child_status,
-                                "sub_batch_index": child_metadata.get("sub_batch_index"),
-                                "items_count": child_metadata.get("items_count"),
-                                "error_message": child_row["error_message"],
-                            }
+                    child_statuses, correct_status = summarize_child_statuses(child_rows, conn.parse_json)
+                    if correct_status is not None and api_status == "pending":
+                        api_status = await self._self_heal_parent_operation_status(
+                            conn, op_uuid, operation_id, correct_status
                         )
-
-                        if child_status not in ("completed", "failed", "cancelled"):
-                            all_done = False
-                        if child_status == "failed":
-                            any_failed = True
-                        if child_status == "cancelled":
-                            any_cancelled = True
-                    # Self-healing: if parent status is out of sync with children, update it
-                    # atomically while still 'pending' so a concurrent cancel_operation wins.
-                    if all_done and api_status == "pending":
-                        correct_status = "failed" if any_failed else ("cancelled" if any_cancelled else "completed")
-                        logger.warning(
-                            f"Parent operation {operation_id} status out of sync (DB: pending, should be: {correct_status}). Fixing."
-                        )
-                        completed_clause = "" if correct_status == "cancelled" else ", completed_at = NOW()"
-                        healed = await conn.fetchrow(
-                            f"""
-                            UPDATE {fq_table("async_operations")}
-                            SET status = $2, updated_at = NOW(){completed_clause}
-                            WHERE operation_id = $1 AND status = 'pending'
-                            RETURNING status
-                            """,
-                            op_uuid,
-                            correct_status,
-                        )
-                        if healed is not None:
-                            api_status = healed["status"]
-                        else:
-                            current_status = await conn.fetchval(
-                                f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1",
-                                op_uuid,
-                            )
-                            if current_status is not None:
-                                api_status = current_status
 
                     return {
                         "operation_id": operation_id,
