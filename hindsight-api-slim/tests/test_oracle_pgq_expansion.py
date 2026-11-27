@@ -504,3 +504,81 @@ async def test_pgq_expansion_matches_relational_on_oracle(oracle_memory, request
             await oracle_memory.delete_bank(bank_id, request_context=request_context)
         except Exception:
             pass
+
+
+@pytest.mark.asyncio
+async def test_oracle_ops_has_property_graph_narrows_errors_and_passes_timeout(monkeypatch):
+    from hindsight_api.engine.db import ops_oracle as ops_oracle_mod
+
+    monkeypatch.setattr(ops_oracle_mod, "get_config", lambda: MagicMock(oracle_use_property_graph=True, link_expansion_timeout=3.25))
+    ops = OracleOps()
+    conn = MagicMock()
+
+    # Transient PGQ-unavailable or timeout errors return False (not cached).
+    for err in (
+        RuntimeError("ORA-00942: table or view does not exist"),
+        RuntimeError("ORA-42404: property graph not found"),
+        RuntimeError("DPY-4024: call timeout exceeded"),
+        TimeoutError("timed out"),
+    ):
+        conn.fetchval = AsyncMock(side_effect=err)
+        assert await ops.has_property_graph(conn) is False
+        assert conn.fetchval.await_args.kwargs["timeout"] == 3.25
+
+    # Fatal database errors must propagate instead of silently falling back.
+    for fatal in (
+        RuntimeError("ORA-01002: fetch out of sequence"),
+        RuntimeError("ORA-03113: end-of-file on communication channel"),
+    ):
+        conn.fetchval = AsyncMock(side_effect=fatal)
+        with pytest.raises(RuntimeError):
+            await ops.has_property_graph(conn)
+
+
+@pytest.mark.asyncio
+async def test_oracle_connection_timeouts_in_probe_and_relational_expansion_preserve_conn(monkeypatch):
+    from hindsight_api.engine.db import ops_oracle as ops_oracle_mod
+    from hindsight_api.engine.db.oracle import OracleConnection
+    from hindsight_api.engine.memories.pg import link_expansion as pg_le
+
+    cfg = MagicMock(
+        oracle_use_property_graph=True,
+        link_expansion_timeout=1.5,
+        link_expansion_per_entity_limit=5,
+        oracle_pgq_max_hops=2,
+    )
+    monkeypatch.setattr(ora_le, "fq_table", lambda t: t)
+    monkeypatch.setattr(pg_le, "fq_table", lambda t: t)
+    monkeypatch.setattr(ora_le, "get_config", lambda: cfg)
+    monkeypatch.setattr(pg_le, "get_config", lambda: cfg)
+    monkeypatch.setattr(ops_oracle_mod, "get_config", lambda: cfg)
+
+    class _ProbeAndFallbackConn(OracleConnection):
+        backend_type = "oracle"
+
+        def __init__(self) -> None:
+            raw = MagicMock()
+            raw.version = "23.26.4.1.0"
+            raw.call_timeout = 0
+            super().__init__(raw)
+            self.calls: list[tuple[str, float | None]] = []
+
+        async def fetchval(self, query: str, *args, column: int = 0, timeout: float | None = None):
+            self.calls.append(("fetchval", timeout))
+            raise TimeoutError("DPY-4024: call timeout")
+
+        async def fetch(self, query: str, *args, timeout: float | None = None):
+            self.calls.append(("fetch", timeout))
+            # First relational query (combined entity+semantic+causal) times out; fallback succeeds.
+            if sum(1 for k, _ in self.calls if k == "fetch") == 1:
+                raise RuntimeError("DPY-4024: call timeout exceeded")
+            return [{"source": "semantic", "id": "u-rel"}]
+
+    conn = _ProbeAndFallbackConn()
+    ops = OracleOps()
+    retriever = OracleLinkExpansionRetriever()
+
+    res = await retriever._expand_combined(conn, ["seed-1"], "world", 10, ops=ops)
+    assert conn._closed_on_cancel is False
+    assert [row["id"] for row in res.semantic] == ["u-rel"]
+    assert all(timeout == 1.5 for _, timeout in conn.calls)

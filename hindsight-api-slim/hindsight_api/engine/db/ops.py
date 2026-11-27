@@ -620,6 +620,8 @@ class DataAccessOps(ABC):
         budget: int,
         per_entity_limit: int,
         window: UpdatedWindow,
+        *,
+        timeout: float | None = None,
     ) -> LinkExpansionRows:
         """Observation-specific graph expansion.
 

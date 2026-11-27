@@ -2389,7 +2389,7 @@ class TestBatchParentRecoveryCandidates:
             assert "FROM pending_parents parent" in compact
             assert 'FROM "tenant".async_operations child' in compact
             assert "child.bank_id = parent.bank_id" in compact
-            assert "child.status NOT IN ('completed', 'failed')" in compact
+            assert "child.status NOT IN ('completed', 'failed', 'cancelled')" in compact
             assert "JSON_VALUE(child.result_metadata, '$.type()') = 'object'" in compact
             assert "JSON_VALUE(child.result_metadata, '$.parent_operation_id') COLLATE BINARY =" in compact
             assert (

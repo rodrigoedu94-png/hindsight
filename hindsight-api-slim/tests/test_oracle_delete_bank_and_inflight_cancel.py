@@ -246,6 +246,111 @@ async def test_oracle_connection_fetch_call_timeout_and_cancel_invalidates_and_d
     assert pool.released == []
 
 
+@_requires_oracledb
+@pytest.mark.asyncio
+async def test_oracle_backend_session_drops_on_schema_or_commit_cancel_and_refuses_silent_rollback() -> None:
+    from hindsight_api.engine.db.oracle import OracleBackend
+
+    # 1) Cancelled during _set_session_schema drops the connection without releasing or rolling back.
+    schema_raw = _FakeRawOracleConn()
+    schema_pool = _FakeOraclePool(schema_raw)
+    backend = OracleBackend()
+    backend._default_schema = "ADMIN"
+    backend._pool = schema_pool
+    backend._set_session_schema = AsyncMock(side_effect=asyncio.CancelledError())  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        async with backend.acquire():
+            raise AssertionError("body must not run")
+
+    assert schema_raw.rollbacks == 0
+    assert schema_pool.dropped == [schema_raw]
+    assert schema_pool.released == []
+
+    # 2) Cancelled during commit() drops the connection without returning it to pool.
+    commit_raw = _FakeRawOracleConn()
+    commit_raw.commit = AsyncMock(side_effect=asyncio.CancelledError())  # type: ignore[method-assign]
+    commit_pool = _FakeOraclePool(commit_raw)
+    backend2 = OracleBackend()
+    backend2._default_schema = "ADMIN"
+    backend2._pool = commit_pool
+
+    with pytest.raises(asyncio.CancelledError):
+        async with backend2.acquire():
+            pass
+
+    assert commit_raw.rollbacks == 0
+    assert commit_pool.dropped == [commit_raw]
+    assert commit_pool.released == []
+
+    # 3) Clean exit after caught cancellation raises ConnectionError loudly instead of silently rolling back.
+    swallow_raw = _FakeRawOracleConn()
+    swallow_pool = _FakeOraclePool(swallow_raw)
+    backend3 = OracleBackend()
+    backend3._default_schema = "ADMIN"
+    backend3._pool = swallow_pool
+
+    with pytest.raises(ConnectionError, match="invalidated by cancellation"):
+        async with backend3.acquire() as acquired_conn:
+            acquired_conn.mark_cancelled()
+
+    assert swallow_raw.commits == 0
+    assert swallow_raw.rollbacks == 0
+    assert swallow_pool.dropped == [swallow_raw]
+    assert swallow_pool.released == []
+
+
+@_requires_oracledb
+@pytest.mark.asyncio
+async def test_oracle_connection_fetch_enforces_cumulative_timeout_across_fetchmany_roundtrips() -> None:
+    import time
+
+    from hindsight_api.engine.db.oracle import OracleConnection
+
+    seen_timeouts: list[int] = []
+
+    class _ChunkedCursor(_FakeOracleCursor):
+        description = [("VAL",)]
+
+        def __init__(self, raw_conn: Any) -> None:
+            super().__init__(raw_conn.executed)
+            self._raw = raw_conn
+            self._calls = 0
+
+        async def execute(self, sql: str, *args, **kwargs) -> None:
+            seen_timeouts.append(self._raw.call_timeout)
+            self._executed.append(sql)
+
+        async def fetchmany(self) -> list[tuple[Any, ...]]:
+            seen_timeouts.append(self._raw.call_timeout)
+            self._calls += 1
+            if self._calls == 1:
+                await asyncio.sleep(0.03)
+                return [(1,)]
+            await asyncio.sleep(0.03)
+            return [(2,)]
+
+    class _ChunkedRawConn(_FakeRawOracleConn):
+        def __init__(self) -> None:
+            super().__init__()
+            self.call_timeout = 999
+
+        def cursor(self) -> _ChunkedCursor:  # type: ignore[override]
+            cur = _ChunkedCursor(self)
+            self.cursors.append(cur)
+            return cur
+
+    raw = _ChunkedRawConn()
+    conn = OracleConnection(raw)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="exceeded timeout"):
+        await conn.fetch("SELECT 1 FROM DUAL", timeout=0.04)
+    assert time.monotonic() - started < 0.2
+    assert len(seen_timeouts) >= 3
+    assert seen_timeouts[-1] <= seen_timeouts[0]
+    assert raw.call_timeout == 999
+
+
 def _make_stub_engine_for_delete() -> MemoryEngine:
     engine = MemoryEngine.__new__(MemoryEngine)
     engine._initialized = True

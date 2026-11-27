@@ -17,7 +17,7 @@ pytestmark = pytest.mark.oracle
     [
         ("canonical", "pending", False),
         ("canonical", "processing", False),
-        ("canonical", "cancelled", False),
+        ("canonical", "cancelled", True),
         ("canonical", "completed", True),
         ("canonical", "failed", True),
         ("uppercase", "pending", True),

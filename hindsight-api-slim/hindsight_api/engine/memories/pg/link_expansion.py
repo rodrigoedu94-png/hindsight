@@ -48,6 +48,16 @@ from ..base import GRAPH_SEED_LIMIT
 logger = logging.getLogger(__name__)
 
 
+_ORACLE_TIMEOUT_CODES = ("DPY-4024", "ORA-03156")
+
+
+def _is_oracle_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return True
+    msg = str(exc)
+    return any(code in msg for code in _ORACLE_TIMEOUT_CODES)
+
+
 async def _find_semantic_seeds(
     conn,
     query_embedding_str: str,
@@ -345,24 +355,41 @@ class LinkExpansionRetriever(GraphRetriever):
 
         params = [seed_ids, fact_type, budget, *window.params]
 
-        try:
-            all_rows = await asyncio.wait_for(
-                conn.fetch(full_query, *params),
-                timeout=config.link_expansion_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[LinkExpansion] Entity expansion timed out after {config.link_expansion_timeout}s "
-                f"for fact_type={fact_type}, falling back to semantic+causal only"
-            )
-            fallback_query = f"""
-                WITH {semantic_causal_cte}
-                SELECT * FROM semantic_expanded
-                UNION ALL
-                SELECT * FROM causal_expanded
-                LIMIT $3
-                """
-            all_rows = await conn.fetch(fallback_query, *params)
+        fallback_query = f"""
+            WITH {semantic_causal_cte}
+            SELECT * FROM semantic_expanded
+            UNION ALL
+            SELECT * FROM causal_expanded
+            LIMIT $3
+            """
+        if getattr(conn, "backend_type", None) == "oracle":
+            try:
+                all_rows = await conn.fetch(full_query, *params, timeout=config.link_expansion_timeout)
+            except Exception as exc:
+                if not _is_oracle_timeout(exc):
+                    raise
+                logger.warning(
+                    f"[LinkExpansion] Entity expansion timed out after {config.link_expansion_timeout}s "
+                    f"for fact_type={fact_type}, falling back to semantic+causal only"
+                )
+                try:
+                    all_rows = await conn.fetch(fallback_query, *params, timeout=config.link_expansion_timeout)
+                except Exception as fb_exc:
+                    if _is_oracle_timeout(fb_exc):
+                        return LinkExpansionRows(entity=[], semantic=[], causal=[])
+                    raise
+        else:
+            try:
+                all_rows = await asyncio.wait_for(
+                    conn.fetch(full_query, *params),
+                    timeout=config.link_expansion_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[LinkExpansion] Entity expansion timed out after {config.link_expansion_timeout}s "
+                    f"for fact_type={fact_type}, falling back to semantic+causal only"
+                )
+                all_rows = await conn.fetch(fallback_query, *params)
 
         return LinkExpansionRows(
             entity=[r for r in all_rows if r["source"] == "entity"],
@@ -422,6 +449,29 @@ class LinkExpansionRetriever(GraphRetriever):
         # Same deadline as _expand_combined (#4529): the three arms are fused into
         # one query, so there is no cheaper fallback — the graph arm yields nothing
         # and recall continues on its other strategies.
+        window = UpdatedWindow(after=created_after, before=created_before, first_param_index=3)
+        if getattr(conn, "backend_type", None) == "oracle":
+            try:
+                return await ops.expand_observations(
+                    conn,
+                    mu,
+                    ue,
+                    ml,
+                    seed_ids,
+                    budget,
+                    per_entity_limit,
+                    window,
+                    timeout=config.link_expansion_timeout,
+                )
+            except Exception as exc:
+                if not _is_oracle_timeout(exc):
+                    raise
+                logger.warning(
+                    f"[LinkExpansion] Observation expansion timed out after {config.link_expansion_timeout}s, "
+                    "skipping graph results for fact_type=observation"
+                )
+                return LinkExpansionRows(entity=[], semantic=[], causal=[])
+
         try:
             return await asyncio.wait_for(
                 ops.expand_observations(
@@ -432,7 +482,7 @@ class LinkExpansionRetriever(GraphRetriever):
                     seed_ids,
                     budget,
                     per_entity_limit,
-                    UpdatedWindow(after=created_after, before=created_before, first_param_index=3),
+                    window,
                 ),
                 timeout=config.link_expansion_timeout,
             )

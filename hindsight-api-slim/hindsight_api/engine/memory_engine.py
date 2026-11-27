@@ -23341,7 +23341,11 @@ class MemoryEngine(MemoryEngineInterface):
                 # Check if this is a parent operation
                 raw_rm = row["result_metadata"]
                 result_metadata = conn.parse_json(raw_rm) or {}
-                is_parent = result_metadata.get("is_parent", False)
+                is_parent = bool(result_metadata.get("is_parent")) or (
+                    row["operation_type"] == "knowledge_ingest"
+                    and "parent_operation_id" not in result_metadata
+                    and ("num_sub_batches" in result_metadata or "document_ids" in result_metadata)
+                )
                 raw_tp = row["task_payload"] if include_payload else None
                 task_payload = conn.parse_json(raw_tp) if include_payload else None
 
@@ -23367,6 +23371,7 @@ class MemoryEngine(MemoryEngineInterface):
                     child_statuses = []
                     all_done = True
                     any_failed = False
+                    any_cancelled = False
 
                     for child_row in child_rows:
                         raw_crm = child_row["result_metadata"]
@@ -23383,26 +23388,39 @@ class MemoryEngine(MemoryEngineInterface):
                             }
                         )
 
-                        if child_status not in ("completed", "failed"):
+                        if child_status not in ("completed", "failed", "cancelled"):
                             all_done = False
                         if child_status == "failed":
                             any_failed = True
+                        if child_status == "cancelled":
+                            any_cancelled = True
                     # Self-healing: if parent status is out of sync with children, update it
+                    # atomically while still 'pending' so a concurrent cancel_operation wins.
                     if all_done and api_status == "pending":
-                        correct_status = "failed" if any_failed else "completed"
+                        correct_status = "failed" if any_failed else ("cancelled" if any_cancelled else "completed")
                         logger.warning(
                             f"Parent operation {operation_id} status out of sync (DB: pending, should be: {correct_status}). Fixing."
                         )
-                        await conn.execute(
+                        completed_clause = "" if correct_status == "cancelled" else ", completed_at = NOW()"
+                        healed = await conn.fetchrow(
                             f"""
                             UPDATE {fq_table("async_operations")}
-                            SET status = $2, updated_at = NOW(), completed_at = NOW()
-                            WHERE operation_id = $1
+                            SET status = $2, updated_at = NOW(){completed_clause}
+                            WHERE operation_id = $1 AND status = 'pending'
+                            RETURNING status
                             """,
                             op_uuid,
                             correct_status,
                         )
-                        api_status = correct_status
+                        if healed is not None:
+                            api_status = healed["status"]
+                        else:
+                            current_status = await conn.fetchval(
+                                f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                                op_uuid,
+                            )
+                            if current_status is not None:
+                                api_status = current_status
 
                     return {
                         "operation_id": operation_id,
@@ -23512,12 +23530,13 @@ class MemoryEngine(MemoryEngineInterface):
         claimed_worker_id: str | None = None
         claimed_at: Any = None
 
+        lit_bank_id = OracleLiteralStr(bank_id)
         async with acquire_with_retry(backend) as conn:
             # Check if operation exists, belongs to this bank, and is in a cancellable state
             result = await conn.fetchrow(
                 f"SELECT bank_id, status FROM {fq_table('async_operations')} WHERE operation_id = $1 AND bank_id = $2",
                 op_uuid,
-                bank_id,
+                lit_bank_id,
             )
 
             if not result:
@@ -23604,6 +23623,7 @@ class MemoryEngine(MemoryEngineInterface):
         backend = await self._get_backend()
 
         op_uuid = uuid.UUID(operation_id)
+        lit_bank_id = OracleLiteralStr(bank_id)
 
         async with acquire_with_retry(backend) as conn:
             # Make the retry transition a single conditional write. This
@@ -23635,7 +23655,7 @@ class MemoryEngine(MemoryEngineInterface):
                 RETURNING operation_id
                 """,
                 op_uuid,
-                bank_id,
+                lit_bank_id,
             )
 
             if updated is None:
@@ -23643,7 +23663,7 @@ class MemoryEngine(MemoryEngineInterface):
                     f"SELECT status, operation_type, task_payload FROM {fq_table('async_operations')} "
                     f"WHERE operation_id = $1 AND bank_id = $2",
                     op_uuid,
-                    bank_id,
+                    lit_bank_id,
                 )
                 if not row:
                     raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")
@@ -23679,7 +23699,7 @@ class MemoryEngine(MemoryEngineInterface):
                               OR (status = 'pending' AND next_retry_at > NOW())
                           )
                         """,
-                        bank_id,
+                        lit_bank_id,
                         child_filter,
                     )
                     revived = await conn.fetchrow(
@@ -23705,7 +23725,7 @@ class MemoryEngine(MemoryEngineInterface):
                         RETURNING operation_id
                         """,
                         op_uuid,
-                        bank_id,
+                        lit_bank_id,
                         child_filter,
                     )
                     if revived is not None:
@@ -23762,6 +23782,7 @@ class MemoryEngine(MemoryEngineInterface):
         backend = await self._get_backend()
 
         op_uuid = uuid.UUID(operation_id)
+        lit_bank_id = OracleLiteralStr(bank_id)
 
         deleted: Any = None
         async with acquire_with_retry(backend) as conn:
@@ -23777,13 +23798,13 @@ class MemoryEngine(MemoryEngineInterface):
                       AND status IN ('failed', 'cancelled', 'completed')
                     RETURNING operation_id, operation_type, status, result_metadata, task_payload""",
                 op_uuid,
-                bank_id,
+                lit_bank_id,
             )
             if not deleted:
                 row = await conn.fetchrow(
                     f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1 AND bank_id = $2",
                     op_uuid,
-                    bank_id,
+                    lit_bank_id,
                 )
                 if not row:
                     raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")

@@ -936,18 +936,23 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
 
     status_conn = _FakeConn()
     status_conn.parse_json = lambda v: json.loads(v) if isinstance(v, str) else v  # type: ignore[attr-defined]
-    status_conn.fetchrow_responses.append({
-        "operation_id": parent_op_id,
-        "operation_type": "knowledge_ingest",
-        "created_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
-        "updated_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
-        "completed_at": None,
-        "status": "pending",
-        "error_message": None,
-        "result_metadata": meta,
-        "retry_count": 0,
-        "next_retry_at": None,
-    })
+    status_conn.fetchrow_responses.extend(
+        [
+            {
+                "operation_id": parent_op_id,
+                "operation_type": "knowledge_ingest",
+                "created_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                "updated_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                "completed_at": None,
+                "status": "pending",
+                "error_message": None,
+                "result_metadata": meta,
+                "retry_count": 0,
+                "next_retry_at": None,
+            },
+            {"status": "completed"},
+        ]
+    )
     status_conn.fetch_responses.append([
         {"operation_id": child_op_id, "status": "completed", "error_message": None, "result_metadata": {"sub_batch_index": 0}}
     ])
@@ -959,13 +964,146 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
     assert isinstance(status_conn.executed[0][1][1], OracleLiteralStr)
     assert isinstance(status_conn.executed[1][1][0], OracleLiteralStr)
 
+    # 4) cancel_operation, retry_operation, delete_operation wrap UUID bank_id in OracleLiteralStr.
+    eng._active_operation_canceller = None
+    eng._is_operation_active = None
+    cancel_conn = _FakeConn()
+    cancel_conn.fetchrow_responses.extend(
+        [{"bank_id": uuid_bank, "status": "pending"}, {"status": "cancelled", "worker_id": None, "claimed_at": None}]
+    )
+    eng._get_backend = AsyncMock(return_value=_cm_backend(cancel_conn))
+    eng._maybe_update_parent_operation = AsyncMock()
+    await eng.cancel_operation(uuid_bank, child_op_id, request_context=RequestContext(), _knowledge_bank=True)
+    assert isinstance(cancel_conn.executed[0][1][1], OracleLiteralStr)
+
+    retry_conn = _FakeConn()
+    retry_conn.fetchrow_responses.append({"operation_id": child_op_id})
+    eng._get_backend = AsyncMock(return_value=_cm_backend(retry_conn))
+    await eng.retry_operation(uuid_bank, child_op_id, request_context=RequestContext(), _knowledge_bank=True)
+    assert isinstance(retry_conn.executed[0][1][1], OracleLiteralStr)
+
+    del_conn = _FakeConn()
+    del_conn.fetchrow_responses.append(
+        {"operation_id": child_op_id, "operation_type": "knowledge_ingest", "status": "completed", "result_metadata": {}, "task_payload": None}
+    )
+    eng._get_backend = AsyncMock(return_value=_cm_backend(del_conn))
+    eng._delete_operation_export_archive = AsyncMock()
+    await eng.delete_operation(uuid_bank, child_op_id, request_context=RequestContext(), _knowledge_bank=True)
+    assert isinstance(del_conn.executed[0][1][1], OracleLiteralStr)
+
+    # 5) Cancelled children reconcile to cancelled in poller + ops_oracle, legacy knowledge_ingest
+    #    parents without is_parent still expose child_operations, and concurrent cancel wins over self-heal.
+    assert "NOT IN ('completed', 'failed', 'cancelled')" in ops_conn.executed[-1][0]
+    rec_cancel_conn = _FakeConn()
+    rec_cancel_conn.fetchrow_responses.append({"status": "pending"})
+    rec_cancel_conn.fetch_responses.append([{"status": "cancelled", "error_message": None}])
+    rec_cancel_poller = WorkerPoller(
+        backend=_cm_backend(
+            rec_cancel_conn,
+            SimpleNamespace(
+                fetch_reconcilable_batch_parents=AsyncMock(
+                    return_value=[{"operation_id": uuid.UUID(parent_op_id), "bank_id": uuid_bank}]
+                )
+            ),
+        ),
+        worker_id="w1",
+        executor=AsyncMock(),
+    )
+    assert await rec_cancel_poller._reconcile_orphaned_parents(None) == 1
+    assert any("SET status = 'cancelled'" in sql for sql, _ in rec_cancel_conn.executed)
+
+    legacy_conn = _FakeConn()
+    legacy_conn.parse_json = lambda v: json.loads(v) if isinstance(v, str) else v  # type: ignore[attr-defined]
+    legacy_conn.fetchrow_responses.extend(
+        [
+            {
+                "operation_id": parent_op_id,
+                "operation_type": "knowledge_ingest",
+                "created_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                "updated_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+                "completed_at": None,
+                "status": "pending",
+                "error_message": None,
+                "result_metadata": {"document_ids": ["doc-1"], "num_sub_batches": 1},
+                "retry_count": 0,
+                "next_retry_at": None,
+            },
+            None,  # Simulate concurrent cancel_operation beating the status = 'pending' UPDATE
+        ]
+    )
+    legacy_conn.fetch_responses.append(
+        [{"operation_id": child_op_id, "status": "completed", "error_message": None, "result_metadata": {"sub_batch_index": 0}}]
+    )
+    legacy_conn.fetchval_responses.append("cancelled")
+    eng._get_backend = AsyncMock(return_value=_cm_backend(legacy_conn))
+    legacy_status = await eng.get_operation_status(
+        uuid_bank, parent_op_id, request_context=RequestContext(), _knowledge_bank=True
+    )
+    assert len(legacy_status["child_operations"]) == 1
+    assert legacy_status["status"] == "cancelled"
+
+
+async def _seed_small_and_big_banks(
+    backend: Any, big: str, small: str, dim: int, big_vec: Any, small_vecs: list[list[float]], kind: str
+) -> None:
+    """Populate a large bank (3,000 rows) and small bank (3 rows) for vector cursor regression."""
+    from hindsight_api.engine.schema import fq_table
+
+    async with backend.acquire() as conn:
+        async with conn.transaction():
+            for bank_id in (big, small):
+                await conn.execute(
+                    f"INSERT INTO {fq_table('banks')} (bank_id, name, disposition, mission, internal_id, kind) "
+                    "VALUES ($1, $2, $3, NULL, $4, $5)",
+                    OracleLiteralStr(bank_id),
+                    OracleLiteralStr(bank_id),
+                    "{}",
+                    uuid.uuid4(),
+                    kind,
+                )
+            await conn.execute(
+                f"INSERT INTO {fq_table('kb_documents')} (bank_id, document_id, content_type, media_type, content_hash, passage_count) "
+                "VALUES ($1, $2, 'text/plain', 'text', 'h', 3000)",
+                OracleLiteralStr(big),
+                OracleLiteralStr("d"),
+            )
+            rows = [
+                (OracleLiteralStr(big), OracleLiteralStr("d"), i, "text", f"big filler {i} red", big_vec)
+                for i in range(1, 3001)
+            ]
+            for idx in range(0, len(rows), 500):
+                await conn.executemany(
+                    f"INSERT INTO {fq_table('kb_passages')} (bank_id, document_id, idx, modality, text, embedding) "
+                    "VALUES ($1, $2, $3, $4, $5, $6)",
+                    rows[idx : idx + 500],
+                )
+            for n, vec in enumerate(small_vecs):
+                doc_id = f"s{n}"
+                await conn.execute(
+                    f"INSERT INTO {fq_table('kb_documents')} (bank_id, document_id, content_type, media_type, content_hash, passage_count) "
+                    "VALUES ($1, $2, 'text/plain', 'text', 'h', 1)",
+                    OracleLiteralStr(small),
+                    OracleLiteralStr(doc_id),
+                )
+                await conn.execute(
+                    f"INSERT INTO {fq_table('kb_passages')} (bank_id, document_id, idx, modality, text, embedding) "
+                    "VALUES ($1, $2, 0, 'text', $3, $4)",
+                    OracleLiteralStr(small),
+                    OracleLiteralStr(doc_id),
+                    f"small passage {n} red",
+                    array.array("f", vec),
+                )
+        try:
+            await conn.execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'KB_PASSAGES'); END;")
+            await conn.execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'KB_DOCUMENTS'); END;")
+        except Exception:
+            pass
+
 
 @pytest.mark.oracle
 @pytest.mark.asyncio
 async def test_oracle_small_bank_finds_its_passages_next_to_a_big_one(oracle_db_url, monkeypatch):
     """Live Oracle 26ai check for #6731: a small bank finds its passages after a 3,000-row big bank."""
-    import uuid
-
     from hindsight_api.config import clear_config_cache
     from hindsight_api.engine.db.oracle import OracleBackend
     from hindsight_api.engine.schema import fq_table
@@ -989,55 +1127,7 @@ async def test_oracle_small_bank_finds_its_passages_next_to_a_big_one(oracle_db_
     ]
     store = OracleKnowledgeStore(AsyncMock(return_value=backend))
     try:
-        async with backend.acquire() as conn:
-            async with conn.transaction():
-                for b in (big, small):
-                    await conn.execute(
-                        f"INSERT INTO {fq_table('banks')} (bank_id, name, disposition, mission, internal_id, kind) "
-                        "VALUES ($1, $2, $3, NULL, $4, $5)",
-                        OracleLiteralStr(b),
-                        OracleLiteralStr(b),
-                        "{}",
-                        uuid.uuid4(),
-                        KIND,
-                    )
-                await conn.execute(
-                    f"INSERT INTO {fq_table('kb_documents')} (bank_id, document_id, content_type, media_type, content_hash, passage_count) "
-                    "VALUES ($1, $2, 'text/plain', 'text', 'h', 3000)",
-                    OracleLiteralStr(big),
-                    OracleLiteralStr("d"),
-                )
-                rows = [
-                    (OracleLiteralStr(big), OracleLiteralStr("d"), i, "text", f"big filler {i} red", big_vec)
-                    for i in range(1, 3001)
-                ]
-                for idx in range(0, len(rows), 500):
-                    await conn.executemany(
-                        f"INSERT INTO {fq_table('kb_passages')} (bank_id, document_id, idx, modality, text, embedding) "
-                        "VALUES ($1, $2, $3, $4, $5, $6)",
-                        rows[idx : idx + 500],
-                    )
-                for n, vec in enumerate(small_vecs):
-                    doc_id = f"s{n}"
-                    await conn.execute(
-                        f"INSERT INTO {fq_table('kb_documents')} (bank_id, document_id, content_type, media_type, content_hash, passage_count) "
-                        "VALUES ($1, $2, 'text/plain', 'text', 'h', 1)",
-                        OracleLiteralStr(small),
-                        OracleLiteralStr(doc_id),
-                    )
-                    await conn.execute(
-                        f"INSERT INTO {fq_table('kb_passages')} (bank_id, document_id, idx, modality, text, embedding) "
-                        "VALUES ($1, $2, 0, 'text', $3, $4)",
-                        OracleLiteralStr(small),
-                        OracleLiteralStr(doc_id),
-                        f"small passage {n} red",
-                        array.array("f", vec),
-                    )
-            try:
-                await conn.execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'KB_PASSAGES'); END;")
-                await conn.execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'KB_DOCUMENTS'); END;")
-            except Exception:
-                pass
+        await _seed_small_and_big_banks(backend, big, small, dim, big_vec, small_vecs, KIND)
 
         # Warm the shared cursor on the big bank first, then search the small bank.
         big_res = await store.search(big, list(big_vec), top_k=10, filters=SearchFilters(), query_text="red")

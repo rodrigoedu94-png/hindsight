@@ -157,7 +157,7 @@ class PostgreSQLOps(DataAccessOps):
                   FROM {table} child
                   WHERE child.bank_id = parent.bank_id
                     AND child.result_metadata->>'parent_operation_id' = parent.operation_id::text
-                    AND child.status NOT IN ('completed', 'failed')
+                    AND child.status NOT IN ('completed', 'failed', 'cancelled')
               )
             """
         )
@@ -1175,6 +1175,8 @@ class PostgreSQLOps(DataAccessOps):
         budget: int,
         per_entity_limit: int,
         window: UpdatedWindow,
+        *,
+        timeout: float | None = None,
     ) -> LinkExpansionRows:
         # Array ops on source_memory_ids: unnest, a per-source @> GIN probe, COUNT(DISTINCT).
         #

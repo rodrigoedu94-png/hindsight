@@ -435,6 +435,42 @@ class SlotAvailability:
     """Remaining shared pool capacity (usable by any operation type)."""
 
 
+async def _finalize_parent_from_siblings(conn: Any, table: str, parent_uuid: Any, siblings: list[Any]) -> str:
+    """Update a batch parent operation to completed/failed/cancelled from its terminal siblings."""
+    if any(s["status"] == "failed" for s in siblings):
+        # A real failure outranks a cancellation: it carries a cause to surface.
+        await conn.execute(
+            f"""
+            UPDATE {table}
+            SET status = 'failed', error_message = $2, updated_at = now()
+            WHERE operation_id = $1
+            """,
+            parent_uuid,
+            _summarise_child_error_messages(siblings),
+        )
+        return "failed"
+    if any(s["status"] == "cancelled" for s in siblings):
+        # No completed_at: the batch was stopped, not finished.
+        await conn.execute(
+            f"""
+            UPDATE {table}
+            SET status = 'cancelled', updated_at = now()
+            WHERE operation_id = $1
+            """,
+            parent_uuid,
+        )
+        return "cancelled"
+    await conn.execute(
+        f"""
+        UPDATE {table}
+        SET status = 'completed', error_message = NULL, updated_at = now(), completed_at = now()
+        WHERE operation_id = $1
+        """,
+        parent_uuid,
+    )
+    return "completed"
+
+
 class WorkerPoller:
     """
     Polls the database for pending tasks and executes them.
@@ -1183,41 +1219,7 @@ class WorkerPoller:
             if not siblings or not all(s["status"] in ("completed", "failed", "cancelled") for s in siblings):
                 return
 
-            any_failed = any(s["status"] == "failed" for s in siblings)
-            any_cancelled = any(s["status"] == "cancelled" for s in siblings)
-            if any_failed:
-                # A real failure outranks a cancellation: it carries a cause to surface.
-                parent_status = "failed"
-                await conn.execute(
-                    f"""
-                    UPDATE {table}
-                    SET status = 'failed', error_message = $2, updated_at = now()
-                    WHERE operation_id = $1
-                    """,
-                    uuid.UUID(parent_operation_id),
-                    _summarise_child_error_messages(siblings),
-                )
-            elif any_cancelled:
-                # No completed_at: the batch was stopped, not finished.
-                parent_status = "cancelled"
-                await conn.execute(
-                    f"""
-                    UPDATE {table}
-                    SET status = 'cancelled', updated_at = now()
-                    WHERE operation_id = $1
-                    """,
-                    uuid.UUID(parent_operation_id),
-                )
-            else:
-                parent_status = "completed"
-                await conn.execute(
-                    f"""
-                    UPDATE {table}
-                    SET status = 'completed', error_message = NULL, updated_at = now(), completed_at = now()
-                    WHERE operation_id = $1
-                    """,
-                    uuid.UUID(parent_operation_id),
-                )
+            parent_status = await _finalize_parent_from_siblings(conn, table, uuid.UUID(parent_operation_id), siblings)
             logger.info(f"Poller updated parent operation {parent_operation_id} to {parent_status} (all siblings done)")
         except Exception as e:
             # Log but don't re-raise — the child has already been marked failed,
@@ -2391,7 +2393,7 @@ class WorkerPoller:
                         )
 
                         # A still-live child will drive the aggregation itself.
-                        if any(s["status"] not in ("completed", "failed") for s in siblings):
+                        if any(s["status"] not in ("completed", "failed", "cancelled") for s in siblings):
                             continue
 
                         if not siblings:
@@ -2407,25 +2409,8 @@ class WorkerPoller:
                                 "persisted (worker crashed mid-submission); resubmit the "
                                 "source documents",
                             )
-                        elif any(s["status"] == "failed" for s in siblings):
-                            await conn.execute(
-                                f"""
-                                UPDATE {table}
-                                SET status = 'failed', error_message = $2, updated_at = now()
-                                WHERE operation_id = $1
-                                """,
-                                parent_id,
-                                _summarise_child_error_messages(siblings),
-                            )
                         else:
-                            await conn.execute(
-                                f"""
-                                UPDATE {table}
-                                SET status = 'completed', error_message = NULL, completed_at = now(), updated_at = now()
-                                WHERE operation_id = $1
-                                """,
-                                parent_id,
-                            )
+                            await _finalize_parent_from_siblings(conn, table, parent_id, siblings)
                         reconciled += 1
 
             # Debug when the pass found nothing: a multi-tenant worker runs this
