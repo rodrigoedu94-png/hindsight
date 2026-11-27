@@ -30,6 +30,7 @@ from ..config import (
     ENV_RETAIN_WALL_TIMEOUT,
     get_config,
 )
+from ..engine.db.oracle import OracleLiteralStr
 from ..engine.permit_wait import excluding_permit_wait
 from ..engine.schema import fq_table_explicit as fq_table
 from ..metrics import OperationOutcome, get_metrics_collector
@@ -1148,6 +1149,7 @@ class WorkerPoller:
                 return
 
             bank_id = row["bank_id"]
+            lit_bank_id = OracleLiteralStr(bank_id)
 
             # Lock parent to prevent concurrent sibling updates. A cancelled parent
             # is left alone: the operator cancelled the whole batch, and a child
@@ -1156,7 +1158,7 @@ class WorkerPoller:
                 f"SELECT operation_id FROM {table} WHERE operation_id = $1 AND bank_id = $2 "
                 f"AND status <> 'cancelled' FOR UPDATE",
                 uuid.UUID(parent_operation_id),
-                bank_id,
+                lit_bank_id,
             )
             if not parent_row:
                 return
@@ -1172,7 +1174,7 @@ class WorkerPoller:
                 WHERE bank_id = $1
                   AND result_metadata::jsonb @> $2::jsonb
                 """,
-                bank_id,
+                lit_bank_id,
                 json.dumps({"parent_operation_id": parent_operation_id}),
             )
             # 'cancelled' counts as done (issue #4131): an operator can cancel an
@@ -2384,7 +2386,7 @@ class WorkerPoller:
                             WHERE bank_id = $1
                               AND result_metadata::jsonb @> $2::jsonb
                             """,
-                            bank_id,
+                            OracleLiteralStr(bank_id),
                             json.dumps({"parent_operation_id": str(parent_id)}),
                         )
 

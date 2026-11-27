@@ -184,6 +184,7 @@ async def expand_observations_pgq(
     *,
     max_causal_hops: int = 2,
     os_table: str = "observation_sources",
+    timeout: float | None = None,
 ) -> LinkExpansionRows:
     """Expand observation memories via Oracle 26ai SQL/PGQ (derived_from, mentions, memory_link).
 
@@ -223,6 +224,7 @@ async def expand_observations_pgq(
                         )
                     )"""
 
+    fetch_kwargs: dict[str, Any] = {"timeout": timeout} if timeout is not None else {}
     all_rows = await conn.fetch(
         f"""
             WITH seed_sources AS (
@@ -330,6 +332,7 @@ async def expand_observations_pgq(
         seed_ids,
         budget,
         *window.params,
+        **fetch_kwargs,
     )
     return LinkExpansionRows(
         entity=[r for r in all_rows if r["source"] == "entity"],

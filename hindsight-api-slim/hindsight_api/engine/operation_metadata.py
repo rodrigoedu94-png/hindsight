@@ -66,6 +66,7 @@ class KnowledgeIngestParentMetadata:
 
     document_ids: list[str]
     num_sub_batches: int
+    is_parent: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""

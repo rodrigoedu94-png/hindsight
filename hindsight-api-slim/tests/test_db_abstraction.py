@@ -2093,3 +2093,36 @@ class TestOracleSessionAndClobBinding:
             "VALUES (q'{it's (a, b), :7}', :1, TO_VECTOR(:2)), (Q'<x) y,>', :3, /* c, ) */ :4)"
         )
         assert keys(insert_sql) == {"2", "4"}
+
+    @pytest.mark.asyncio
+    async def test_vector_bind_keys_matches_to_vector_with_dim_and_leading_whitespace(self):
+        import array
+        from unittest.mock import AsyncMock, MagicMock
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        sql = "INSERT INTO kb_passages (bank_id, document_id, idx, embedding) VALUES (:1, :2, :3, TO_VECTOR(:4, 384, FLOAT32))"
+        assert OracleConnection._vector_bind_keys(sql) == {"4"}
+
+        params = {"4": "  [0.5, 1.5] "}
+        OracleConnection._convert_vector_params({"4"}, params)
+        assert isinstance(params["4"], array.array)
+        assert params["4"].typecode == "f"
+        assert list(params["4"]) == [0.5, 1.5]
+
+        cursor = MagicMock()
+        cursor.execute = AsyncMock()
+        cursor.executemany = AsyncMock()
+        cursor.getbatcherrors = MagicMock(return_value=[])
+        raw_conn = MagicMock()
+        raw_conn.version = "23.26.4.1.0"
+        raw_conn.cursor.return_value = cursor
+        conn = OracleConnection(raw_conn)
+        await conn.executemany_filtered(
+            "INSERT INTO kb_passages (bank_id, document_id, idx, embedding) VALUES ($1, $2, $3, TO_VECTOR($4, 384, FLOAT32))",
+            [("b1", "d1", 0, " [0.25, 0.75]")],
+            is_ignored_error=lambda _e: False,
+        )
+        bound_rows = cursor.executemany.await_args.args[1]
+        assert isinstance(bound_rows[0]["4"], array.array)
+        assert list(bound_rows[0]["4"]) == [0.25, 0.75]

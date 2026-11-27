@@ -691,6 +691,7 @@ from .bank_life import (
 from .bank_templates import apply_default_bank_template_resources, load_default_bank_template_manifest
 from .cross_encoder import RANK_SCORE_PROVIDERS, CrossEncoderModel, recall_log_id
 from .decision_model import DecisionEngineFor, DecisionModel, decision_engine
+from .db.oracle import OracleLiteralStr
 from .embeddings import (
     EMBEDDING_MODEL_SETTING,
     Embeddings,
@@ -6441,6 +6442,7 @@ class MemoryEngine(MemoryEngineInterface):
                 return
 
             bank_id = row["bank_id"]
+            lit_bank_id = OracleLiteralStr(bank_id)
 
             # Lock the parent operation to prevent concurrent updates from other children
             # Use FOR UPDATE to ensure only one child can update the parent at a time.
@@ -6455,7 +6457,7 @@ class MemoryEngine(MemoryEngineInterface):
                 FOR UPDATE
                 """,
                 uuid.UUID(parent_operation_id),
-                bank_id,
+                lit_bank_id,
             )
 
             if not parent_row:
@@ -6478,7 +6480,7 @@ class MemoryEngine(MemoryEngineInterface):
                 WHERE bank_id = $1
                 AND result_metadata::jsonb @> $2::jsonb
                 """,
-                bank_id,
+                lit_bank_id,
                 json.dumps({"parent_operation_id": parent_operation_id}),
             )
 
@@ -12964,7 +12966,7 @@ class MemoryEngine(MemoryEngineInterface):
                         bank_row = await conn.fetchrow(
                             f"SELECT bank_id, internal_id FROM {fq_table('banks')} "
                             f"WHERE bank_id = $1 FOR NO KEY UPDATE",
-                            bank_id,
+                            OracleLiteralStr(bank_id),
                         )
                         if _expected_internal_id is not None and (
                             bank_row is None or str(bank_row["internal_id"]) != str(_expected_internal_id)
@@ -13021,7 +13023,7 @@ class MemoryEngine(MemoryEngineInterface):
                             if fact_type == "observation":
                                 await conn.execute(
                                     f"DELETE FROM {fq_table('observation_history')} WHERE bank_id = $1",
-                                    bank_id,
+                                    OracleLiteralStr(bank_id),
                                 )
 
                             if unit_ids:
@@ -13068,7 +13070,8 @@ class MemoryEngine(MemoryEngineInterface):
                                     ):
                                         continue
                                     await conn.execute(
-                                        f"DELETE FROM {qualified} WHERE {spec.bank_id_column} = $1", bank_id
+                                        f"DELETE FROM {qualified} WHERE {spec.bank_id_column} = $1",
+                                        OracleLiteralStr(bank_id),
                                     )
 
                             attempt_result = {
@@ -13091,7 +13094,7 @@ class MemoryEngine(MemoryEngineInterface):
                                     await conn.execute(
                                         f"{llm_requests_locked_in_id_order(_llm_table, 'bank_id = $1')} "
                                         f"DELETE FROM {_llm_table} t USING target WHERE t.id = target.id",
-                                        bank_id,
+                                        OracleLiteralStr(bank_id),
                                     )
                                 # The FK cascade drops these, but resolve() caches them: their
                                 # names are evicted after commit, or a write to one would recreate
@@ -13099,12 +13102,14 @@ class MemoryEngine(MemoryEngineInterface):
                                 attempt_freed_aliases = [
                                     row["alias"]
                                     for row in await conn.fetch(
-                                        f"SELECT alias FROM {fq_table('bank_aliases')} WHERE bank_id = $1", bank_id
+                                        f"SELECT alias FROM {fq_table('bank_aliases')} WHERE bank_id = $1",
+                                        OracleLiteralStr(bank_id),
                                     )
                                 ]
                                 # Delete the bank profile and retrieve internal_id for HNSW index cleanup
                                 internal_id = await conn.fetchval(
-                                    f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1 RETURNING internal_id", bank_id
+                                    f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1 RETURNING internal_id",
+                                    OracleLiteralStr(bank_id),
                                 )
                                 if internal_id:
                                     attempt_bank_internal_id = str(internal_id)
@@ -23321,6 +23326,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         async with acquire_with_retry(backend) as conn:
             payload_column = ", task_payload" if include_payload else ""
+            lit_bank_id = OracleLiteralStr(bank_id)
             row = await conn.fetchrow(
                 f"""
                 SELECT operation_id, operation_type, created_at, updated_at, completed_at, status, error_message, result_metadata, retry_count, next_retry_at{payload_column}
@@ -23328,7 +23334,7 @@ class MemoryEngine(MemoryEngineInterface):
                 WHERE operation_id = $1 AND bank_id = $2
                 """,
                 op_uuid,
-                bank_id,
+                lit_bank_id,
             )
 
             if row:
@@ -23353,7 +23359,7 @@ class MemoryEngine(MemoryEngineInterface):
                         AND result_metadata::jsonb @> $2::jsonb
                         ORDER BY (result_metadata->>'sub_batch_index')::int
                         """,
-                        bank_id,
+                        lit_bank_id,
                         json.dumps({"parent_operation_id": operation_id}),
                     )
 

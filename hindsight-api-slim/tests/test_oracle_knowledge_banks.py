@@ -777,6 +777,189 @@ async def test_oracle_store_search_breaks_equal_score_ties_deterministically():
     ]
 
 
+@pytest.mark.asyncio
+async def test_oracle_store_search_arms_include_sql_tie_breakers():
+    conn = _FakeConn()
+    conn.fetchval_responses.extend([1, 10])  # bank exists, total_n
+    conn.fetch_responses.extend(
+        [
+            [{"document_id": "doc-a", "idx": 0, "arm_score": 0.9}],  # Arm 1
+            [],  # Arm 2
+            [{"term_idx": 0, "df": 1}, {"term_idx": 1, "df": 1}],  # batched df probe
+            [{"document_id": "doc-a", "idx": 0, "arm_score": 50.0}],  # Arm 3
+            [_sample_doc_row("doc-a") | {"idx": 0, "modality": "text", "text": "alpha beta", "page": None, "start_ms": None, "end_ms": None, "media_key": None, "language": None, "score": 0.9}],
+            [],  # role scores
+        ]
+    )
+    store = OracleKnowledgeStore(AsyncMock(return_value=_FakeBackend(conn)))  # ty: ignore[invalid-argument-type]
+    await store.search("bank-1", query_text="alpha beta", vector=[0.1, 0.2], top_k=3, around=0, filters=SearchFilters())
+
+    arm1_sql = next(sql for sql, _ in conn.executed if "FETCH EXACT FIRST" in sql)
+    arm2_sql = next(sql for sql, _ in conn.executed if "GROUP BY x.document_id, x.idx" in sql)
+    arm3_sql = next(sql for sql, _ in conn.executed if "ORDER BY SCORE(1) DESC" in sql)
+    assert "ORDER BY VECTOR_DISTANCE(x.embedding, $1, COSINE), x.document_id ASC, x.idx ASC FETCH EXACT FIRST" in arm1_sql
+    assert "ORDER BY MAX(1 - VECTOR_DISTANCE(x.embedding, $1, COSINE)) DESC, x.document_id ASC, x.idx ASC FETCH FIRST" in arm2_sql
+    assert "ORDER BY SCORE(1) DESC, x.document_id ASC, x.idx ASC FETCH FIRST" in arm3_sql
+
+
+@pytest.mark.asyncio
+async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
+    import uuid
+
+    from hindsight_api.engine.db.ops_oracle import OracleOps
+    from hindsight_api.engine.memory_engine import MemoryEngine
+    from hindsight_api.engine.operation_metadata import KnowledgeIngestParentMetadata
+    from hindsight_api.models import RequestContext
+    from hindsight_api.worker.poller import WorkerPoller
+
+    uuid_bank = "11111111-2222-3333-4444-555555555555"
+    parent_op_id = str(uuid.uuid4())
+    child_op_id = str(uuid.uuid4())
+
+    # 1) KnowledgeIngestParentMetadata carries is_parent=True for get_operation_status self-healing.
+    meta = KnowledgeIngestParentMetadata(document_ids=["doc-1"], num_sub_batches=1).to_dict()
+    assert meta["is_parent"] is True
+
+    # 2) KnowledgeService.delete_bank passes OracleLiteralStr(bank_id) to engine.delete_bank, and
+    #    MemoryEngine.delete_bank preserves OracleLiteralStr on banks & bank_aliases queries.
+    conn = _FakeConn()
+    conn.fetchrow_responses.append({"bank_id": uuid_bank, "internal_id": str(uuid.uuid4())})
+    conn.fetch_responses.append([{"alias": "alias-1"}])
+    conn.fetchval_responses.append(str(uuid.uuid4()))
+
+    def _cm_backend(c: Any, ops_obj: Any = None) -> Any:
+        @asynccontextmanager
+        async def _acquire():
+            yield c
+
+        return SimpleNamespace(_wraps_backend=True, acquire=_acquire, ops=ops_obj)
+
+    backend = _cm_backend(conn, SimpleNamespace(drop_bank_vector_indexes=AsyncMock()))
+    del_store = SimpleNamespace(
+        store_owned_for=lambda _b: True,
+        count_bank_contents=AsyncMock(return_value=SimpleNamespace(memory_units=0, entities=0, documents=0)),
+        purge_bank_rows=AsyncMock(return_value=[]),
+        drop_bank_storage=AsyncMock(),
+    )
+
+    eng = MemoryEngine.__new__(MemoryEngine)
+    eng._initialized = True
+    eng._tenant_extension = None
+    eng._operation_validator = None
+    eng._active_operation_canceller = None
+    eng._active_bank_operations_canceller = None
+    eng._finish_bank_delete = None
+    eng._bank_stats_cache = SimpleNamespace(invalidate=AsyncMock())
+    eng._delete_files_quietly = AsyncMock()
+    eng._submit_vector_index_maintenance_quietly = AsyncMock()
+    eng._authenticate_tenant = AsyncMock(return_value=None)
+    eng._refuse_bank_wide_if_scoped = AsyncMock(return_value=None)
+    eng._backend = backend
+    eng._get_backend = AsyncMock(return_value=backend)
+    eng._config_resolver = SimpleNamespace(resolve_full_config=AsyncMock(return_value=SimpleNamespace(enable_auto_consolidation=False)))
+
+    with patch("hindsight_api.engine.memories.get_memories", return_value=del_store):
+        await eng.delete_bank(uuid_bank, request_context=RequestContext(), _knowledge_bank=True)
+
+    bank_queries = [
+        args[0]
+        for sql, args in conn.executed
+        if ("banks" in sql or "bank_aliases" in sql) and "WHERE bank_id = $1" in sql
+    ]
+    assert len(bank_queries) == 3
+    assert all(isinstance(arg, OracleLiteralStr) and isinstance(_convert_arg(arg), str) for arg in bank_queries)
+
+    svc_engine = SimpleNamespace(
+        _db_backend=SimpleNamespace(backend_type="oracle"),
+        _get_backend=AsyncMock(return_value=_cm_backend(_FakeConn())),
+        delete_bank=AsyncMock(return_value={"bank_deleted": True}),
+        _file_storage=SimpleNamespace(delete_prefix=AsyncMock()),
+    )
+    svc = KnowledgeService(svc_engine)  # type: ignore[arg-type]
+    monkeypatch.setattr(svc, "_open_bank", AsyncMock())
+    monkeypatch.setattr(
+        svc,
+        "_store",
+        SimpleNamespace(
+            bank_stats=AsyncMock(return_value={}),
+            delete_some_documents=AsyncMock(return_value=0),
+            list_documents=AsyncMock(return_value=SimpleNamespace(documents=[])),
+            bank_deleted=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr(svc, "_on_delete_complete", AsyncMock())
+    await svc.delete_bank(uuid_bank, RequestContext())
+    assert isinstance(svc_engine.delete_bank.await_args.args[0], OracleLiteralStr)
+
+    # 3) Engine & Poller _maybe_update_parent_operation + _reconcile_orphaned_parents + get_operation_status
+    #    wrap plain str row['bank_id'] in OracleLiteralStr(bank_id) and discovery includes 'knowledge_ingest'.
+    ops = OracleOps()
+    ops_conn = _FakeConn()
+    await ops.fetch_reconcilable_batch_parents(ops_conn, "async_operations")  # type: ignore[arg-type]
+    assert "IN ('batch_retain', 'knowledge_ingest')" in ops_conn.executed[-1][0]
+
+    rollup_conn = _FakeConn()
+    rollup_conn.parse_json = lambda v: json.loads(v) if isinstance(v, str) else v  # type: ignore[attr-defined]
+    rollup_conn.fetchrow_responses.extend([
+        {"bank_id": uuid_bank, "result_metadata": {"parent_operation_id": parent_op_id}},
+        {"operation_id": parent_op_id},
+    ])
+    rollup_conn.fetch_responses.append([{"status": "completed", "error_message": None, "result_metadata": {}}])
+    await eng._maybe_update_parent_operation(child_op_id, rollup_conn)
+    assert isinstance(rollup_conn.executed[1][1][1], OracleLiteralStr)
+    assert isinstance(rollup_conn.executed[2][1][0], OracleLiteralStr)
+
+    poller = WorkerPoller(backend=backend, worker_id="w1", executor=AsyncMock())
+    p_conn = _FakeConn()
+    p_conn.fetchrow_responses.extend([
+        {"bank_id": uuid_bank, "result_metadata": {"parent_operation_id": parent_op_id}},
+        {"operation_id": parent_op_id},
+    ])
+    p_conn.fetch_responses.append([{"status": "completed", "error_message": None}])
+    await poller._maybe_update_parent_operation(child_op_id, None, p_conn)
+    assert isinstance(p_conn.executed[1][1][1], OracleLiteralStr)
+    assert isinstance(p_conn.executed[2][1][0], OracleLiteralStr)
+
+    rec_conn = _FakeConn()
+    rec_conn.fetchrow_responses.append({"status": "pending"})
+    rec_conn.fetch_responses.append([{"status": "completed", "error_message": None}])
+    rec_backend = _cm_backend(
+        rec_conn,
+        SimpleNamespace(
+            fetch_reconcilable_batch_parents=AsyncMock(return_value=[{"operation_id": uuid.UUID(parent_op_id), "bank_id": uuid_bank}])
+        ),
+    )
+    rec_poller = WorkerPoller(backend=rec_backend, worker_id="w1", executor=AsyncMock())  # type: ignore[arg-type]
+    assert await rec_poller._reconcile_orphaned_parents(None) == 1
+    siblings_call = next((args for sql, args in rec_conn.executed if "result_metadata::jsonb @>" in sql), None)
+    assert siblings_call is not None and isinstance(siblings_call[0], OracleLiteralStr)
+
+    status_conn = _FakeConn()
+    status_conn.parse_json = lambda v: json.loads(v) if isinstance(v, str) else v  # type: ignore[attr-defined]
+    status_conn.fetchrow_responses.append({
+        "operation_id": parent_op_id,
+        "operation_type": "knowledge_ingest",
+        "created_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+        "completed_at": None,
+        "status": "pending",
+        "error_message": None,
+        "result_metadata": meta,
+        "retry_count": 0,
+        "next_retry_at": None,
+    })
+    status_conn.fetch_responses.append([
+        {"operation_id": child_op_id, "status": "completed", "error_message": None, "result_metadata": {"sub_batch_index": 0}}
+    ])
+    eng._get_backend = AsyncMock(return_value=_cm_backend(status_conn))
+    status = await eng.get_operation_status(
+        uuid_bank, parent_op_id, request_context=RequestContext(), _knowledge_bank=True
+    )
+    assert status["status"] == "completed"
+    assert isinstance(status_conn.executed[0][1][1], OracleLiteralStr)
+    assert isinstance(status_conn.executed[1][1][0], OracleLiteralStr)
+
+
 @pytest.mark.oracle
 @pytest.mark.asyncio
 async def test_oracle_small_bank_finds_its_passages_next_to_a_big_one(oracle_db_url, monkeypatch):
@@ -872,6 +1055,7 @@ async def test_oracle_small_bank_finds_its_passages_next_to_a_big_one(oracle_db_
                     await conn.execute(f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1", OracleLiteralStr(b))
         finally:
             await backend.shutdown()
+            clear_config_cache()
 
 
 @pytest.mark.oracle

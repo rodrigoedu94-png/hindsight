@@ -442,10 +442,18 @@ class TestOracleOpsAndPropertyGraph:
         assert len(res_to.causal) == 1
         assert conn.fetch.await_count == 2
 
-        # When both PGQ and its timeout fallback fail/timeout, degrade to relational super()._expand_combined.
+        # When both PGQ and its timeout fallback time out, return empty without cascading to relational.
+        relational_mock = AsyncMock(return_value=fallback_rows)
+        monkeypatch.setattr(LinkExpansionRetriever, "_expand_combined", relational_mock)
         conn.fetch = AsyncMock(side_effect=[asyncio.TimeoutError(), asyncio.TimeoutError()])
         res_to_fb = await retriever._expand_combined(conn, ["seed-1"], "world", 20, ops=ops)
-        assert res_to_fb is fallback_rows
+        assert res_to_fb.entity == [] and res_to_fb.semantic == [] and res_to_fb.causal == []
+        relational_mock.assert_not_awaited()
+
+        # When PGQ times out and its fallback hits a PGQ error, fall back to relational.
+        conn.fetch = AsyncMock(side_effect=[asyncio.TimeoutError(), RuntimeError("ORA-49022: graph unavailable")])
+        res_to_pgq_err = await retriever._expand_combined(conn, ["seed-1"], "world", 20, ops=ops)
+        assert res_to_pgq_err is fallback_rows
 
     @pytest.mark.asyncio
     async def test_uuid_shaped_bank_ids_stay_str_in_ora_modules(self):

@@ -766,7 +766,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                 f"FROM {passages_table} x "
                 f"{join_docs}"
                 f"WHERE x.bank_id = $2{p_where} "
-                f"ORDER BY VECTOR_DISTANCE(x.embedding, $1, COSINE) "
+                f"ORDER BY VECTOR_DISTANCE(x.embedding, $1, COSINE), x.document_id ASC, x.idx ASC "
                 f"FETCH EXACT FIRST {pool_size} ROWS ONLY",
                 *vec_params,
             )
@@ -779,7 +779,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                 f"{join_docs}"
                 f"WHERE x.bank_id = $2{p_where} AND {extra_roles_sql} "
                 f"GROUP BY x.document_id, x.idx "
-                f"ORDER BY MAX(1 - VECTOR_DISTANCE(x.embedding, $1, COSINE)) DESC "
+                f"ORDER BY MAX(1 - VECTOR_DISTANCE(x.embedding, $1, COSINE)) DESC, x.document_id ASC, x.idx ASC "
                 f"FETCH FIRST {pool_size} ROWS ONLY",
                 *vec_params,
             )
@@ -852,7 +852,7 @@ class OracleKnowledgeStore(KnowledgeStore):
                                 f"FROM {passages_table} x "
                                 f"{join_docs}"
                                 f"WHERE x.bank_id = $1{where} AND CONTAINS(x.text, ${kw_pos}, 1) > 0 "
-                                f"ORDER BY SCORE(1) DESC "
+                                f"ORDER BY SCORE(1) DESC, x.document_id ASC, x.idx ASC "
                                 f"FETCH FIRST {pool_size} ROWS ONLY",
                                 *kw_params,
                             )

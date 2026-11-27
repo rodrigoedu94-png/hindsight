@@ -63,7 +63,7 @@ class OracleOps(DataAccessOps):
             WITH pending_parents AS (
                 SELECT operation_id, bank_id, LOWER(RAWTOHEX(operation_id)) AS uuid_hex
                 FROM {table}
-                WHERE operation_type = 'batch_retain'
+                WHERE operation_type IN ('batch_retain', 'knowledge_ingest')
                   AND status = 'pending'
                   AND task_payload IS NULL
             )
@@ -825,6 +825,7 @@ class OracleOps(DataAccessOps):
                 FETCH FIRST 1 ROW ONLY
                 """,
                 graph_name.upper(),
+                timeout=get_config().link_expansion_timeout,
             )
             available = bool(row)
             self._pgq_available_schemas[cache_key] = available

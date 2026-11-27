@@ -1028,7 +1028,7 @@ class KnowledgeService:
             if not (await self.store.list_documents(bank_id, limit=1, offset=0)).documents:
                 break
             await asyncio.sleep(1)
-        await self._engine.delete_bank(bank_id, request_context=request_context, _knowledge_bank=True)
+        await self._engine.delete_bank(OracleLiteralStr(bank_id), request_context=request_context, _knowledge_bank=True)
         await self.store.bank_deleted(bank_id)
         await self._engine._file_storage.delete_prefix(f"{bank_storage_prefix(bank_id)}kb/")
         await self._on_delete_complete(bank_id, request_context, passages_removed, content_tokens_removed)

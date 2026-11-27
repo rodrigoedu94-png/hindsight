@@ -222,6 +222,66 @@ def test_pgq_entity_caps_of_zero_or_less_keep_no_units(cap):
     assert f"WHERE eur.rn <= {cap}" in build_pgq_entity_expansion_cte("g", "mu_t", cap, window)
 
 
+@pytest.mark.asyncio
+async def test_oracle_link_expansion_retriever_empty_seeds_and_non_positive_budget(monkeypatch):
+    ops = OracleOps()
+    ops.has_property_graph = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.backend_type = "oracle"
+    conn.fetch = AsyncMock()
+    retriever = OracleLinkExpansionRetriever()
+
+    for args in (([], 10), (["seed-1"], 0), (["seed-1"], -1)):
+        res_c = await retriever._expand_combined(conn, args[0], "world", args[1], ops=ops)
+        res_o = await retriever._expand_observations(conn, args[0], args[1], ops=ops)
+        assert res_c.entity == [] and res_c.semantic == [] and res_c.causal == []
+        assert res_o.entity == [] and res_o.semantic == [] and res_o.causal == []
+    ops.has_property_graph.assert_not_awaited()
+    conn.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oracle_link_expansion_retriever_narrows_errors_and_avoids_timeout_cascade(monkeypatch):
+    monkeypatch.setattr(ora_le, "fq_table", lambda t: t)
+    monkeypatch.setattr(ora_le, "get_config", lambda: MagicMock(link_expansion_timeout=2.5, link_expansion_per_entity_limit=5, oracle_pgq_max_hops=2))
+    ops = OracleOps()
+    monkeypatch.setattr(ops, "has_property_graph", AsyncMock(return_value=True))
+
+    conn = MagicMock()
+    conn.backend_type = "oracle"
+    retriever = OracleLinkExpansionRetriever()
+
+    # Passes timeout directly to conn.fetch instead of cancelling via asyncio.wait_for.
+    conn.fetch = AsyncMock(return_value=[{"source": "semantic", "id": "u1"}])
+    await retriever._expand_combined(conn, ["seed-1"], "world", 10, ops=ops)
+    assert conn.fetch.await_args.kwargs["timeout"] == 2.5
+
+    # Timeout errors (DPY-4024 / ORA-03156 / TimeoutError) trigger bounded fallback, and a second
+    # timeout returns empty without cascading to relational super()._expand_combined.
+    relational_combined = AsyncMock()
+    monkeypatch.setattr(LinkExpansionRetriever, "_expand_combined", relational_combined)
+    conn.fetch = AsyncMock(side_effect=[RuntimeError("DPY-4024: call timeout exceeded"), RuntimeError("ORA-03156: OCI call timed out")])
+    res = await retriever._expand_combined(conn, ["seed-1"], "world", 10, ops=ops)
+    assert res.entity == [] and res.semantic == [] and res.causal == []
+    assert conn.fetch.await_count == 2
+    assert all(call.kwargs["timeout"] == 2.5 for call in conn.fetch.await_args_list)
+    relational_combined.assert_not_awaited()
+
+    # Narrowed PGQ errors fall back to relational; arbitrary ORA-01002/ORA-03113 disconnects propagate.
+    for code in ("ORA-49022", "ORA-42404", "ORA-40998", "ORA-00942"):
+        relational_combined.reset_mock()
+        conn.fetch = AsyncMock(side_effect=RuntimeError(f"{code}: pgq error"))
+        await retriever._expand_combined(conn, ["seed-1"], "world", 10, ops=ops)
+        relational_combined.assert_awaited_once()
+
+    for fatal in (RuntimeError("ORA-01002: fetch out of sequence"), RuntimeError("ORA-03113: end-of-file on communication channel")):
+        conn.fetch = AsyncMock(side_effect=fatal)
+        with pytest.raises(RuntimeError):
+            await retriever._expand_combined(conn, ["seed-1"], "world", 10, ops=ops)
+        with pytest.raises(RuntimeError):
+            await retriever._expand_observations(conn, ["seed-1"], 10, ops=ops)
+
+
 # ---------------------------------------------------------------------------
 # Oracle 26ai integration: the GRAPH_TABLE arms run and match the relational CTEs
 # ---------------------------------------------------------------------------
