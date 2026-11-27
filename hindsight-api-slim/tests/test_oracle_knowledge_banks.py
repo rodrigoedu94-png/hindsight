@@ -802,45 +802,16 @@ async def test_oracle_store_search_arms_include_sql_tie_breakers():
     assert "ORDER BY SCORE(1) DESC, x.document_id ASC, x.idx ASC FETCH FIRST" in arm3_sql
 
 
-@pytest.mark.asyncio
-async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
-    import uuid
+def _kb_cm_backend(c: Any, ops_obj: Any = None) -> Any:
+    @asynccontextmanager
+    async def _acquire():
+        yield c
 
-    from hindsight_api.engine.db.ops_oracle import OracleOps
+    return SimpleNamespace(_wraps_backend=True, acquire=_acquire, ops=ops_obj)
+
+
+def _make_kb_test_engine(backend: Any) -> Any:
     from hindsight_api.engine.memory_engine import MemoryEngine
-    from hindsight_api.engine.operation_metadata import KnowledgeIngestParentMetadata
-    from hindsight_api.models import RequestContext
-    from hindsight_api.worker.poller import WorkerPoller
-
-    uuid_bank = "11111111-2222-3333-4444-555555555555"
-    parent_op_id = str(uuid.uuid4())
-    child_op_id = str(uuid.uuid4())
-
-    # 1) KnowledgeIngestParentMetadata carries is_parent=True for get_operation_status self-healing.
-    meta = KnowledgeIngestParentMetadata(document_ids=["doc-1"], num_sub_batches=1).to_dict()
-    assert meta["is_parent"] is True
-
-    # 2) KnowledgeService.delete_bank passes OracleLiteralStr(bank_id) to engine.delete_bank, and
-    #    MemoryEngine.delete_bank preserves OracleLiteralStr on banks & bank_aliases queries.
-    conn = _FakeConn()
-    conn.fetchrow_responses.append({"bank_id": uuid_bank, "internal_id": str(uuid.uuid4())})
-    conn.fetch_responses.append([{"alias": "alias-1"}])
-    conn.fetchval_responses.append(str(uuid.uuid4()))
-
-    def _cm_backend(c: Any, ops_obj: Any = None) -> Any:
-        @asynccontextmanager
-        async def _acquire():
-            yield c
-
-        return SimpleNamespace(_wraps_backend=True, acquire=_acquire, ops=ops_obj)
-
-    backend = _cm_backend(conn, SimpleNamespace(drop_bank_vector_indexes=AsyncMock()))
-    del_store = SimpleNamespace(
-        store_owned_for=lambda _b: True,
-        count_bank_contents=AsyncMock(return_value=SimpleNamespace(memory_units=0, entities=0, documents=0)),
-        purge_bank_rows=AsyncMock(return_value=[]),
-        drop_bank_storage=AsyncMock(),
-    )
 
     eng = MemoryEngine.__new__(MemoryEngine)
     eng._initialized = True
@@ -856,8 +827,40 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
     eng._refuse_bank_wide_if_scoped = AsyncMock(return_value=None)
     eng._backend = backend
     eng._get_backend = AsyncMock(return_value=backend)
-    eng._config_resolver = SimpleNamespace(resolve_full_config=AsyncMock(return_value=SimpleNamespace(enable_auto_consolidation=False)))
+    eng._config_resolver = SimpleNamespace(
+        resolve_full_config=AsyncMock(return_value=SimpleNamespace(enable_auto_consolidation=False))
+    )
+    return eng
 
+
+@pytest.mark.asyncio
+async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
+    import uuid
+
+    from hindsight_api.engine.operation_metadata import KnowledgeIngestParentMetadata
+    from hindsight_api.models import RequestContext
+
+    uuid_bank = "11111111-2222-3333-4444-555555555555"
+
+    # 1) KnowledgeIngestParentMetadata carries is_parent=True for get_operation_status self-healing.
+    meta = KnowledgeIngestParentMetadata(document_ids=["doc-1"], num_sub_batches=1).to_dict()
+    assert meta["is_parent"] is True
+
+    # 2) KnowledgeService.delete_bank passes OracleLiteralStr(bank_id) to engine.delete_bank, and
+    #    MemoryEngine.delete_bank preserves OracleLiteralStr on banks & bank_aliases queries.
+    conn = _FakeConn()
+    conn.fetchrow_responses.append({"bank_id": uuid_bank, "internal_id": str(uuid.uuid4())})
+    conn.fetch_responses.append([{"alias": "alias-1"}])
+    conn.fetchval_responses.append(str(uuid.uuid4()))
+
+    backend = _kb_cm_backend(conn, SimpleNamespace(drop_bank_vector_indexes=AsyncMock()))
+    del_store = SimpleNamespace(
+        store_owned_for=lambda _b: True,
+        count_bank_contents=AsyncMock(return_value=SimpleNamespace(memory_units=0, entities=0, documents=0)),
+        purge_bank_rows=AsyncMock(return_value=[]),
+        drop_bank_storage=AsyncMock(),
+    )
+    eng = _make_kb_test_engine(backend)
     with patch("hindsight_api.engine.memories.get_memories", return_value=del_store):
         await eng.delete_bank(uuid_bank, request_context=RequestContext(), _knowledge_bank=True)
 
@@ -871,7 +874,7 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
 
     svc_engine = SimpleNamespace(
         _db_backend=SimpleNamespace(backend_type="oracle"),
-        _get_backend=AsyncMock(return_value=_cm_backend(_FakeConn())),
+        _get_backend=AsyncMock(return_value=_kb_cm_backend(_FakeConn())),
         delete_bank=AsyncMock(return_value={"bank_deleted": True}),
         _file_storage=SimpleNamespace(delete_prefix=AsyncMock()),
     )
@@ -891,13 +894,24 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
     await svc.delete_bank(uuid_bank, RequestContext())
     assert isinstance(svc_engine.delete_bank.await_args.args[0], OracleLiteralStr)
 
-    # 3) Engine & Poller _maybe_update_parent_operation + _reconcile_orphaned_parents + get_operation_status
-    #    wrap plain str row['bank_id'] in OracleLiteralStr(bank_id) and discovery includes 'knowledge_ingest'.
+
+@pytest.mark.asyncio
+async def test_uuid_knowledge_bank_ingest_parent_rollup_preserves_oracle_literal():
+    import uuid
+
+    from hindsight_api.engine.db.ops_oracle import OracleOps
+    from hindsight_api.worker.poller import WorkerPoller
+
+    uuid_bank = "11111111-2222-3333-4444-555555555555"
+    parent_op_id = str(uuid.uuid4())
+    child_op_id = str(uuid.uuid4())
+
     ops = OracleOps()
     ops_conn = _FakeConn()
     await ops.fetch_reconcilable_batch_parents(ops_conn, "async_operations")  # type: ignore[arg-type]
     assert "IN ('batch_retain', 'knowledge_ingest')" in ops_conn.executed[-1][0]
 
+    eng = _make_kb_test_engine(_kb_cm_backend(_FakeConn()))
     rollup_conn = _FakeConn()
     rollup_conn.parse_json = lambda v: json.loads(v) if isinstance(v, str) else v  # type: ignore[attr-defined]
     rollup_conn.fetchrow_responses.extend([
@@ -909,7 +923,7 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
     assert isinstance(rollup_conn.executed[1][1][1], OracleLiteralStr)
     assert isinstance(rollup_conn.executed[2][1][0], OracleLiteralStr)
 
-    poller = WorkerPoller(backend=backend, worker_id="w1", executor=AsyncMock())
+    poller = WorkerPoller(backend=_kb_cm_backend(_FakeConn()), worker_id="w1", executor=AsyncMock())
     p_conn = _FakeConn()
     p_conn.fetchrow_responses.extend([
         {"bank_id": uuid_bank, "result_metadata": {"parent_operation_id": parent_op_id}},
@@ -920,13 +934,29 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
     assert isinstance(p_conn.executed[1][1][1], OracleLiteralStr)
     assert isinstance(p_conn.executed[2][1][0], OracleLiteralStr)
 
+
+@pytest.mark.asyncio
+async def test_uuid_knowledge_bank_reconcile_and_status_preserve_oracle_literal():
+    import uuid
+
+    from hindsight_api.engine.operation_metadata import KnowledgeIngestParentMetadata
+    from hindsight_api.models import RequestContext
+    from hindsight_api.worker.poller import WorkerPoller
+
+    uuid_bank = "11111111-2222-3333-4444-555555555555"
+    parent_op_id = str(uuid.uuid4())
+    child_op_id = str(uuid.uuid4())
+    meta = KnowledgeIngestParentMetadata(document_ids=["doc-1"], num_sub_batches=1).to_dict()
+
     rec_conn = _FakeConn()
     rec_conn.fetchrow_responses.append({"status": "pending"})
     rec_conn.fetch_responses.append([{"status": "completed", "error_message": None}])
-    rec_backend = _cm_backend(
+    rec_backend = _kb_cm_backend(
         rec_conn,
         SimpleNamespace(
-            fetch_reconcilable_batch_parents=AsyncMock(return_value=[{"operation_id": uuid.UUID(parent_op_id), "bank_id": uuid_bank}])
+            fetch_reconcilable_batch_parents=AsyncMock(
+                return_value=[{"operation_id": uuid.UUID(parent_op_id), "bank_id": uuid_bank}]
+            )
         ),
     )
     rec_poller = WorkerPoller(backend=rec_backend, worker_id="w1", executor=AsyncMock())  # type: ignore[arg-type]
@@ -936,41 +966,31 @@ async def test_uuid_knowledge_bank_delete_and_ingest_parent_rollup(monkeypatch):
 
     status_conn = _FakeConn()
     status_conn.parse_json = lambda v: json.loads(v) if isinstance(v, str) else v  # type: ignore[attr-defined]
-    status_conn.fetchrow_responses.extend(
-        [
-            {
-                "operation_id": parent_op_id,
-                "operation_type": "knowledge_ingest",
-                "created_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
-                "updated_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
-                "completed_at": None,
-                "status": "pending",
-                "error_message": None,
-                "result_metadata": meta,
-                "retry_count": 0,
-                "next_retry_at": None,
-            },
-            {"status": "completed"},
-        ]
-    )
+    status_conn.fetchrow_responses.extend([
+        {
+            "operation_id": parent_op_id,
+            "operation_type": "knowledge_ingest",
+            "created_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+            "completed_at": None,
+            "status": "pending",
+            "error_message": None,
+            "result_metadata": meta,
+            "retry_count": 0,
+            "next_retry_at": None,
+        },
+        {"status": "completed"},
+    ])
     status_conn.fetch_responses.append([
         {"operation_id": child_op_id, "status": "completed", "error_message": None, "result_metadata": {"sub_batch_index": 0}}
     ])
-    eng._get_backend = AsyncMock(return_value=_cm_backend(status_conn))
+    eng = _make_kb_test_engine(_kb_cm_backend(status_conn))
     status = await eng.get_operation_status(
         uuid_bank, parent_op_id, request_context=RequestContext(), _knowledge_bank=True
     )
     assert status["status"] == "completed"
     assert isinstance(status_conn.executed[0][1][1], OracleLiteralStr)
     assert isinstance(status_conn.executed[1][1][0], OracleLiteralStr)
-
-
-def _kb_cm_backend(c: Any, ops_obj: Any = None) -> Any:
-    @asynccontextmanager
-    async def _acquire():
-        yield c
-
-    return SimpleNamespace(_wraps_backend=True, acquire=_acquire, ops=ops_obj)
 
 
 @pytest.mark.asyncio

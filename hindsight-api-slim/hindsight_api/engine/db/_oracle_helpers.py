@@ -10,6 +10,44 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+ORACLE_TIMEOUT_CODES = ("DPY-4024", "ORA-03156")
+
+
+def is_oracle_timeout(exc: BaseException) -> bool:
+    """Return whether ``exc`` represents an asyncio or Oracle driver call timeout."""
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return True
+    msg = str(exc)
+    return any(code in msg for code in ORACLE_TIMEOUT_CODES)
+
+
+async def fetch_with_conn_timeout(conn: Any, query: str, params: list[Any], timeout: float) -> list[Any]:
+    """Fetch query rows using Oracle ``call_timeout`` when available, or ``asyncio.wait_for`` otherwise."""
+    if getattr(conn, "backend_type", None) == "oracle":
+        return await conn.fetch(query, *params, timeout=timeout)
+    return await asyncio.wait_for(conn.fetch(query, *params), timeout=timeout)
+
+
+async def fetch_fallback_with_timeout(conn: Any, query: str, params: list[Any], timeout: float) -> list[Any]:
+    """Run fallback query; on Oracle, bound it via ``timeout`` and return ``[]`` if that times out too."""
+    if getattr(conn, "backend_type", None) != "oracle":
+        return await conn.fetch(query, *params)
+    try:
+        return await conn.fetch(query, *params, timeout=timeout)
+    except Exception as exc:
+        if is_oracle_timeout(exc):
+            return []
+        raise
+
+
+async def run_with_call_scope_or_timeout(conn: Any, fn: Any, args: tuple[Any, ...], timeout: float) -> Any:
+    """Invoke ``fn(*args)`` bounded by ``conn._call_scope(timeout)`` if supported, else ``asyncio.wait_for``."""
+    call_scope = getattr(conn, "_call_scope", None)
+    if callable(call_scope):
+        async with call_scope(timeout):
+            return await fn(*args)
+    return await asyncio.wait_for(fn(*args), timeout=timeout)
+
 
 def apply_call_timeout(raw_conn: Any, timeout: float | None) -> int | None:
     """Set millisecond ``call_timeout`` on ``raw_conn`` and return its previous value, if any."""
