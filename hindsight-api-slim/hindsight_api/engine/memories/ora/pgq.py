@@ -173,35 +173,15 @@ def build_pgq_semantic_causal_cte(
             )"""
 
 
-async def expand_observations_pgq(
-    conn: Any,
+def _build_observation_expansion_sql(
     graph_name: str,
     mu_table: str,
-    seed_ids: list,
-    budget: int,
-    per_entity_limit: int,
+    os_table: str,
+    safe_limit: int,
     window: UpdatedWindow,
-    *,
-    max_causal_hops: int = 2,
-    os_table: str = "observation_sources",
-) -> LinkExpansionRows:
-    """Expand observation memories via Oracle 26ai SQL/PGQ (derived_from, mentions, memory_link).
-
-    The entity arm ranks every unit that mentions a seed source's entities, the seed
-    sources included, and drops those only after the per-entity cap (``connected_sources``),
-    as ``OracleOps.expand_observations`` does, so both pick the same units under the cap.
-
-    The last hop, from the connected sources back to their observations, joins
-    ``observation_sources`` on ``source_id`` instead of matching ``derived_from`` again.
-    A GRAPH_TABLE cannot be seeded from a CTE, so that match enumerated every
-    observation-to-source edge and joined ``memory_units`` once per edge to bind its
-    ``src`` vertex: 6.2k buffer gets for this arm against 0.8k relational, on an
-    8.5k-unit bank. The join reads only the candidate sources' rows (0.9k).
-    """
-    if not seed_ids or budget <= 0:
-        return LinkExpansionRows(entity=[], semantic=[], causal=[])
-    # As the relational CTEs: a cap of 0 (or less) keeps no entity-linked units.
-    safe_limit = int(per_entity_limit)
+    max_causal_hops: int,
+) -> str:
+    """Build the SQL/PGQ query string for observation entity, semantic, and causal expansion."""
     causal_two_hop = ""
     if max_causal_hops >= 2:
         causal_two_hop = f"""
@@ -223,8 +203,7 @@ async def expand_observations_pgq(
                         )
                     )"""
 
-    all_rows = await conn.fetch(
-        f"""
+    return f"""
             WITH seed_sources AS (
                 SELECT DISTINCT source_id
                 FROM GRAPH_TABLE (
@@ -326,11 +305,42 @@ async def expand_observations_pgq(
             SELECT * FROM semantic_expanded
             UNION ALL
             SELECT * FROM causal_expanded
-            """,
-        seed_ids,
-        budget,
-        *window.params,
+            """
+
+
+async def expand_observations_pgq(
+    conn: Any,
+    graph_name: str,
+    mu_table: str,
+    seed_ids: list,
+    budget: int,
+    per_entity_limit: int,
+    window: UpdatedWindow,
+    *,
+    max_causal_hops: int = 2,
+    os_table: str = "observation_sources",
+    timeout: float | None = None,
+) -> LinkExpansionRows:
+    """Expand observation memories via Oracle 26ai SQL/PGQ (derived_from, mentions, memory_link).
+
+    The entity arm ranks every unit that mentions a seed source's entities, the seed
+    sources included, and drops those only after the per-entity cap (``connected_sources``),
+    as ``OracleOps.expand_observations`` does, so both pick the same units under the cap.
+
+    The last hop, from the connected sources back to their observations, joins
+    ``observation_sources`` on ``source_id`` instead of matching ``derived_from`` again.
+    A GRAPH_TABLE cannot be seeded from a CTE, so that match enumerated every
+    observation-to-source edge and joined ``memory_units`` once per edge to bind its
+    ``src`` vertex: 6.2k buffer gets for this arm against 0.8k relational, on an
+    8.5k-unit bank. The join reads only the candidate sources' rows (0.9k).
+    """
+    if not seed_ids or budget <= 0:
+        return LinkExpansionRows(entity=[], semantic=[], causal=[])
+    sql = _build_observation_expansion_sql(
+        graph_name, mu_table, os_table, int(per_entity_limit), window, max_causal_hops
     )
+    fetch_kwargs: dict[str, Any] = {"timeout": timeout} if timeout is not None else {}
+    all_rows = await conn.fetch(sql, seed_ids, budget, *window.params, **fetch_kwargs)
     return LinkExpansionRows(
         entity=[r for r in all_rows if r["source"] == "entity"],
         semantic=[r for r in all_rows if r["source"] == "semantic"],

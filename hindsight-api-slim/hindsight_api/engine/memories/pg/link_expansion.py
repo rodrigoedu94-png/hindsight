@@ -34,6 +34,12 @@ from datetime import datetime
 from typing import Any
 
 from ....config import DEFAULT_GRAPH_SEED_MIN_SIMILARITY, get_config
+from ...db._oracle_helpers import (
+    fetch_fallback_with_timeout,
+    fetch_with_conn_timeout,
+    is_oracle_timeout,
+    run_with_call_scope_or_timeout,
+)
 from ...db.ops import LinkExpansionRows, UpdatedWindow
 from ...db_utils import acquire_with_retry
 
@@ -346,11 +352,10 @@ class LinkExpansionRetriever(GraphRetriever):
         params = [seed_ids, fact_type, budget, *window.params]
 
         try:
-            all_rows = await asyncio.wait_for(
-                conn.fetch(full_query, *params),
-                timeout=config.link_expansion_timeout,
-            )
-        except asyncio.TimeoutError:
+            all_rows = await fetch_with_conn_timeout(conn, full_query, params, config.link_expansion_timeout)
+        except Exception as exc:
+            if not is_oracle_timeout(exc):
+                raise
             logger.warning(
                 f"[LinkExpansion] Entity expansion timed out after {config.link_expansion_timeout}s "
                 f"for fact_type={fact_type}, falling back to semantic+causal only"
@@ -362,7 +367,7 @@ class LinkExpansionRetriever(GraphRetriever):
                 SELECT * FROM causal_expanded
                 LIMIT $3
                 """
-            all_rows = await conn.fetch(fallback_query, *params)
+            all_rows = await fetch_fallback_with_timeout(conn, fallback_query, params, config.link_expansion_timeout)
 
         return LinkExpansionRows(
             entity=[r for r in all_rows if r["source"] == "entity"],
@@ -422,21 +427,15 @@ class LinkExpansionRetriever(GraphRetriever):
         # Same deadline as _expand_combined (#4529): the three arms are fused into
         # one query, so there is no cheaper fallback — the graph arm yields nothing
         # and recall continues on its other strategies.
+        window = UpdatedWindow(after=created_after, before=created_before, first_param_index=3)
+        obs_args = (conn, mu, ue, ml, seed_ids, budget, per_entity_limit, window)
         try:
-            return await asyncio.wait_for(
-                ops.expand_observations(
-                    conn,
-                    mu,
-                    ue,
-                    ml,
-                    seed_ids,
-                    budget,
-                    per_entity_limit,
-                    UpdatedWindow(after=created_after, before=created_before, first_param_index=3),
-                ),
-                timeout=config.link_expansion_timeout,
+            return await run_with_call_scope_or_timeout(
+                conn, ops.expand_observations, obs_args, config.link_expansion_timeout
             )
-        except asyncio.TimeoutError:
+        except Exception as exc:
+            if not is_oracle_timeout(exc):
+                raise
             logger.warning(
                 f"[LinkExpansion] Observation expansion timed out after {config.link_expansion_timeout}s, "
                 "skipping graph results for fact_type=observation"

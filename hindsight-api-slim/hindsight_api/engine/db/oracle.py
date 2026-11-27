@@ -22,12 +22,25 @@ import itertools
 import json
 import logging
 import re
+import time
 import uuid as _uuid_mod
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, NamedTuple, cast
 
 from ...schema_context import get_current_schema
+from ._oracle_helpers import (
+    apply_call_timeout,
+    close_cursor_safely,
+    coerce_uuid_value,
+    execute_ignoring_dup,
+    fetch_rows_within_deadline,
+    finalize_session_conn,
+    is_conn_cancelled,
+    mark_conn_cancelled,
+    restore_call_timeout,
+    session_outcome,
+)
 from .pool_instrumentation import PoolStats, acquire_conn
 
 
@@ -109,7 +122,7 @@ _MERGE_SOURCE_EMBEDDING_RE = re.compile(r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?\s+
 _INSERT_COLUMNS_VALUES_RE = re.compile(
     r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*(\(.*)", re.IGNORECASE | re.DOTALL
 )
-_INSERT_EMBEDDING_VALUE_RE = re.compile(r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*\))?", re.IGNORECASE)
+_INSERT_EMBEDDING_VALUE_RE = re.compile(r"(?:TO_VECTOR\(\s*)?:(\w+)(?:\s*,[^)]*)?(?:\s*\))?", re.IGNORECASE)
 # Text the vector-bind scan must not read as SQL: Oracle alternative-quoted literals
 # (q'[...]', q'{...}', q'(...)', q'<...>', q'!...!', optionally N-prefixed), ordinary '...'
 # literals ('' escapes a quote), -- line comments and /* */ block comments. A single
@@ -870,7 +883,7 @@ class OracleConnection(DatabaseConnection):
     to Oracle syntax so that existing consumer code works without modification.
     """
 
-    __slots__ = ("_conn", "_supports_for_update_row_limit")
+    __slots__ = ("_conn", "_supports_for_update_row_limit", "_closed_on_cancel")
 
     @property
     def backend_type(self) -> str:
@@ -879,6 +892,7 @@ class OracleConnection(DatabaseConnection):
     def __init__(self, conn: Any) -> None:
         super().__init__()
         self._conn = conn
+        self._closed_on_cancel: bool = False
         # Thin-mode connection.version includes the RU (e.g. 23.26.4.1.0).
         # Unknown/incomplete versions keep the old syntax rather than assuming
         # support from the marketed "26ai" name, which also covers earlier RUs.
@@ -1009,7 +1023,7 @@ class OracleConnection(DatabaseConnection):
     def _convert_vector_params(keys: set[str], params: dict[str, Any]) -> None:
         for key in keys:
             value = params.get(key)
-            if isinstance(value, str) and value.startswith("["):
+            if isinstance(value, str) and value.lstrip().startswith("["):
                 params[key] = array.array("f", json.loads(value))
 
     @staticmethod
@@ -1299,28 +1313,64 @@ class OracleConnection(DatabaseConnection):
     # -- transaction ------------------------------------------------------
 
     @asynccontextmanager
+    async def _call_scope(self, timeout: float | None = None) -> AsyncIterator[float | None]:
+        """Apply per-call timeout, yield an overall monotonic deadline, and poison on cancel."""
+        if getattr(self, "_closed_on_cancel", False):
+            raise ConnectionError("Oracle connection was invalidated after cancellation")
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
+        prev_call_timeout = apply_call_timeout(self._conn, timeout)
+        try:
+            yield deadline
+        except asyncio.CancelledError:
+            mark_conn_cancelled(self, self._conn)
+            raise
+        finally:
+            restore_call_timeout(self, self._conn, prev_call_timeout)
+
+    async def _prepare_statement(
+        self,
+        cursor: Any,
+        query: str,
+        args: tuple[Any, ...],
+        ret_cols: tuple[str, ...] | list[str] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Bind positional parameters, expand ANY lists, convert vectors, and stage temporary LOBs."""
+        params = self._make_bind_params(cursor, args, ret_cols)
+        query, params = self._expand_any_lists(query, params)
+        # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+        # not a temporary CLOB.
+        self._bind_vectors_natively(query, params)
+        await self._bind_large_values_as_lobs(params)
+        self._apply_clob_input_sizes(cursor, query, params)
+        return query, params
+
+    @asynccontextmanager
     async def transaction(self) -> AsyncIterator["OracleConnection"]:
+        if getattr(self, "_closed_on_cancel", False):
+            raise ConnectionError("Oracle connection was invalidated after cancellation")
         sp_name = f"sp_{_uuid_mod.uuid4().hex[:12]}"
         cursor = self._conn.cursor()
         try:
-            await cursor.execute(f"SAVEPOINT {sp_name}")
+            async with self._call_scope():
+                await cursor.execute(f"SAVEPOINT {sp_name}")
         finally:
-            cursor.close()
+            close_cursor_safely(self, cursor)
         try:
             yield self
         except BaseException:
-            rb_cursor = None
-            try:
-                rb_cursor = self._conn.cursor()
-                await rb_cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
-            except BaseException as rb_err:
-                logger.debug(f"ROLLBACK TO SAVEPOINT {sp_name} failed during unwind: {rb_err!r}")
-            finally:
-                if rb_cursor is not None:
-                    try:
-                        rb_cursor.close()
-                    except BaseException as close_err:
-                        logger.debug(f"Closing rollback cursor for {sp_name} failed: {close_err!r}")
+            if not getattr(self, "_closed_on_cancel", False):
+                rb_cursor = None
+                try:
+                    rb_cursor = self._conn.cursor()
+                    await rb_cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                except BaseException as rb_err:
+                    logger.debug(f"ROLLBACK TO SAVEPOINT {sp_name} failed during unwind: {rb_err!r}")
+                finally:
+                    if rb_cursor is not None:
+                        try:
+                            rb_cursor.close()
+                        except BaseException as close_err:
+                            logger.debug(f"Closing rollback cursor for {sp_name} failed: {close_err!r}")
             raise
 
     # -- DML methods ------------------------------------------------------
@@ -1331,27 +1381,19 @@ class OracleConnection(DatabaseConnection):
         # ORA-00922. They are tuning hints scoped to the transaction, so skip them.
         if query.lstrip().upper().startswith("SET LOCAL "):
             return "SET"
+        if getattr(self, "_closed_on_cancel", False):
+            raise ConnectionError("Oracle connection was invalidated after cancellation")
         orig_query = query
         query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
             query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         cursor = self._conn.cursor()
         try:
-            params = self._make_bind_params(cursor, args, ret_cols)
-            query, params = self._expand_any_lists(query, params)
-            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
-            # not a temporary CLOB.
-            self._bind_vectors_natively(query, params)
-            await self._bind_large_values_as_lobs(params)
-            self._apply_clob_input_sizes(cursor, query, params)
-            if ignore_dup:
-                try:
-                    await cursor.execute(query, params)
-                except Exception as e:
-                    if "ORA-00001" in str(e):
-                        return "INSERT 0 0"
-                    raise
-            else:
+            async with self._call_scope(timeout):
+                query, params = await self._prepare_statement(cursor, query, args, ret_cols)
+                if ignore_dup:
+                    inserted = await execute_ignoring_dup(cursor, query, params)
+                    return "INSERT 0 1" if inserted else "INSERT 0 0"
                 try:
                     await cursor.execute(query, params)
                 except Exception as e:
@@ -1362,18 +1404,15 @@ class OracleConnection(DatabaseConnection):
                         e,
                     )
                     raise
-            # Return PG-compatible status string
-            cmd = orig_query.strip().split()[0].upper() if orig_query.strip() else "OK"
-            rowcount = cursor.rowcount
-            if cmd == "INSERT":
-                return f"INSERT 0 {rowcount}"
-            elif cmd in ("DELETE", "UPDATE", "SELECT", "MERGE"):
-                return f"{cmd} {rowcount}"
-            return f"{cmd} {rowcount}"
+                # Return PG-compatible status string
+                cmd = orig_query.strip().split()[0].upper() if orig_query.strip() else "OK"
+                return f"{cmd} {cursor.rowcount}"
         finally:
-            cursor.close()
+            close_cursor_safely(self, cursor)
 
     async def executemany(self, query: str, args: list[tuple[Any, ...]], *, timeout: float | None = None) -> None:
+        if getattr(self, "_closed_on_cancel", False):
+            raise ConnectionError("Oracle connection was invalidated after cancellation")
         query, ignore_dup, _ = _rewrite_pg_to_oracle(
             query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
@@ -1383,42 +1422,43 @@ class OracleConnection(DatabaseConnection):
         vector_keys = self._vector_bind_keys(query)
         cursor = self._conn.cursor()
         try:
-            if ignore_dup:
-                # Row-by-row with individual dup suppression
-                for row in converted:
-                    params = {str(i + 1): v for i, v in enumerate(row)}
-                    # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
-                    # not a temporary CLOB.
-                    self._convert_vector_params(vector_keys, params)
-                    await self._bind_large_values_as_lobs(params)
-                    self._apply_clob_input_sizes(cursor, query, params)
+            async with self._call_scope(timeout):
+                if ignore_dup:
+                    # Row-by-row with individual dup suppression
+                    for row in converted:
+                        params = {str(i + 1): v for i, v in enumerate(row)}
+                        # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
+                        # not a temporary CLOB.
+                        self._convert_vector_params(vector_keys, params)
+                        await self._bind_large_values_as_lobs(params)
+                        self._apply_clob_input_sizes(cursor, query, params)
+                        try:
+                            await cursor.execute(query, params)
+                        except Exception as e:
+                            if "ORA-00001" not in str(e):
+                                raise
+                else:
+                    # Convert tuples to dicts for named binding (:1, :2, ...). No temporary
+                    # LOBs here: the batched callers are plain INSERT ... VALUES (chunks,
+                    # attachments, links), where a CLOB input size binds long text fine —
+                    # ORA-01461 only hits a bind in a select list such as MERGE ... USING.
+                    converted_dicts = []
+                    for row in converted:
+                        params = {str(i + 1): v for i, v in enumerate(row)}
+                        self._convert_vector_params(vector_keys, params)
+                        converted_dicts.append(params)
+                    # The driver types each column from the first row, so a column holding
+                    # any CLOB-sized value must be declared CLOB for the whole batch.
+                    clob_keys = {k for row in converted_dicts for k, v in row.items() if _needs_clob_bind(v)}
+                    if clob_keys:
+                        cursor.setinputsizes(**dict.fromkeys(clob_keys, _import_oracledb().DB_TYPE_CLOB))
                     try:
-                        await cursor.execute(query, params)
+                        await cursor.executemany(query, converted_dicts)
                     except Exception as e:
-                        if "ORA-00001" not in str(e):
-                            raise
-            else:
-                # Convert tuples to dicts for named binding (:1, :2, ...). No temporary
-                # LOBs here: the batched callers are plain INSERT ... VALUES (chunks,
-                # attachments, links), where a CLOB input size binds long text fine —
-                # ORA-01461 only hits a bind in a select list such as MERGE ... USING.
-                converted_dicts = []
-                for row in converted:
-                    params = {str(i + 1): v for i, v in enumerate(row)}
-                    self._convert_vector_params(vector_keys, params)
-                    converted_dicts.append(params)
-                # The driver types each column from the first row, so a column holding
-                # any CLOB-sized value must be declared CLOB for the whole batch.
-                clob_keys = {k for row in converted_dicts for k, v in row.items() if _needs_clob_bind(v)}
-                if clob_keys:
-                    cursor.setinputsizes(**dict.fromkeys(clob_keys, _import_oracledb().DB_TYPE_CLOB))
-                try:
-                    await cursor.executemany(query, converted_dicts)
-                except Exception as e:
-                    logger.error("Oracle executemany failed. Query: %s\nError: %s", query[:500], e)
-                    raise
+                        logger.error("Oracle executemany failed. Query: %s\nError: %s", query[:500], e)
+                        raise
         finally:
-            cursor.close()
+            close_cursor_safely(self, cursor)
 
     async def executemany_filtered(
         self,
@@ -1436,34 +1476,42 @@ class OracleConnection(DatabaseConnection):
         """
         if not args:
             return
+        if getattr(self, "_closed_on_cancel", False):
+            raise ConnectionError("Oracle connection was invalidated after cancellation")
         query, ignore_dup, _ = _rewrite_pg_to_oracle(
             query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         converted = _convert_args_list(args)
-        converted_dicts = [{str(i + 1): v for i, v in enumerate(row)} for row in converted]
+        vector_keys = self._vector_bind_keys(query)
+        converted_dicts = []
+        for row in converted:
+            params = {str(i + 1): v for i, v in enumerate(row)}
+            self._convert_vector_params(vector_keys, params)
+            converted_dicts.append(params)
         oracledb = _import_oracledb()
         async with self.transaction():
             cursor = self._conn.cursor()
             try:
-                clob_keys = {k for row in converted_dicts for k, v in row.items() if _needs_clob_bind(v)}
-                if clob_keys:
-                    cursor.setinputsizes(**dict.fromkeys(clob_keys, oracledb.DB_TYPE_CLOB))
-                await cursor.executemany(query, converted_dicts, batcherrors=True)
-                for err in cursor.getbatcherrors():
-                    if (ignore_dup and getattr(err, "code", None) == 1) or is_ignored_error(err):
-                        continue
-                    logger.error(
-                        "Oracle batch error at offset %s. Query: %s\nError: %s",
-                        getattr(err, "offset", "?"),
-                        query[:500],
-                        getattr(err, "message", err),
-                    )
-                    exc = oracledb.DatabaseError(err)
-                    exc.code = getattr(err, "code", None)
-                    exc.offset = getattr(err, "offset", None)
-                    raise exc
+                async with self._call_scope():
+                    clob_keys = {k for row in converted_dicts for k, v in row.items() if _needs_clob_bind(v)}
+                    if clob_keys:
+                        cursor.setinputsizes(**dict.fromkeys(clob_keys, oracledb.DB_TYPE_CLOB))
+                    await cursor.executemany(query, converted_dicts, batcherrors=True)
+                    for err in cursor.getbatcherrors():
+                        if (ignore_dup and getattr(err, "code", None) == 1) or is_ignored_error(err):
+                            continue
+                        logger.error(
+                            "Oracle batch error at offset %s. Query: %s\nError: %s",
+                            getattr(err, "offset", "?"),
+                            query[:500],
+                            getattr(err, "message", err),
+                        )
+                        exc = oracledb.DatabaseError(err)
+                        exc.code = getattr(err, "code", None)
+                        exc.offset = getattr(err, "offset", None)
+                        raise exc
             finally:
-                cursor.close()
+                close_cursor_safely(self, cursor)
 
     async def bulk_insert_from_arrays(
         self,
@@ -1501,153 +1549,105 @@ class OracleConnection(DatabaseConnection):
         return f"INSERT 0 {n_rows}"
 
     async def fetch(self, query: str, *args: Any, timeout: float | None = None) -> list[ResultRow]:
+        if getattr(self, "_closed_on_cancel", False):
+            raise ConnectionError("Oracle connection was invalidated after cancellation")
         query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
             query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         cursor = self._conn.cursor()
         try:
-            params = self._make_bind_params(cursor, args, ret_cols)
-            query, params = self._expand_any_lists(query, params)
-            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
-            # not a temporary CLOB.
-            self._bind_vectors_natively(query, params)
-            await self._bind_large_values_as_lobs(params)
-            self._apply_clob_input_sizes(cursor, query, params)
-            if ignore_dup:
+            async with self._call_scope(timeout) as deadline:
+                query, params = await self._prepare_statement(cursor, query, args, ret_cols)
+                if ignore_dup:
+                    await execute_ignoring_dup(cursor, query, params)
+                    # INSERT succeeded (or skipped dup) and RETURNING was stripped
+                    return []
+
                 try:
                     await cursor.execute(query, params)
                 except Exception as e:
-                    if "ORA-00001" in str(e):
-                        return []
+                    logger.error(
+                        "Oracle fetch failed. Query: %s\nParams keys: %s\nError: %s",
+                        query[:500],
+                        list(params.keys()) if params else None,
+                        e,
+                    )
                     raise
-                # INSERT succeeded but RETURNING was stripped — return empty
-                # (callers using fetch with ON CONFLICT DO NOTHING typically
-                # only care about rowcount, not the returned rows)
-                return []
 
-            try:
-                await cursor.execute(query, params)
-            except Exception as e:
-                logger.error(
-                    "Oracle fetch failed. Query: %s\nParams keys: %s\nError: %s",
-                    query[:500],
-                    list(params.keys()) if params else None,
-                    e,
-                )
-                raise
+                if ret_cols is not None:
+                    row_dict = await self._read_returning_values(ret_cols, cast("dict[str, Any]", params))
+                    return [ResultRow(row_dict)] if row_dict else []
 
-            if ret_cols is not None:
-                # `params` is the bind dict built for the statement just executed.
-                row_dict = await self._read_returning_values(ret_cols, cast("dict[str, Any]", params))
-                return [ResultRow(row_dict)] if row_dict else []
-
-            columns = [col[0].lower() for col in cursor.description or []]
-            rows = await cursor.fetchall()
-            return [ResultRow(dict(zip(columns, _convert_row_from_oracle(columns, row)))) for row in rows]
+                columns = [col[0].lower() for col in cursor.description or []]
+                rows = await fetch_rows_within_deadline(self._conn, cursor, deadline)
+                return [ResultRow(dict(zip(columns, _convert_row_from_oracle(columns, row)))) for row in rows]
         finally:
-            cursor.close()
+            close_cursor_safely(self, cursor)
 
     async def fetchrow(self, query: str, *args: Any, timeout: float | None = None) -> ResultRow | None:
+        if getattr(self, "_closed_on_cancel", False):
+            raise ConnectionError("Oracle connection was invalidated after cancellation")
         query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
             query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         cursor = self._conn.cursor()
         try:
-            params = self._make_bind_params(cursor, args, ret_cols)
-            query, params = self._expand_any_lists(query, params)
-            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
-            # not a temporary CLOB.
-            self._bind_vectors_natively(query, params)
-            await self._bind_large_values_as_lobs(params)
-            self._apply_clob_input_sizes(cursor, query, params)
-            if ignore_dup:
+            async with self._call_scope(timeout):
+                query, params = await self._prepare_statement(cursor, query, args, ret_cols)
+                if ignore_dup:
+                    await execute_ignoring_dup(cursor, query, params)
+                    return None
+
                 try:
                     await cursor.execute(query, params)
                 except Exception as e:
-                    if "ORA-00001" in str(e):
-                        return None
+                    logger.error(
+                        "Oracle fetchrow failed. Query: %s\nParams keys: %s\nError: %s",
+                        query[:500],
+                        list(params.keys()) if params else None,
+                        e,
+                    )
                     raise
-                # INSERT succeeded but RETURNING was stripped
-                return None
 
-            try:
-                await cursor.execute(query, params)
-            except Exception as e:
-                logger.error(
-                    "Oracle fetchrow failed. Query: %s\nParams keys: %s\nError: %s",
-                    query[:500],
-                    list(params.keys()) if params else None,
-                    e,
-                )
-                raise
+                if ret_cols is not None:
+                    row_dict = await self._read_returning_values(ret_cols, cast("dict[str, Any]", params))
+                    return ResultRow(row_dict) if row_dict else None
 
-            if ret_cols is not None:
-                # `params` is the bind dict built for the statement just executed.
-                row_dict = await self._read_returning_values(ret_cols, cast("dict[str, Any]", params))
-                return ResultRow(row_dict) if row_dict else None
-
-            columns = [col[0].lower() for col in cursor.description or []]
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            return ResultRow(dict(zip(columns, _convert_row_from_oracle(columns, row))))
+                columns = [col[0].lower() for col in cursor.description or []]
+                row = await cursor.fetchone()
+                if row is None:
+                    return None
+                return ResultRow(dict(zip(columns, _convert_row_from_oracle(columns, row))))
         finally:
-            cursor.close()
+            close_cursor_safely(self, cursor)
 
     async def fetchval(self, query: str, *args: Any, column: int = 0, timeout: float | None = None) -> Any:
+        if getattr(self, "_closed_on_cancel", False):
+            raise ConnectionError("Oracle connection was invalidated after cancellation")
         query, ignore_dup, ret_cols = _rewrite_pg_to_oracle(
             query, supports_for_update_row_limit=getattr(self, "_supports_for_update_row_limit", False)
         )
         cursor = self._conn.cursor()
         try:
-            params = self._make_bind_params(cursor, args, ret_cols)
-            query, params = self._expand_any_lists(query, params)
-            # Vectors first: an embedding literal past 32 767 bytes must become a VECTOR,
-            # not a temporary CLOB.
-            self._bind_vectors_natively(query, params)
-            await self._bind_large_values_as_lobs(params)
-            self._apply_clob_input_sizes(cursor, query, params)
-            if ignore_dup:
-                try:
-                    await cursor.execute(query, params)
-                except Exception as e:
-                    if "ORA-00001" in str(e):
+            async with self._call_scope(timeout):
+                query, params = await self._prepare_statement(cursor, query, args, ret_cols)
+                if ignore_dup:
+                    inserted = await execute_ignoring_dup(cursor, query, params)
+                    # RETURNING was stripped; return first arg as best-effort stand-in when inserted.
+                    return (args[0] if args else True) if inserted else None
+
+                await cursor.execute(query, params)
+                if ret_cols is not None:
+                    row_dict = await self._read_returning_values(ret_cols, cast("dict[str, Any]", params))
+                    if row_dict is None:
                         return None
-                    raise
-                # INSERT succeeded (no dup). RETURNING was stripped, so we can't
-                # fetch rows. Return the first positional arg as a best-effort
-                # stand-in (callers typically RETURNING the PK they just inserted).
-                return args[0] if args else True
+                    vals = list(row_dict.values())
+                    return coerce_uuid_value(vals[column] if column < len(vals) else None)
 
-            await cursor.execute(query, params)
-
-            if ret_cols is not None:
-                # `params` is the bind dict built for the statement just executed.
-                row_dict = await self._read_returning_values(ret_cols, cast("dict[str, Any]", params))
-                if row_dict is None:
-                    return None
-                vals = list(row_dict.values())
-                val = vals[column] if column < len(vals) else None
-                # Try to convert RAW(16) hex back to UUID
-                if isinstance(val, str) and len(val) == 32:
-                    try:
-                        return _uuid_mod.UUID(val)
-                    except Exception:
-                        pass
-                return val
-
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            val = row[column]
-            if isinstance(val, bytes) and len(val) == 16:
-                try:
-                    return _uuid_mod.UUID(bytes=val)
-                except Exception:
-                    return val
-            return val
+                row = await cursor.fetchone()
+                return None if row is None else coerce_uuid_value(row[column])
         finally:
-            cursor.close()
+            close_cursor_safely(self, cursor)
 
 
 # ---------------------------------------------------------------------------
@@ -1869,48 +1869,41 @@ class OracleBackend(DatabaseBackend):
         conn = await acquire_conn(
             pool.acquire(), pool_stats=self._pool_stats, warn_threshold_s=self._acquire_warn_threshold_s
         )
+        wrapper = OracleConnection(conn)
         broken = False
         committed = False
         unwinding = False
         try:
-            await self._set_session_schema(conn)
-            wrapper = OracleConnection(conn)
+            async with wrapper._call_scope():
+                await self._set_session_schema(conn)
             yield wrapper
-            await wrapper._run_before_commit()
-            # Auto-commit on clean exit (asyncpg uses autocommit by default;
-            # oracledb does not, so we must commit explicitly)
-            await conn.commit()
+            if is_conn_cancelled(wrapper, conn):
+                broken = True
+                raise ConnectionError("Oracle connection was invalidated by cancellation; transaction was not committed")
+            async with wrapper._call_scope():
+                await wrapper._run_before_commit()
+                # Auto-commit on clean exit (asyncpg uses autocommit by default;
+                # oracledb does not, so we must commit explicitly)
+                await conn.commit()
             committed = True
         except BaseException:
             # Roll back on cancellation (BaseException) as well as Exception so
             # an aborted task never hands an open transaction or held row locks
-            # back to another caller from the pool.
+            # back to another caller from the pool. Skip rollback and drop the
+            # connection whenever an in-flight Oracle call was cancelled.
             unwinding = True
-            try:
-                await conn.rollback()
-            except BaseException as rb_err:
+            if is_conn_cancelled(wrapper, conn):
                 broken = True
-                logger.debug(f"Oracle rollback failed during session unwind; dropping connection: {rb_err!r}")
+            else:
+                try:
+                    await conn.rollback()
+                except BaseException as rb_err:
+                    broken = True
+                    logger.debug(f"Oracle rollback failed during session unwind; dropping connection: {rb_err!r}")
             raise
         finally:
-            if broken:
-                await self._release_or_drop_conn(pool, conn, broken=True)
-            elif committed or unwinding:
-                try:
-                    await self._release_or_drop_conn(pool, conn, broken=False)
-                except BaseException as rel_err:
-                    logger.warning(
-                        f"Oracle pool.release failed after {'commit' if committed else 'unwind'}; "
-                        f"discarding connection: {rel_err!r}"
-                    )
-                    await self._release_or_drop_conn(pool, conn, broken=True)
-                    # Ordinary release failures stay suppressed (the work already committed or
-                    # is already unwinding), but a cancellation delivered during the release
-                    # must still reach the caller, or a cancelled task would return normally.
-                    if isinstance(rel_err, asyncio.CancelledError):
-                        raise
-            else:
-                await self._release_or_drop_conn(pool, conn, broken=False)
+            outcome = session_outcome(wrapper, conn, (broken, committed, unwinding))
+            await finalize_session_conn(self._release_or_drop_conn, pool, conn, outcome)
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[OracleConnection]:

@@ -691,6 +691,7 @@ from .bank_life import (
 from .bank_templates import apply_default_bank_template_resources, load_default_bank_template_manifest
 from .cross_encoder import RANK_SCORE_PROVIDERS, CrossEncoderModel, recall_log_id
 from .decision_model import DecisionEngineFor, DecisionModel, decision_engine
+from .db.oracle import OracleLiteralStr
 from .embeddings import (
     EMBEDDING_MODEL_SETTING,
     Embeddings,
@@ -6441,6 +6442,7 @@ class MemoryEngine(MemoryEngineInterface):
                 return
 
             bank_id = row["bank_id"]
+            lit_bank_id = OracleLiteralStr(bank_id)
 
             # Lock the parent operation to prevent concurrent updates from other children
             # Use FOR UPDATE to ensure only one child can update the parent at a time.
@@ -6455,7 +6457,7 @@ class MemoryEngine(MemoryEngineInterface):
                 FOR UPDATE
                 """,
                 uuid.UUID(parent_operation_id),
-                bank_id,
+                lit_bank_id,
             )
 
             if not parent_row:
@@ -6478,7 +6480,7 @@ class MemoryEngine(MemoryEngineInterface):
                 WHERE bank_id = $1
                 AND result_metadata::jsonb @> $2::jsonb
                 """,
-                bank_id,
+                lit_bank_id,
                 json.dumps({"parent_operation_id": parent_operation_id}),
             )
 
@@ -12964,7 +12966,7 @@ class MemoryEngine(MemoryEngineInterface):
                         bank_row = await conn.fetchrow(
                             f"SELECT bank_id, internal_id FROM {fq_table('banks')} "
                             f"WHERE bank_id = $1 FOR NO KEY UPDATE",
-                            bank_id,
+                            OracleLiteralStr(bank_id),
                         )
                         if _expected_internal_id is not None and (
                             bank_row is None or str(bank_row["internal_id"]) != str(_expected_internal_id)
@@ -13021,7 +13023,7 @@ class MemoryEngine(MemoryEngineInterface):
                             if fact_type == "observation":
                                 await conn.execute(
                                     f"DELETE FROM {fq_table('observation_history')} WHERE bank_id = $1",
-                                    bank_id,
+                                    OracleLiteralStr(bank_id),
                                 )
 
                             if unit_ids:
@@ -13068,7 +13070,8 @@ class MemoryEngine(MemoryEngineInterface):
                                     ):
                                         continue
                                     await conn.execute(
-                                        f"DELETE FROM {qualified} WHERE {spec.bank_id_column} = $1", bank_id
+                                        f"DELETE FROM {qualified} WHERE {spec.bank_id_column} = $1",
+                                        OracleLiteralStr(bank_id),
                                     )
 
                             attempt_result = {
@@ -13091,7 +13094,7 @@ class MemoryEngine(MemoryEngineInterface):
                                     await conn.execute(
                                         f"{llm_requests_locked_in_id_order(_llm_table, 'bank_id = $1')} "
                                         f"DELETE FROM {_llm_table} t USING target WHERE t.id = target.id",
-                                        bank_id,
+                                        OracleLiteralStr(bank_id),
                                     )
                                 # The FK cascade drops these, but resolve() caches them: their
                                 # names are evicted after commit, or a write to one would recreate
@@ -13099,12 +13102,14 @@ class MemoryEngine(MemoryEngineInterface):
                                 attempt_freed_aliases = [
                                     row["alias"]
                                     for row in await conn.fetch(
-                                        f"SELECT alias FROM {fq_table('bank_aliases')} WHERE bank_id = $1", bank_id
+                                        f"SELECT alias FROM {fq_table('bank_aliases')} WHERE bank_id = $1",
+                                        OracleLiteralStr(bank_id),
                                     )
                                 ]
                                 # Delete the bank profile and retrieve internal_id for HNSW index cleanup
                                 internal_id = await conn.fetchval(
-                                    f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1 RETURNING internal_id", bank_id
+                                    f"DELETE FROM {fq_table('banks')} WHERE bank_id = $1 RETURNING internal_id",
+                                    OracleLiteralStr(bank_id),
                                 )
                                 if internal_id:
                                     attempt_bank_internal_id = str(internal_id)
@@ -23283,6 +23288,32 @@ class MemoryEngine(MemoryEngineInterface):
                 "operations": operation_list,
             }
 
+    async def _self_heal_parent_operation_status(
+        self, conn: Any, op_uuid: uuid.UUID, operation_id: str, correct_status: str
+    ) -> str:
+        """Atomically reconcile a pending parent operation while preserving concurrent cancellations."""
+        logger.warning(
+            f"Parent operation {operation_id} status out of sync (DB: pending, should be: {correct_status}). Fixing."
+        )
+        completed_clause = "" if correct_status == "cancelled" else ", completed_at = NOW()"
+        healed = await conn.fetchrow(
+            f"""
+            UPDATE {fq_table("async_operations")}
+            SET status = $2, updated_at = NOW(){completed_clause}
+            WHERE operation_id = $1 AND status = 'pending'
+            RETURNING status
+            """,
+            op_uuid,
+            correct_status,
+        )
+        if healed is not None:
+            return healed["status"]
+        current_status = await conn.fetchval(
+            f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1",
+            op_uuid,
+        )
+        return current_status if current_status is not None else "pending"
+
     async def get_operation_status(
         self,
         bank_id: str,
@@ -23321,6 +23352,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         async with acquire_with_retry(backend) as conn:
             payload_column = ", task_payload" if include_payload else ""
+            lit_bank_id = OracleLiteralStr(bank_id)
             row = await conn.fetchrow(
                 f"""
                 SELECT operation_id, operation_type, created_at, updated_at, completed_at, status, error_message, result_metadata, retry_count, next_retry_at{payload_column}
@@ -23328,14 +23360,16 @@ class MemoryEngine(MemoryEngineInterface):
                 WHERE operation_id = $1 AND bank_id = $2
                 """,
                 op_uuid,
-                bank_id,
+                lit_bank_id,
             )
 
             if row:
                 # Check if this is a parent operation
+                from .operation_metadata import is_parent_operation_row, summarize_child_statuses
+
                 raw_rm = row["result_metadata"]
                 result_metadata = conn.parse_json(raw_rm) or {}
-                is_parent = result_metadata.get("is_parent", False)
+                is_parent = is_parent_operation_row(row["operation_type"], result_metadata)
                 raw_tp = row["task_payload"] if include_payload else None
                 task_payload = conn.parse_json(raw_tp) if include_payload else None
 
@@ -23353,50 +23387,15 @@ class MemoryEngine(MemoryEngineInterface):
                         AND result_metadata::jsonb @> $2::jsonb
                         ORDER BY (result_metadata->>'sub_batch_index')::int
                         """,
-                        bank_id,
+                        lit_bank_id,
                         json.dumps({"parent_operation_id": operation_id}),
                     )
 
-                    # Build child operations list and check if parent status needs updating
-                    child_statuses = []
-                    all_done = True
-                    any_failed = False
-
-                    for child_row in child_rows:
-                        raw_crm = child_row["result_metadata"]
-                        child_metadata = conn.parse_json(raw_crm) or {}
-                        child_status = child_row["status"]
-
-                        child_statuses.append(
-                            {
-                                "operation_id": str(child_row["operation_id"]),
-                                "status": child_status,
-                                "sub_batch_index": child_metadata.get("sub_batch_index"),
-                                "items_count": child_metadata.get("items_count"),
-                                "error_message": child_row["error_message"],
-                            }
+                    child_statuses, correct_status = summarize_child_statuses(child_rows, conn.parse_json)
+                    if correct_status is not None and api_status == "pending":
+                        api_status = await self._self_heal_parent_operation_status(
+                            conn, op_uuid, operation_id, correct_status
                         )
-
-                        if child_status not in ("completed", "failed"):
-                            all_done = False
-                        if child_status == "failed":
-                            any_failed = True
-                    # Self-healing: if parent status is out of sync with children, update it
-                    if all_done and api_status == "pending":
-                        correct_status = "failed" if any_failed else "completed"
-                        logger.warning(
-                            f"Parent operation {operation_id} status out of sync (DB: pending, should be: {correct_status}). Fixing."
-                        )
-                        await conn.execute(
-                            f"""
-                            UPDATE {fq_table("async_operations")}
-                            SET status = $2, updated_at = NOW(), completed_at = NOW()
-                            WHERE operation_id = $1
-                            """,
-                            op_uuid,
-                            correct_status,
-                        )
-                        api_status = correct_status
 
                     return {
                         "operation_id": operation_id,
@@ -23506,12 +23505,13 @@ class MemoryEngine(MemoryEngineInterface):
         claimed_worker_id: str | None = None
         claimed_at: Any = None
 
+        lit_bank_id = OracleLiteralStr(bank_id)
         async with acquire_with_retry(backend) as conn:
             # Check if operation exists, belongs to this bank, and is in a cancellable state
             result = await conn.fetchrow(
                 f"SELECT bank_id, status FROM {fq_table('async_operations')} WHERE operation_id = $1 AND bank_id = $2",
                 op_uuid,
-                bank_id,
+                lit_bank_id,
             )
 
             if not result:
@@ -23598,6 +23598,7 @@ class MemoryEngine(MemoryEngineInterface):
         backend = await self._get_backend()
 
         op_uuid = uuid.UUID(operation_id)
+        lit_bank_id = OracleLiteralStr(bank_id)
 
         async with acquire_with_retry(backend) as conn:
             # Make the retry transition a single conditional write. This
@@ -23629,7 +23630,7 @@ class MemoryEngine(MemoryEngineInterface):
                 RETURNING operation_id
                 """,
                 op_uuid,
-                bank_id,
+                lit_bank_id,
             )
 
             if updated is None:
@@ -23637,7 +23638,7 @@ class MemoryEngine(MemoryEngineInterface):
                     f"SELECT status, operation_type, task_payload FROM {fq_table('async_operations')} "
                     f"WHERE operation_id = $1 AND bank_id = $2",
                     op_uuid,
-                    bank_id,
+                    lit_bank_id,
                 )
                 if not row:
                     raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")
@@ -23673,7 +23674,7 @@ class MemoryEngine(MemoryEngineInterface):
                               OR (status = 'pending' AND next_retry_at > NOW())
                           )
                         """,
-                        bank_id,
+                        lit_bank_id,
                         child_filter,
                     )
                     revived = await conn.fetchrow(
@@ -23699,7 +23700,7 @@ class MemoryEngine(MemoryEngineInterface):
                         RETURNING operation_id
                         """,
                         op_uuid,
-                        bank_id,
+                        lit_bank_id,
                         child_filter,
                     )
                     if revived is not None:
@@ -23756,6 +23757,7 @@ class MemoryEngine(MemoryEngineInterface):
         backend = await self._get_backend()
 
         op_uuid = uuid.UUID(operation_id)
+        lit_bank_id = OracleLiteralStr(bank_id)
 
         deleted: Any = None
         async with acquire_with_retry(backend) as conn:
@@ -23771,13 +23773,13 @@ class MemoryEngine(MemoryEngineInterface):
                       AND status IN ('failed', 'cancelled', 'completed')
                     RETURNING operation_id, operation_type, status, result_metadata, task_payload""",
                 op_uuid,
-                bank_id,
+                lit_bank_id,
             )
             if not deleted:
                 row = await conn.fetchrow(
                     f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1 AND bank_id = $2",
                     op_uuid,
-                    bank_id,
+                    lit_bank_id,
                 )
                 if not row:
                     raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")

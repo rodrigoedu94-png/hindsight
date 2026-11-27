@@ -179,6 +179,179 @@ async def test_oracle_backend_rolls_back_and_drops_broken_conn_on_cancel(mode: s
     assert broken_pool.released == []
 
 
+@_requires_oracledb
+@pytest.mark.asyncio
+async def test_oracle_connection_fetch_call_timeout_and_cancel_invalidates_and_drops_conn() -> None:
+    from hindsight_api.engine.db.oracle import OracleBackend, OracleConnection
+
+    seen_timeouts: list[int] = []
+
+    class _TimeoutCursor(_FakeOracleCursor):
+        description = [("VAL",)]
+
+        def __init__(self, raw_conn: Any, *, hang: bool = False) -> None:
+            super().__init__(raw_conn.executed)
+            self._raw = raw_conn
+            self._hang = hang
+
+        async def execute(self, sql: str, *args, **kwargs) -> None:
+            seen_timeouts.append(self._raw.call_timeout)
+            if self._hang:
+                await asyncio.sleep(10)
+            self._executed.append(sql)
+
+        async def fetchall(self) -> list[tuple[Any, ...]]:
+            seen_timeouts.append(self._raw.call_timeout)
+            return [(1,)]
+
+    class _TimeoutRawConn(_FakeRawOracleConn):
+        def __init__(self, *, hang: bool = False) -> None:
+            super().__init__()
+            self.call_timeout = 1234
+            self._hang = hang
+
+        def cursor(self) -> _TimeoutCursor:  # type: ignore[override]
+            cur = _TimeoutCursor(self, hang=self._hang)
+            self.cursors.append(cur)
+            return cur
+
+    # 1) call_timeout is set to int(timeout * 1000) during fetch and restored afterward.
+    raw = _TimeoutRawConn()
+    conn = OracleConnection(raw)
+    rows = await conn.fetch("SELECT 1 FROM DUAL", timeout=2.5)
+    assert len(rows) == 1 and rows[0]["val"] == 1
+    assert seen_timeouts == [2500, 2500]
+    assert raw.call_timeout == 1234
+
+    # 2) Cancelling mid-fetch marks _closed_on_cancel, refuses in-place reuse, and drops from pool.
+    hanging_raw = _TimeoutRawConn(hang=True)
+    pool = _FakeOraclePool(hanging_raw)
+    backend = OracleBackend()
+    backend._default_schema = "ADMIN"
+    backend._pool = pool
+
+    with pytest.raises(asyncio.TimeoutError):
+        async with backend.acquire() as acquired_conn:
+            try:
+                await asyncio.wait_for(acquired_conn.fetch("SELECT 1 FROM DUAL"), timeout=0.01)
+            except asyncio.TimeoutError:
+                assert acquired_conn._closed_on_cancel is True
+                with pytest.raises(ConnectionError, match="invalidated after cancellation"):
+                    await acquired_conn.fetch("SELECT 2 FROM DUAL")
+                raise
+
+    assert hanging_raw.rollbacks == 0
+    assert hanging_raw.commits == 0
+    assert pool.dropped == [hanging_raw]
+    assert pool.released == []
+
+
+@_requires_oracledb
+@pytest.mark.asyncio
+async def test_oracle_backend_session_drops_on_schema_or_commit_cancel_and_refuses_silent_rollback() -> None:
+    from hindsight_api.engine.db._oracle_helpers import mark_conn_cancelled
+    from hindsight_api.engine.db.oracle import OracleBackend
+
+    # 1) Cancelled during _set_session_schema drops the connection without releasing or rolling back.
+    schema_raw = _FakeRawOracleConn()
+    schema_pool = _FakeOraclePool(schema_raw)
+    backend = OracleBackend()
+    backend._default_schema = "ADMIN"
+    backend._pool = schema_pool
+    backend._set_session_schema = AsyncMock(side_effect=asyncio.CancelledError())  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        async with backend.acquire():
+            raise AssertionError("body must not run")
+
+    assert schema_raw.rollbacks == 0
+    assert schema_pool.dropped == [schema_raw]
+    assert schema_pool.released == []
+
+    # 2) Cancelled during commit() drops the connection without returning it to pool.
+    commit_raw = _FakeRawOracleConn()
+    commit_raw.commit = AsyncMock(side_effect=asyncio.CancelledError())  # type: ignore[method-assign]
+    commit_pool = _FakeOraclePool(commit_raw)
+    backend2 = OracleBackend()
+    backend2._default_schema = "ADMIN"
+    backend2._pool = commit_pool
+
+    with pytest.raises(asyncio.CancelledError):
+        async with backend2.acquire():
+            pass
+
+    assert commit_raw.rollbacks == 0
+    assert commit_pool.dropped == [commit_raw]
+    assert commit_pool.released == []
+
+    # 3) Clean exit after caught cancellation raises ConnectionError loudly instead of silently rolling back.
+    swallow_raw = _FakeRawOracleConn()
+    swallow_pool = _FakeOraclePool(swallow_raw)
+    backend3 = OracleBackend()
+    backend3._default_schema = "ADMIN"
+    backend3._pool = swallow_pool
+
+    with pytest.raises(ConnectionError, match="invalidated by cancellation"):
+        async with backend3.acquire() as acquired_conn:
+            mark_conn_cancelled(acquired_conn, swallow_raw)
+
+    assert swallow_raw.commits == 0
+    assert swallow_raw.rollbacks == 0
+    assert swallow_pool.dropped == [swallow_raw]
+    assert swallow_pool.released == []
+
+
+@_requires_oracledb
+@pytest.mark.asyncio
+async def test_oracle_connection_fetch_enforces_cumulative_timeout_across_fetchmany_roundtrips() -> None:
+    import time
+
+    from hindsight_api.engine.db.oracle import OracleConnection
+
+    seen_timeouts: list[int] = []
+
+    class _ChunkedCursor(_FakeOracleCursor):
+        description = [("VAL",)]
+
+        def __init__(self, raw_conn: Any) -> None:
+            super().__init__(raw_conn.executed)
+            self._raw = raw_conn
+            self._calls = 0
+
+        async def execute(self, sql: str, *args, **kwargs) -> None:
+            seen_timeouts.append(self._raw.call_timeout)
+            self._executed.append(sql)
+
+        async def fetchmany(self) -> list[tuple[Any, ...]]:
+            seen_timeouts.append(self._raw.call_timeout)
+            self._calls += 1
+            if self._calls == 1:
+                await asyncio.sleep(0.03)
+                return [(1,)]
+            await asyncio.sleep(0.03)
+            return [(2,)]
+
+    class _ChunkedRawConn(_FakeRawOracleConn):
+        def __init__(self) -> None:
+            super().__init__()
+            self.call_timeout = 999
+
+        def cursor(self) -> _ChunkedCursor:  # type: ignore[override]
+            cur = _ChunkedCursor(self)
+            self.cursors.append(cur)
+            return cur
+
+    raw = _ChunkedRawConn()
+    conn = OracleConnection(raw)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="exceeded timeout"):
+        await conn.fetch("SELECT 1 FROM DUAL", timeout=0.04)
+    assert time.monotonic() - started < 0.2
+    assert len(seen_timeouts) >= 3
+    assert seen_timeouts[-1] <= seen_timeouts[0]
+    assert raw.call_timeout == 999
+
+
 def _make_stub_engine_for_delete() -> MemoryEngine:
     engine = MemoryEngine.__new__(MemoryEngine)
     engine._initialized = True

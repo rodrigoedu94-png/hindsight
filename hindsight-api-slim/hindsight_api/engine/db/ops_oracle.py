@@ -5,12 +5,13 @@ for Oracle-specific syntax requirements (no unnest, no DISTINCT ON, CLOB
 columns can't appear in GROUP BY).
 """
 
+import asyncio
 import json
 import logging
 import re
 import uuid as uuid_mod
 from datetime import UTC, datetime
-from typing import cast
+from typing import Any, cast
 
 from ...config import get_config
 from ...schema_context import get_current_schema
@@ -31,6 +32,8 @@ from .result import ResultRow as DatabaseResultRow
 
 # ORA-02291 on a memory_links -> memory_units FK: the link's endpoint was deleted.
 _VANISHED_UNIT_FK = re.compile(r"ORA-02291\b.*\.FK_ML_(?:FROM|TO)\)", re.IGNORECASE)
+_ORACLE_TIMEOUT_CODES = ("DPY-4024", "ORA-03156")
+_PGQ_UNAVAILABLE_CODES = ("ORA-00942", "ORA-42404", "ORA-49022", "ORA-40998", "ORA-01031")
 
 
 _PGQ_LOGGER = logging.getLogger(__name__)
@@ -63,7 +66,7 @@ class OracleOps(DataAccessOps):
             WITH pending_parents AS (
                 SELECT operation_id, bank_id, LOWER(RAWTOHEX(operation_id)) AS uuid_hex
                 FROM {table}
-                WHERE operation_type = 'batch_retain'
+                WHERE operation_type IN ('batch_retain', 'knowledge_ingest')
                   AND status = 'pending'
                   AND task_payload IS NULL
             )
@@ -73,7 +76,7 @@ class OracleOps(DataAccessOps):
                 SELECT 1
                 FROM {table} child
                 WHERE child.bank_id = parent.bank_id
-                  AND child.status NOT IN ('completed', 'failed')
+                  AND child.status NOT IN ('completed', 'failed', 'cancelled')
                   AND JSON_VALUE(child.result_metadata, '$.type()') = 'object'
                   AND JSON_VALUE(child.result_metadata, '$.parent_operation_id') COLLATE BINARY =
                       SUBSTR(parent.uuid_hex, 1, 8) || '-' ||
@@ -803,6 +806,8 @@ class OracleOps(DataAccessOps):
         self,
         conn: DatabaseConnection,
         graph_name: str = "HINDSIGHT_MEMORY_GRAPH",
+        *,
+        timeout: float | None = None,
     ) -> bool:
         """Return whether the native Oracle 26ai SQL/PGQ property graph is readable."""
         if not get_config().oracle_use_property_graph:
@@ -812,6 +817,7 @@ class OracleOps(DataAccessOps):
         cached = self._pgq_available_schemas.get(cache_key)
         if cached is not None:
             return cached
+        effective_timeout = get_config().link_expansion_timeout if timeout is None else timeout
         try:
             row = await conn.fetchval(
                 """
@@ -825,13 +831,19 @@ class OracleOps(DataAccessOps):
                 FETCH FIRST 1 ROW ONLY
                 """,
                 graph_name.upper(),
+                timeout=effective_timeout,
             )
             available = bool(row)
             self._pgq_available_schemas[cache_key] = available
             return available
         except Exception as exc:
-            _PGQ_LOGGER.debug("SQL/PGQ capability check skipped/failed for schema=%s: %s", schema, exc)
-            return False
+            msg = str(exc)
+            if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or any(
+                code in msg for code in (*_ORACLE_TIMEOUT_CODES, *_PGQ_UNAVAILABLE_CODES)
+            ):
+                _PGQ_LOGGER.debug("SQL/PGQ capability check skipped/failed for schema=%s: %s", schema, exc)
+                return False
+            raise
 
     def build_pgq_semantic_causal_cte(
         self,
